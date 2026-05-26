@@ -1,0 +1,536 @@
+"""
+Eight comparison baselines for ORDI evaluation (E1).
+
+B1  Direct downlink        - no onboard inference; downlink raw tiles to ground
+B2  Onboard-only           - source satellite processes all tiles locally, no helpers
+B3  Compression-only       - compress tiles before downlink, no distributed compute
+B4  Serval-like            - priority-queue bifurcation; single satellite per task
+B5  SECO-like              - multi-sat placement, no redundancy, greedy min-latency
+B6  Full replication       - replicate every tile to r_max helpers
+B7  Random replication     - replicate to random feasible helpers
+B8  CoCoI-like             - MDS redundancy (adapted to contact-window setting)
+
+All baselines implement the same interface:
+    schedule(epoch, t_sim_start, pending_tasks) → SchedulerResult
+"""
+
+from __future__ import annotations
+import math
+import random
+from typing import Dict, List, Optional, Set, Tuple
+
+from ordi.orbit.graph import EpochContactGraph, earliest_arrival, earliest_downlink
+from ordi.sim.satellite import SatelliteState
+from ordi.sim.reliability import ReliabilityModel
+from ordi.tasks.generator import EOTask, Tile
+from ordi.scheduler.feasibility import compute_candidates, ReplicaCandidate
+from ordi.scheduler.ordi import ORDIConfig, TileAssignment, SchedulerResult
+
+# Compression ratio for B3 (JPEG-style lossy compression on raw EO tiles)
+COMPRESSION_RATIO = 0.15   # compressed to 15% of original size
+
+
+# ── shared helpers ────────────────────────────────────────────────────────────
+
+def _empty_result(epoch: int) -> SchedulerResult:
+    return SchedulerResult(
+        epoch=epoch, assignments=[], total_utility=0.0,
+        energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+        objective=0.0, link_utilization={},
+    )
+
+
+def _make_assignment_from_replica(
+    task: EOTask, tile: Tile, replica: ReplicaCandidate,
+    reliability: ReliabilityModel,
+) -> TileAssignment:
+    a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+    a.replicas = [replica]
+    a.primary_aggregator = replica.aggregator
+    a.z_kv = replica.p_success
+    a.L_hat = replica.latency
+    return a
+
+
+# ── B1: Direct downlink ───────────────────────────────────────────────────────
+
+class DirectDownlink:
+    """All raw tiles downlinked directly from source satellite to ground."""
+    name = "B1_direct_downlink"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            src = task.source_sat
+            src_state = self.states.get(src)
+            if src_state is None or not src_state.A_i:
+                continue
+
+            for tile in task.tiles:
+                # Downlink raw tile directly from source
+                ell_down = earliest_downlink(
+                    src, epoch, self.graphs, tile.d_in_bits, self.ground_stations
+                )
+                feasible = ell_down <= tau_k
+                p_down = self.reliability.default_downlink_pi if feasible else 0.0
+                z_kv = p_down
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.primary_aggregator = src
+                a.z_kv = z_kv
+                a.L_hat = ell_down if feasible else math.inf
+                assignments.append(a)
+                if feasible:
+                    total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * ell_down)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B2: Onboard-only ─────────────────────────────────────────────────────────
+
+class OnboardOnly:
+    """Source satellite processes all tiles locally and downlinks results."""
+    name = "B2_onboard_only"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            src = task.source_sat
+            src_state = self.states.get(src)
+            if src_state is None or not src_state.A_i:
+                continue
+
+            for tile in task.tiles:
+                t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                ell_down = earliest_downlink(
+                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations
+                )
+                L = t_compute + ell_down
+                feasible = L <= tau_k
+                p = self.reliability.node_pi(src) * self.reliability.default_downlink_pi
+                z_kv = p if feasible else 0.0
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.primary_aggregator = src
+                a.z_kv = z_kv
+                a.L_hat = L if feasible else math.inf
+                assignments.append(a)
+                if feasible:
+                    total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * L)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B3: Compression-only ─────────────────────────────────────────────────────
+
+class CompressionOnly:
+    """Compress raw tiles before downlink; no distributed compute."""
+    name = "B3_compression_only"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            src = task.source_sat
+            src_state = self.states.get(src)
+            if src_state is None or not src_state.A_i:
+                continue
+
+            for tile in task.tiles:
+                compressed_bits = tile.d_in_bits * COMPRESSION_RATIO
+                ell_down = earliest_downlink(
+                    src, epoch, self.graphs, compressed_bits, self.ground_stations
+                )
+                feasible = ell_down <= tau_k
+                p = self.reliability.default_downlink_pi if feasible else 0.0
+                z_kv = p
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.primary_aggregator = src
+                a.z_kv = z_kv
+                a.L_hat = ell_down if feasible else math.inf
+                assignments.append(a)
+                if feasible:
+                    total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * ell_down)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B4: Serval-like ───────────────────────────────────────────────────────────
+
+class ServalLike:
+    """
+    Priority-queue bifurcation inspired by Serval (NSDI '24).
+    Tiles are classified as high/low priority based on utility.
+    High-priority tiles are processed on source sat and downlinked first.
+    No inter-satellite helpers used.
+    """
+    name = "B4_serval_like"
+    HIGH_PRIORITY_THRESHOLD = 0.8
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            src = task.source_sat
+            src_state = self.states.get(src)
+            if src_state is None or not src_state.A_i:
+                continue
+
+            # Classify tiles by priority
+            max_u = max(t.utility for t in task.tiles)
+            high_priority = [t for t in task.tiles
+                             if t.utility >= self.HIGH_PRIORITY_THRESHOLD * max_u]
+            low_priority  = [t for t in task.tiles
+                             if t.utility < self.HIGH_PRIORITY_THRESHOLD * max_u]
+
+            time_offset = 0.0
+            for tile in high_priority + low_priority:
+                t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                ell_down = earliest_downlink(
+                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations
+                )
+                L = time_offset + t_compute + ell_down
+                feasible = L <= tau_k
+                p = self.reliability.node_pi(src) * self.reliability.default_downlink_pi
+                z_kv = p if feasible else 0.0
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.primary_aggregator = src
+                a.z_kv = z_kv
+                a.L_hat = L if feasible else math.inf
+                assignments.append(a)
+                if feasible:
+                    total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * L)
+                time_offset += t_compute  # sequential on source sat
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B5: SECO-like ─────────────────────────────────────────────────────────────
+
+class SECOLike:
+    """
+    Multi-satellite placement without redundancy, greedy min-latency.
+    Inspired by SECO (INFOCOM '24): assign each tile to the helper
+    with minimum end-to-end time cost, no backup.
+    """
+    name = "B5_seco_like"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            for tile in task.tiles:
+                candidates = compute_candidates(
+                    task, tile, epoch, epoch_start,
+                    self.graphs, self.states, self.reliability,
+                    self.ground_stations, tau_k,
+                )
+                if not candidates:
+                    assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
+                    continue
+
+                # Pick minimum latency (SECO greedy)
+                best = min(candidates, key=lambda c: c.latency)
+                a = _make_assignment_from_replica(task, tile, best, self.reliability)
+                assignments.append(a)
+                total_utility += tile.utility * a.z_kv * math.exp(-cfg.alpha * a.L_hat)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B6: Full replication ──────────────────────────────────────────────────────
+
+class FullReplication:
+    """Replicate every tile to all r_max feasible helpers."""
+    name = "B6_full_replication"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            for tile in task.tiles:
+                candidates = compute_candidates(
+                    task, tile, epoch, epoch_start,
+                    self.graphs, self.states, self.reliability,
+                    self.ground_stations, tau_k,
+                )
+                # Use up to r_max replicas with distinct aggregators
+                selected = []
+                seen_agg = set()
+                for c in sorted(candidates, key=lambda c: -c.p_success):
+                    if c.aggregator not in seen_agg and len(selected) < tile.n_replicas_max:
+                        selected.append(c)
+                        seen_agg.add(c.aggregator)
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.replicas = selected
+                if selected:
+                    a.primary_aggregator = selected[0].aggregator
+                    if len(selected) > 1:
+                        a.backup_aggregator = selected[1].aggregator
+                    probs = [c.p_success for c in selected]
+                    a.z_kv = self.reliability.tile_delivery_prob(probs)
+                    a.L_hat = min(c.latency for c in selected)
+                    total_utility += tile.utility * a.z_kv * math.exp(-cfg.alpha * a.L_hat)
+
+                assignments.append(a)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B7: Random replication ────────────────────────────────────────────────────
+
+class RandomReplication:
+    """Replicate to random feasible helpers (up to r_max)."""
+    name = "B7_random_replication"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg, seed=42):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+        self.rng = random.Random(seed)
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            for tile in task.tiles:
+                candidates = compute_candidates(
+                    task, tile, epoch, epoch_start,
+                    self.graphs, self.states, self.reliability,
+                    self.ground_stations, tau_k,
+                )
+                if not candidates:
+                    assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
+                    continue
+
+                n = min(tile.n_replicas_max, len(candidates))
+                selected = self.rng.sample(candidates, n)
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.replicas = selected
+                if selected:
+                    a.primary_aggregator = selected[0].aggregator
+                    probs = [c.p_success for c in selected]
+                    a.z_kv = self.reliability.tile_delivery_prob(probs)
+                    a.L_hat = min(c.latency for c in selected)
+                    total_utility += tile.utility * a.z_kv * math.exp(-cfg.alpha * a.L_hat)
+
+                assignments.append(a)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── B8: CoCoI-like ────────────────────────────────────────────────────────────
+
+class CoCoILike:
+    """
+    MDS coded redundancy adapted to contact-window setting.
+    Inspired by CoCoI (arXiv 2025): k-of-n MDS coding where any k
+    of n assigned helpers suffice to reconstruct the result.
+    Uses n = r_max workers and k = ceil(n/2) threshold.
+    Success probability = P(at least k of n replicas succeed).
+    """
+    name = "B8_cocoi_like"
+
+    def __init__(self, graphs, states, ground_stations, reliability, cfg):
+        self.graphs = graphs
+        self.states = states
+        self.ground_stations = ground_stations
+        self.reliability = reliability
+        self.cfg = cfg
+
+    def _k_of_n_prob(self, probs: List[float], k: int) -> float:
+        """P(at least k of n succeed) using inclusion-exclusion / DP."""
+        n = len(probs)
+        if k > n:
+            return 0.0
+        # DP: dp[j] = P(exactly j successes)
+        dp = [0.0] * (n + 1)
+        dp[0] = 1.0
+        for p in probs:
+            new_dp = [0.0] * (n + 1)
+            for j in range(n + 1):
+                if dp[j] == 0.0:
+                    continue
+                if j + 1 <= n:
+                    new_dp[j + 1] += dp[j] * p
+                new_dp[j] += dp[j] * (1 - p)
+            dp = new_dp
+        return sum(dp[j] for j in range(k, n + 1))
+
+    def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
+        cfg = self.cfg
+        epoch_start = t_sim_start + epoch * cfg.epoch_length
+        assignments = []
+        total_utility = 0.0
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            for tile in task.tiles:
+                candidates = compute_candidates(
+                    task, tile, epoch, epoch_start,
+                    self.graphs, self.states, self.reliability,
+                    self.ground_stations, tau_k,
+                )
+                if not candidates:
+                    assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
+                    continue
+
+                n = min(tile.n_replicas_max, len(candidates))
+                # Pick best n by success probability
+                selected = sorted(candidates, key=lambda c: -c.p_success)[:n]
+                k_thresh = math.ceil(n / 2)  # need at least half to succeed
+                probs = [c.p_success for c in selected]
+                z_kv = self._k_of_n_prob(probs, k_thresh)
+
+                a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+                a.replicas = selected
+                if selected:
+                    a.primary_aggregator = selected[0].aggregator
+                    a.z_kv = z_kv
+                    a.L_hat = min(c.latency for c in selected)
+                    total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * a.L_hat)
+
+                assignments.append(a)
+
+        return SchedulerResult(
+            epoch=epoch, assignments=assignments, total_utility=total_utility,
+            energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+            objective=total_utility, link_utilization={},
+        )
+
+
+# ── registry ──────────────────────────────────────────────────────────────────
+
+ALL_BASELINES = [
+    DirectDownlink, OnboardOnly, CompressionOnly, ServalLike,
+    SECOLike, FullReplication, RandomReplication, CoCoILike,
+]
+
+
+def build_all_baselines(graphs, states, ground_stations, reliability, cfg) -> dict:
+    return {
+        cls.name: cls(graphs, states, ground_stations, reliability, cfg)
+        for cls in ALL_BASELINES
+    }
