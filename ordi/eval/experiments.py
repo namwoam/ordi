@@ -20,6 +20,8 @@ import time
 from copy import deepcopy
 from typing import Dict, List, Optional
 
+from tqdm import tqdm
+
 from ordi.orbit.contacts import build_synthetic_walker, compute_contact_windows, DEFAULT_GROUND_STATIONS
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
@@ -99,7 +101,7 @@ def _run_algorithm(name, scheduler_or_baseline, tasks, graphs, states, reliabili
     sat_cap = {s: local_states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
 
     epoch_metrics = []
-    for epoch in range(N_EPOCHS):
+    for epoch in tqdm(range(N_EPOCHS), desc=f"  {name}", unit="ep", leave=False):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
 
         if injector:
@@ -151,8 +153,7 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
     results["ORDI"] = _run_algorithm("ORDI", ordi, tasks, graphs, states, reliability,
                                      sat_ids, gs_names, cfg)
 
-    for name, baseline in baselines.items():
-        print(f"  Running {name} ...")
+    for name, baseline in tqdm(baselines.items(), desc="E1 baselines", unit="alg"):
         results[name] = _run_algorithm(name, baseline, tasks, graphs, states, reliability,
                                        sat_ids, gs_names, cfg)
 
@@ -178,8 +179,7 @@ def run_E2(seed=0) -> Dict[str, List[EpochMetrics]]:
     }
 
     results = {}
-    for scenario_name, faults in fault_scenarios.items():
-        print(f"  Scenario: {scenario_name}")
+    for scenario_name, faults in tqdm(fault_scenarios.items(), desc="E2 scenarios", unit="scenario"):
         ordi = ORDIScheduler(cfg, sat_ids, gs_names, graphs, deepcopy(states), deepcopy(reliability))
         results[scenario_name] = _run_algorithm(
             "ORDI", ordi, tasks, graphs, states, reliability,
@@ -200,11 +200,10 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
     fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
     results = {}
 
-    for rate in fault_rates:
+    for rate in tqdm(fault_rates, desc="E3 fault rates", unit="rate"):
         faults = random_fault_schedule(sat_ids, N_EPOCHS, fault_rate=rate, seed=seed)
-        for alg_name in ["ORDI", "B5_seco_like", "B6_full_replication"]:
+        for alg_name in tqdm(["ORDI", "B5_seco_like", "B6_full_replication"], desc=f"  rate={rate:.2f}", unit="alg", leave=False):
             key = f"{alg_name}@fault={rate:.2f}"
-            print(f"  {key}")
             if alg_name == "ORDI":
                 sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
                                       deepcopy(states), deepcopy(reliability))
@@ -229,10 +228,9 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E4: Scalability sweep")
     results = {}
 
-    for n_sats in [12, 24, 36, 60]:
+    for n_sats in tqdm([12, 24, 36, 60], desc="E4 constellation sizes", unit="size"):
         planes = 6
         per_plane = n_sats // planes
-        print(f"  {n_sats} sats ({planes}p × {per_plane})")
         sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
             _build_sim(n_planes=planes, sats_per_plane=per_plane, seed=seed)
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
@@ -262,7 +260,7 @@ def run_E5(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E5: Deadline tightness sweep")
     results = {}
 
-    for slack in [60, 120, 180, 300, 600]:
+    for slack in tqdm([60, 120, 180, 300, 600], desc="E5 deadline slacks", unit="slack"):
         sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
             _build_sim(seed=seed, deadline_slack=float(slack))
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
@@ -294,7 +292,7 @@ def run_E6(seed=0) -> Dict[str, List[EpochMetrics]]:
         _build_sim(seed=seed)
     results = {}
 
-    for lambda_R in [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]:
+    for lambda_R in tqdm([0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0], desc="E6 lambda_R", unit="λ"):
         cfg = deepcopy(base_cfg)
         cfg.lambda_R = lambda_R
         key = f"ORDI@lambda_R={lambda_R}"
@@ -321,7 +319,7 @@ def run_E7(seed=0) -> Dict[str, List[EpochMetrics]]:
     plane_sizes = [6, 12]  # 1 plane, 2 planes
     results = {}
 
-    for n_plane_sats in plane_sizes:
+    for n_plane_sats in tqdm(plane_sizes, desc="E7 plane sizes", unit="config"):
         plane_sats = sat_ids[:n_plane_sats]
         faults = [FaultEvent("plane_outage", 20, 10, plane_sats)]
         label = f"plane_{n_plane_sats}_sats"
@@ -396,6 +394,6 @@ ALL_EXPERIMENTS = {
 
 
 def run_all(seed=0):
-    for exp_id, fn in ALL_EXPERIMENTS.items():
+    for exp_id, fn in tqdm(ALL_EXPERIMENTS.items(), desc="Experiments", unit="exp"):
         print(f"\n{'='*50}\n{exp_id}\n{'='*50}")
         fn(seed=seed)
