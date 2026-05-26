@@ -17,8 +17,9 @@ import csv
 import math
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -73,35 +74,41 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
     return sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg
 
 
-def _run_algorithm(name, scheduler_or_baseline, tasks, graphs, states, reliability,
-                   sat_ids, gs_names, cfg, faults: Optional[List[FaultEvent]] = None,
-                   seed=0) -> List[EpochMetrics]:
+# ── parallel worker (module-level so multiprocessing can pickle it) ───────────
+
+def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     """
-    Run one algorithm for all N_EPOCHS. Returns per-epoch metrics.
-    States are deep-copied so each algorithm run is independent.
+    Worker for ProcessPoolExecutor.
+    args = (result_key, sched_name, scheduler_class,
+            tasks, graphs, states, reliability,
+            sat_ids, gs_names, cfg, faults, seed)
+
+    result_key  : key stored in the results dict
+    sched_name  : "ORDI" or the baseline name (controls dispatch)
+    scheduler_class : class to instantiate
     """
+    (result_key, sched_name, scheduler_class,
+     tasks, graphs, states, reliability,
+     sat_ids, gs_names, cfg, faults, seed) = args
+
     local_states = deepcopy(states)
     local_rel = deepcopy(reliability)
 
     injector = None
     if faults:
-        from ordi.orbit.contacts import DEFAULT_GROUND_STATIONS
         injector = FaultInjector(local_states, local_rel, [], rng_seed=seed)
         for f in faults:
             injector.schedule(f)
 
-    # Rebuild scheduler with local copies
-    if name == "ORDI":
+    if sched_name == "ORDI":
         sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
     else:
-        sched = scheduler_or_baseline.__class__(
-            graphs, local_states, gs_names, local_rel, cfg
-        )
+        sched = scheduler_class(graphs, local_states, gs_names, local_rel, cfg)
 
     sat_cap = {s: local_states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
-
     epoch_metrics = []
-    for epoch in tqdm(range(N_EPOCHS), desc=f"  {name}", unit="ep", leave=False):
+
+    for epoch in range(N_EPOCHS):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
 
         if injector:
@@ -109,18 +116,30 @@ def _run_algorithm(name, scheduler_or_baseline, tasks, graphs, states, reliabili
 
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
 
-        if name == "ORDI":
+        if sched_name == "ORDI":
             result = sched.schedule_epoch(epoch, T_SIM_START, pending)
         else:
             result = sched.schedule(epoch, T_SIM_START, pending)
 
-        m = compute_metrics(result, pending, ep_start, sat_cap, cfg.alpha)
-        epoch_metrics.append(m)
+        epoch_metrics.append(compute_metrics(result, pending, ep_start, sat_cap, cfg.alpha))
 
         if injector:
             injector.withdraw_epoch(epoch + 1)
 
-    return epoch_metrics
+    return result_key, epoch_metrics
+
+
+def _run_parallel(job_args: List[Tuple], desc: str = "") -> Dict[str, List[EpochMetrics]]:
+    """Submit a list of _parallel_run_algorithm arg-tuples and collect results."""
+    n = len(job_args)
+    results: Dict[str, List[EpochMetrics]] = {}
+    n_workers = min(n, os.cpu_count() or 4)
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_parallel_run_algorithm, args): args[0] for args in job_args}
+        for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="job"):
+            key, metrics = fut.result()
+            results[key] = metrics
+    return results
 
 
 def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
@@ -148,15 +167,17 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = _build_sim(seed=seed)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
-    results = {}
-    ordi = ORDIScheduler(cfg, sat_ids, gs_names, graphs, deepcopy(states), deepcopy(reliability))
-    results["ORDI"] = _run_algorithm("ORDI", ordi, tasks, graphs, states, reliability,
-                                     sat_ids, gs_names, cfg)
+    job_args = [
+        ("ORDI", "ORDI", ORDIScheduler,
+         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
+    ]
+    for name, baseline in baselines.items():
+        job_args.append((
+            name, name, baseline.__class__,
+            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+        ))
 
-    for name, baseline in tqdm(baselines.items(), desc="E1 baselines", unit="alg"):
-        results[name] = _run_algorithm(name, baseline, tasks, graphs, states, reliability,
-                                       sat_ids, gs_names, cfg)
-
+    results = _run_parallel(job_args, desc="E1 algorithms")
     _save_csv("E1_core", results)
     return results
 
@@ -178,14 +199,14 @@ def run_E2(seed=0) -> Dict[str, List[EpochMetrics]]:
         "thermal":        [FaultEvent("thermal_throttle", 18, 3, [sat_ids[6]])],
     }
 
-    results = {}
-    for scenario_name, faults in tqdm(fault_scenarios.items(), desc="E2 scenarios", unit="scenario"):
-        ordi = ORDIScheduler(cfg, sat_ids, gs_names, graphs, deepcopy(states), deepcopy(reliability))
-        results[scenario_name] = _run_algorithm(
-            "ORDI", ordi, tasks, graphs, states, reliability,
-            sat_ids, gs_names, cfg, faults=faults, seed=seed,
-        )
+    # result_key = scenario name; sched_name = "ORDI" for all
+    job_args = [
+        (scenario_name, "ORDI", ORDIScheduler,
+         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed)
+        for scenario_name, faults in fault_scenarios.items()
+    ]
 
+    results = _run_parallel(job_args, desc="E2 scenarios")
     _save_csv("E2_fault_types", results)
     return results
 
@@ -198,26 +219,20 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
     fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
-    results = {}
+    alg_names = ["ORDI", "B5_seco_like", "B6_full_replication"]
 
-    for rate in tqdm(fault_rates, desc="E3 fault rates", unit="rate"):
+    job_args = []
+    for rate in fault_rates:
         faults = random_fault_schedule(sat_ids, N_EPOCHS, fault_rate=rate, seed=seed)
-        for alg_name in tqdm(["ORDI", "B5_seco_like", "B6_full_replication"], desc=f"  rate={rate:.2f}", unit="alg", leave=False):
+        for alg_name in alg_names:
             key = f"{alg_name}@fault={rate:.2f}"
-            if alg_name == "ORDI":
-                sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                      deepcopy(states), deepcopy(reliability))
-                results[key] = _run_algorithm(
-                    "ORDI", sched, tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg, faults=faults, seed=seed,
-                )
-            else:
-                baseline = baselines[alg_name]
-                results[key] = _run_algorithm(
-                    alg_name, baseline, tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg, faults=faults, seed=seed,
-                )
+            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
+            job_args.append((
+                key, alg_name, cls,
+                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed,
+            ))
 
+    results = _run_parallel(job_args, desc="E3 rate×alg")
     _save_csv("E3_fault_intensity", results)
     return results
 
@@ -228,6 +243,8 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E4: Scalability sweep")
     results = {}
 
+    # Sim is rebuilt per constellation size → keep outer loop sequential,
+    # parallelize the 2 algorithms per size.
     for n_sats in tqdm([12, 24, 36, 60], desc="E4 constellation sizes", unit="size"):
         planes = 6
         per_plane = n_sats // planes
@@ -235,20 +252,16 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
             _build_sim(n_planes=planes, sats_per_plane=per_plane, seed=seed)
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
+        job_args = []
         for alg_name in ["ORDI", "B5_seco_like"]:
             key = f"{alg_name}@n={n_sats}"
-            if alg_name == "ORDI":
-                sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                      deepcopy(states), deepcopy(reliability))
-                results[key] = _run_algorithm(
-                    "ORDI", sched, tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg,
-                )
-            else:
-                results[key] = _run_algorithm(
-                    alg_name, baselines[alg_name], tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg,
-                )
+            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
+            job_args.append((
+                key, alg_name, cls,
+                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+            ))
+
+        results.update(_run_parallel(job_args, desc=f"E4 n={n_sats}"))
 
     _save_csv("E4_scalability", results)
     return results
@@ -260,25 +273,23 @@ def run_E5(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E5: Deadline tightness sweep")
     results = {}
 
+    # Sim is rebuilt per slack → keep outer loop sequential,
+    # parallelize the 3 algorithms per slack.
     for slack in tqdm([60, 120, 180, 300, 600], desc="E5 deadline slacks", unit="slack"):
         sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
             _build_sim(seed=seed, deadline_slack=float(slack))
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
+        job_args = []
         for alg_name in ["ORDI", "B2_onboard_only", "B4_serval_like"]:
             key = f"{alg_name}@slack={slack}s"
-            if alg_name == "ORDI":
-                sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                      deepcopy(states), deepcopy(reliability))
-                results[key] = _run_algorithm(
-                    "ORDI", sched, tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg,
-                )
-            else:
-                results[key] = _run_algorithm(
-                    alg_name, baselines[alg_name], tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg,
-                )
+            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
+            job_args.append((
+                key, alg_name, cls,
+                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+            ))
+
+        results.update(_run_parallel(job_args, desc=f"E5 slack={slack}s"))
 
     _save_csv("E5_deadline", results)
     return results
@@ -290,19 +301,19 @@ def run_E6(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E6: λ_R (replication penalty) sweep")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, base_cfg = \
         _build_sim(seed=seed)
-    results = {}
 
-    for lambda_R in tqdm([0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0], desc="E6 lambda_R", unit="λ"):
+    lambda_Rs = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
+    job_args = []
+    for lambda_R in lambda_Rs:
         cfg = deepcopy(base_cfg)
         cfg.lambda_R = lambda_R
         key = f"ORDI@lambda_R={lambda_R}"
-        sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                              deepcopy(states), deepcopy(reliability))
-        results[key] = _run_algorithm(
-            "ORDI", sched, tasks, graphs, states, reliability,
-            sat_ids, gs_names, cfg,
-        )
+        job_args.append((
+            key, "ORDI", ORDIScheduler,
+            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+        ))
 
+    results = _run_parallel(job_args, desc="E6 lambda_R")
     _save_csv("E6_lambda_R", results)
     return results
 
@@ -315,35 +326,28 @@ def run_E7(seed=0) -> Dict[str, List[EpochMetrics]]:
         _build_sim(seed=seed)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
-    # Knock out entire planes (6 sats each)
     plane_sizes = [6, 12]  # 1 plane, 2 planes
-    results = {}
-
-    for n_plane_sats in tqdm(plane_sizes, desc="E7 plane sizes", unit="config"):
+    job_args = []
+    for n_plane_sats in plane_sizes:
         plane_sats = sat_ids[:n_plane_sats]
         faults = [FaultEvent("plane_outage", 20, 10, plane_sats)]
         label = f"plane_{n_plane_sats}_sats"
-
         for alg_name in ["ORDI", "B6_full_replication"]:
             key = f"{alg_name}@{label}"
-            if alg_name == "ORDI":
-                sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                      deepcopy(states), deepcopy(reliability))
-                results[key] = _run_algorithm(
-                    "ORDI", sched, tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg, faults=faults, seed=seed,
-                )
-            else:
-                results[key] = _run_algorithm(
-                    alg_name, baselines[alg_name], tasks, graphs, states, reliability,
-                    sat_ids, gs_names, cfg, faults=faults, seed=seed,
-                )
+            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
+            job_args.append((
+                key, alg_name, cls,
+                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed,
+            ))
 
+    results = _run_parallel(job_args, desc="E7 configs")
     _save_csv("E7_correlated", results)
     return results
 
 
 # ── E8: ILP vs greedy optimality gap ─────────────────────────────────────────
+# Left sequential: greedy and ILP are compared epoch-by-epoch, and HiGHS
+# already uses 8 threads internally.
 
 def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E8: ILP vs greedy optimality gap (small instances)")
@@ -371,7 +375,7 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
             compute_metrics(g_result, pending, ep_start, sat_cap, cfg.alpha)
         )
 
-        # ILP
+        # ILP (HiGHS uses 8 threads internally)
         ilp_result = solve_ilp(
             epoch, T_SIM_START, pending, graphs, deepcopy(states),
             deepcopy(reliability), gs_names, cfg, time_limit_s=30.0,
