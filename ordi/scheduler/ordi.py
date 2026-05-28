@@ -13,24 +13,17 @@ Per epoch:
 """
 
 from __future__ import annotations
-import ctypes
-import gc
 import math
-import os
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
 
 from ordi.orbit.graph import EpochContactGraph, earliest_arrival, earliest_downlink
 from ordi.sim.satellite import SatelliteState
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask, Tile
 from ordi.scheduler.feasibility import ReplicaCandidate, compute_candidates
-
-try:
-    _libc = ctypes.CDLL("libc.so.6")
-except Exception:
-    _libc = None
 
 
 # ── scheduler parameters (λ weights from proposal) ───────────────────────────
@@ -96,18 +89,24 @@ class ORDIScheduler:
         epoch_start: float,
         pending_tasks: List[EOTask],
     ) -> Tuple[
-        Dict[float, Dict[str, float]],                    # ell_down_caches[d_out][agg]
-        Dict[float, Dict[Tuple[str, str], float]],        # ell_ia_caches[d_out][(h,a)]
-        Dict[float, Dict[str, Dict[str, float]]],         # ell_ski_caches[d_in][src][h]
+        Dict[str, int],                     # sat_index: name → array row/col
+        Dict[float, np.ndarray],            # ell_down_caches[d_out] shape (n,)
+        Dict[float, np.ndarray],            # ell_ia_caches[d_out]   shape (n, n)
+        Dict[float, Dict[str, np.ndarray]], # ell_ski_caches[d_in][src] shape (n,)
     ]:
         """
-        Precompute three routing tables for this epoch that are shared across
-        all (task, tile) pairs, eliminating redundant Dijkstra calls.
+        Precompute three routing tables for this epoch as numpy arrays.
+
+        Storing results in np.ndarray (managed by numpy's own allocator, not
+        Python's arena system) prevents arena fragmentation — the fix for the
+        tens-of-GB RSS growth seen with pure-Python dict caches.
 
         Reduction for n=60: ~62M Dijkstra calls per run → ~3M (20× fewer).
         """
         cfg = self.cfg
         sat_ids_active = [sid for sid, st in self.states.items() if st.A_i]
+        n = len(sat_ids_active)
+        sat_index: Dict[str, int] = {sid: i for i, sid in enumerate(sat_ids_active)}
 
         unique_d_out: Set[float] = set()
         unique_d_in:  Set[float] = set()
@@ -126,71 +125,51 @@ class ORDIScheduler:
 
         max_search_ep = int(math.ceil(max_tau_k / cfg.epoch_length)) + 1
 
-        # ell_down_caches[d_out][agg] ─ aggregator → earliest downlink latency
-        ell_down_caches: Dict[float, Dict[str, float]] = {}
+        # ell_down_caches[d_out] → (n,) array: ell_down_caches[d_out][agg_idx]
+        ell_down_caches: Dict[float, np.ndarray] = {}
         for d_out in unique_d_out:
-            ell_down_caches[d_out] = {
-                agg: earliest_downlink(
+            arr = np.full(n, np.inf)
+            for i, agg in enumerate(sat_ids_active):
+                arr[i] = earliest_downlink(
                     agg, epoch, self.graphs, d_out, self.ground_stations,
                     max_search_epochs=max_search_ep,
                 )
-                for agg in sat_ids_active
-            }
+            ell_down_caches[d_out] = arr
 
-        # ell_ia_caches[d_out][(helper, agg)] ─ helper→agg transfer latency.
-        # Skip pairs where agg can't downlink (saves ~half the Dijkstra calls).
-        # Parallelize with threads: GIL is released during heapq/dict work in
-        # tight loops, giving meaningful wall-clock speedup for large N.
-        ell_ia_caches: Dict[float, Dict[Tuple[str, str], float]] = {}
-        graphs_ref = self.graphs
+        # ell_ia_caches[d_out] → (n, n) array: ell_ia_caches[d_out][h_idx, a_idx]
+        # Only fill cells where agg can downlink (inf ell_down → skip).
+        ell_ia_caches: Dict[float, np.ndarray] = {}
         for d_out in unique_d_out:
             dc = ell_down_caches[d_out]
-            reachable_aggs = [a for a in sat_ids_active
-                              if not math.isinf(dc.get(a, math.inf))]
-            ia: Dict[Tuple[str, str], float] = {}
-
-            def _compute_row(helper: str) -> Dict[Tuple[str, str], float]:
-                row: Dict[Tuple[str, str], float] = {}
-                for agg in reachable_aggs:
-                    if agg == helper:
+            arr = np.full((n, n), np.inf)
+            reachable = [i for i in range(n) if not np.isinf(dc[i])]
+            for hi, helper in enumerate(sat_ids_active):
+                for ai in reachable:
+                    if ai == hi:
                         continue
-                    row[(helper, agg)] = earliest_arrival(
-                        helper, agg, epoch, graphs_ref, d_out,
+                    arr[hi, ai] = earliest_arrival(
+                        helper, sat_ids_active[ai], epoch, self.graphs, d_out,
                         max_search_epochs=max_search_ep,
                     )
-                return row
+            ell_ia_caches[d_out] = arr
 
-            n_workers = min(len(sat_ids_active), (os.cpu_count() or 4))
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                for row in pool.map(_compute_row, sat_ids_active):
-                    ia.update(row)
-            ell_ia_caches[d_out] = ia
-
-        # ell_ski_caches[d_in][source][helper] ─ source→helper transfer latency.
-        ell_ski_caches: Dict[float, Dict[str, Dict[str, float]]] = {}
+        # ell_ski_caches[d_in][source] → (n,) array: arr[h_idx]
+        ell_ski_caches: Dict[float, Dict[str, np.ndarray]] = {}
         for d_in in unique_d_in:
-            per_src: Dict[str, Dict[str, float]] = {}
+            per_src: Dict[str, np.ndarray] = {}
             for source in unique_sources:
-                per_src[source] = {
-                    helper: earliest_arrival(
+                arr = np.full(n, np.inf)
+                for hi, helper in enumerate(sat_ids_active):
+                    if helper == source:
+                        continue
+                    arr[hi] = earliest_arrival(
                         source, helper, epoch, self.graphs, d_in,
                         max_search_epochs=max_search_ep,
                     )
-                    for helper in sat_ids_active
-                    if helper != source
-                }
+                per_src[source] = arr
             ell_ski_caches[d_in] = per_src
 
-        # Release freed Python arena pages back to the OS so per-epoch
-        # Dijkstra allocations don't accumulate across 180 epochs.
-        gc.collect()
-        if _libc is not None:
-            try:
-                _libc.malloc_trim(0)
-            except Exception:
-                pass
-
-        return ell_down_caches, ell_ia_caches, ell_ski_caches
+        return sat_index, ell_down_caches, ell_ia_caches, ell_ski_caches
 
     # ── main scheduling entry point ───────────────────────────────────────────
 
@@ -215,7 +194,7 @@ class ORDIScheduler:
 
         # Precompute routing caches once per epoch to avoid O(N²) Dijkstra
         # redundancy across the many (task, tile) pairs scheduled this epoch.
-        ell_down_caches, ell_ia_caches, ell_ski_caches = \
+        sat_index, ell_down_caches, ell_ia_caches, ell_ski_caches = \
             self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
         for task in pending_tasks:
@@ -227,6 +206,7 @@ class ORDIScheduler:
                 assignment = self._schedule_tile(
                     task, tile, epoch, epoch_start, tau_k,
                     energy_used, link_used,
+                    sat_index,
                     ell_down_caches.get(tile.d_out_bits),
                     ell_ia_caches.get(tile.d_out_bits),
                     ell_ski_caches.get(tile.d_in_bits, {}).get(task.source_sat),
@@ -272,9 +252,10 @@ class ORDIScheduler:
         tau_k: float,
         energy_used: Dict[str, float],
         link_used: Dict[Tuple[str, str], float],
-        ell_down_cache: Optional[Dict[str, float]] = None,
-        ell_ia_cache: Optional[Dict[Tuple[str, str], float]] = None,
-        ell_ski_cache: Optional[Dict[str, float]] = None,
+        sat_index: Optional[Dict[str, int]] = None,
+        ell_down_cache: Optional[np.ndarray] = None,   # shape (n_active,)
+        ell_ia_cache: Optional[np.ndarray] = None,     # shape (n_active, n_active)
+        ell_ski_cache: Optional[np.ndarray] = None,    # shape (n_active,)
     ) -> TileAssignment:
         cfg = self.cfg
         assignment = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
@@ -283,6 +264,7 @@ class ORDIScheduler:
             task, tile, epoch, epoch_start,
             self.graphs, self.states, self.reliability,
             self.ground_stations, tau_k,
+            sat_index=sat_index,
             ell_down_cache=ell_down_cache,
             ell_ia_cache=ell_ia_cache,
             ell_ski_cache=ell_ski_cache,
@@ -294,8 +276,9 @@ class ORDIScheduler:
         if src_state and src_state.A_i:
             t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
             # Reuse the epoch-level downlink cache for the source satellite.
-            if ell_down_cache is not None:
-                ell_down = ell_down_cache.get(task.source_sat, math.inf)
+            src_idx = sat_index.get(task.source_sat) if sat_index is not None else None
+            if ell_down_cache is not None and src_idx is not None:
+                ell_down = float(ell_down_cache[src_idx])
             else:
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(

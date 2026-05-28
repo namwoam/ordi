@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from ordi.orbit.graph import EpochContactGraph, earliest_arrival, earliest_downlink
 from ordi.sim.satellite import SatelliteState
 from ordi.sim.reliability import ReliabilityModel
@@ -43,16 +45,17 @@ def compute_candidates(
     reliability: ReliabilityModel,
     ground_stations: set,
     tau_k: float,           # remaining deadline budget (seconds)
-    ell_down_cache: Optional[Dict[str, float]] = None,
-    ell_ia_cache: Optional[Dict[Tuple[str, str], float]] = None,
-    ell_ski_cache: Optional[Dict[str, float]] = None,
+    sat_index: Optional[Dict[str, int]] = None,
+    ell_down_cache: Optional[np.ndarray] = None,  # shape (n_active,)
+    ell_ia_cache: Optional[np.ndarray] = None,    # shape (n_active, n_active)
+    ell_ski_cache: Optional[np.ndarray] = None,   # shape (n_active,)
 ) -> List[ReplicaCandidate]:
     """
     Enumerate all feasible (helper, aggregator) pairs for tile (k, v) at epoch t.
 
-    Callers should pass epoch-level precomputed caches (ell_down_cache,
-    ell_ia_cache, ell_ski_cache) to avoid redundant Dijkstra calls across tiles.
-    If caches are absent they are computed locally (correct but slow for large N).
+    When sat_index + numpy arrays are provided (normal path from schedule_epoch),
+    all routing lookups are O(1) array accesses with no Python dict overhead.
+    Falls back to computing Dijkstra inline when caches are absent.
     """
     candidates = []
     sat_ids = [sid for sid, st in states.items() if st.A_i == 1]
@@ -60,8 +63,10 @@ def compute_candidates(
     epoch_length = graphs[0].t_end - graphs[0].t_start if graphs else 60.0
     max_search_epochs = int(math.ceil(tau_k / epoch_length)) + 1
 
-    if ell_down_cache is None:
-        ell_down_cache = {
+    # Fallback dict-based ell_down (only used when numpy cache absent)
+    _ell_down_dict: Optional[Dict[str, float]] = None
+    if ell_down_cache is None or sat_index is None:
+        _ell_down_dict = {
             agg: earliest_downlink(
                 agg, epoch, graphs, tile.d_out_bits, ground_stations,
                 max_search_epochs=max_search_epochs,
@@ -77,9 +82,11 @@ def compute_candidates(
         if not h_state.A_i:
             continue
 
+        h_idx = sat_index.get(helper) if sat_index is not None else None
+
         # ℓ_ski: source → helper transfer time for input tile
-        if ell_ski_cache is not None:
-            ell_ski = ell_ski_cache.get(helper, math.inf)
+        if ell_ski_cache is not None and h_idx is not None:
+            ell_ski = float(ell_ski_cache[h_idx])
         else:
             ell_ski = earliest_arrival(
                 task.source_sat, helper, epoch, graphs, tile.d_in_bits,
@@ -99,14 +106,19 @@ def compute_candidates(
             if not a_state.A_i:
                 continue
 
+            a_idx = sat_index.get(aggregator) if sat_index is not None else None
+
             # Check downlink feasibility before computing ell_ia (cheaper first)
-            ell_down = ell_down_cache.get(aggregator, math.inf)
+            if ell_down_cache is not None and a_idx is not None:
+                ell_down = float(ell_down_cache[a_idx])
+            else:
+                ell_down = _ell_down_dict.get(aggregator, math.inf)  # type: ignore[union-attr]
             if math.isinf(ell_down):
                 continue
 
             # ℓ_ia: helper → aggregator transfer time for output
-            if ell_ia_cache is not None:
-                ell_ia = ell_ia_cache.get((helper, aggregator), math.inf)
+            if ell_ia_cache is not None and h_idx is not None and a_idx is not None:
+                ell_ia = float(ell_ia_cache[h_idx, a_idx])
             else:
                 ell_ia = earliest_arrival(
                     helper, aggregator, epoch, graphs, tile.d_out_bits,
