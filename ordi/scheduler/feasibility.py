@@ -51,6 +51,22 @@ def compute_candidates(
     candidates = []
     sat_ids = [sid for sid, st in states.items() if st.A_i == 1]
 
+    # Limit Dijkstra to epochs within the task deadline (paths beyond tau_k are
+    # infeasible anyway, so this is correct — not just a heuristic).
+    epoch_length = graphs[0].t_end - graphs[0].t_start if graphs else 60.0
+    max_search_epochs = int(math.ceil(tau_k / epoch_length)) + 1
+
+    # Precompute ell_down once per aggregator.  ell_down(aggregator) does NOT
+    # depend on which helper is used, so computing it inside the helper loop
+    # (as O(N²)) was the primary performance bottleneck.
+    ell_down_cache: Dict[str, float] = {
+        agg: earliest_downlink(
+            agg, epoch, graphs, tile.d_out_bits, ground_stations,
+            max_search_epochs=max_search_epochs,
+        )
+        for agg in sat_ids
+    }
+
     for helper in sat_ids:
         if helper == task.source_sat:
             continue  # source is not a helper
@@ -61,7 +77,8 @@ def compute_candidates(
 
         # ℓ_ski: source → helper transfer time for input tile
         ell_ski = earliest_arrival(
-            task.source_sat, helper, epoch, graphs, tile.d_in_bits
+            task.source_sat, helper, epoch, graphs, tile.d_in_bits,
+            max_search_epochs=max_search_epochs,
         )
         if math.isinf(ell_ski):
             continue
@@ -77,18 +94,17 @@ def compute_candidates(
             if not a_state.A_i:
                 continue
 
-            # ℓ_ia: helper → aggregator transfer time for output
-            ell_ia = earliest_arrival(
-                helper, aggregator, epoch, graphs, tile.d_out_bits
-            )
-            if math.isinf(ell_ia):
+            # Check downlink feasibility before computing ell_ia (cheaper first)
+            ell_down = ell_down_cache.get(aggregator, math.inf)
+            if math.isinf(ell_down):
                 continue
 
-            # ℓ_down_a: aggregator → any ground station
-            ell_down = earliest_downlink(
-                aggregator, epoch, graphs, tile.d_out_bits, ground_stations
+            # ℓ_ia: helper → aggregator transfer time for output
+            ell_ia = earliest_arrival(
+                helper, aggregator, epoch, graphs, tile.d_out_bits,
+                max_search_epochs=max_search_epochs,
             )
-            if math.isinf(ell_down):
+            if math.isinf(ell_ia):
                 continue
 
             L_kvia = ell_ski + t_compute + ell_ia + ell_down

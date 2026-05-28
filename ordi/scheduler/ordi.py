@@ -161,6 +161,36 @@ class ORDIScheduler:
             self.ground_stations, tau_k,
         )
 
+        # Add source-satellite self-processing as a candidate so ORDI never
+        # has a higher miss rate than onboard-only baselines. Zero ISL bits/energy.
+        src_state = self.states.get(task.source_sat)
+        if src_state and src_state.A_i:
+            t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+            _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
+            ell_down = earliest_downlink(
+                task.source_sat, epoch, self.graphs, tile.d_out_bits,
+                self.ground_stations, max_search_epochs=_max_ep,
+            )
+            L_self = t_compute + ell_down
+            if L_self <= tau_k:
+                p_self = (self.reliability.node_pi(task.source_sat)
+                          * self.reliability.default_downlink_pi)
+                candidates.append(ReplicaCandidate(
+                    task_id=task.task_id,
+                    tile_id=tile.tile_id,
+                    helper=task.source_sat,
+                    aggregator=task.source_sat,
+                    epoch=epoch,
+                    latency=L_self,
+                    p_success=p_self,
+                    e_compute=src_state.energy_for_compute(tile.compute_ops),
+                    e_rx=0.0,
+                    e_tx=0.0,
+                    feasible=True,
+                    d_in_bits=0.0,
+                    d_out_bits=0.0,
+                ))
+
         if not candidates:
             return assignment  # no feasible replica
 

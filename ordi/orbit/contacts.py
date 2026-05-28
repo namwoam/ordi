@@ -16,7 +16,7 @@ from skyfield.units import Distance
 
 # ── tunables ────────────────────────────────────────────────────────────────
 GS_MIN_ELEVATION_DEG = 5.0       # minimum elevation for sat-ground contact
-ISL_MAX_RANGE_KM = 2500.0        # maximum ISL range
+ISL_MAX_RANGE_KM = 5000.0        # maximum ISL range
 DOWNLINK_RATE_BPS = 100e6        # 100 Mbps downlink (Starlink-class)
 ISL_RATE_BPS = 200e6             # 200 Mbps ISL
 UPLINK_RATE_BPS = 10e6           # 10 Mbps uplink (ground → sat)

@@ -86,15 +86,22 @@ def earliest_arrival(
     epoch: int,
     graphs: List[EpochContactGraph],
     data_bits: float,
+    max_search_epochs: Optional[int] = None,
 ) -> float:
     """
     Compute the earliest-arrival transfer time (seconds) to send `data_bits`
     from `src` to `dst` starting at the given epoch, using a multi-hop path
     through the time-expanded contact graph.
 
+    max_search_epochs: if set, limit search to this many epochs ahead (e.g.
+    ceil(tau_k / epoch_length) + 1). Paths beyond that window would violate
+    the deadline anyway, so this is correct for feasibility checks.
+
     Returns math.inf if no path exists within the remaining epochs.
     """
     n_epochs = len(graphs)
+    if max_search_epochs is not None:
+        n_epochs = min(n_epochs, epoch + max_search_epochs)
 
     # Dijkstra over (epoch, node) states.
     # State cost = wall-clock time elapsed from the start of `epoch`.
@@ -165,11 +172,13 @@ def earliest_downlink(
     graphs: List[EpochContactGraph],
     data_bits: float,
     ground_stations: set,
+    max_search_epochs: Optional[int] = None,
 ) -> float:
     """Earliest transfer time from `aggregator` to any reachable ground station."""
     best = math.inf
     for gs in ground_stations:
-        t = earliest_arrival(aggregator, gs, epoch, graphs, data_bits)
+        t = earliest_arrival(aggregator, gs, epoch, graphs, data_bits,
+                             max_search_epochs=max_search_epochs)
         if t < best:
             best = t
     return best

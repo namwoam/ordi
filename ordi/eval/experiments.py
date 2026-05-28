@@ -142,6 +142,13 @@ def _run_parallel(job_args: List[Tuple], desc: str = "") -> Dict[str, List[Epoch
     return results
 
 
+_CSV_FIELDS = [
+    "algorithm", "deadline_miss_ratio", "delivered_utility", "partial_coverage",
+    "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
+    "energy_joules", "helper_utilization", "objective",
+]
+
+
 def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     path = os.path.join(RESULTS_DIR, f"{exp_id}.csv")
@@ -152,9 +159,9 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
         rows.append(row)
     if not rows:
         return
-    keys = list(rows[0].keys())
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS,
+                                extrasaction="ignore", restval="")
         writer.writeheader()
         writer.writerows(rows)
     print(f"  Saved: {path}")
@@ -239,6 +246,14 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
 
 # ── E4: Scalability (constellation size 10–100 sats) ─────────────────────────
 
+_E4_CONFIGS = {
+    12: (3, 4),   # 3 planes × 4 sats: enough inter-plane contact density
+    24: (4, 6),   # 4 planes × 6 sats
+    36: (6, 6),   # 6 planes × 6 sats (matches E1 baseline)
+    60: (6, 10),  # 6 planes × 10 sats
+}
+
+
 def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E4: Scalability sweep")
     results = {}
@@ -246,8 +261,7 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
     # Sim is rebuilt per constellation size → keep outer loop sequential,
     # parallelize the 2 algorithms per size.
     for n_sats in tqdm([12, 24, 36, 60], desc="E4 constellation sizes", unit="size"):
-        planes = 6
-        per_plane = n_sats // planes
+        planes, per_plane = _E4_CONFIGS[n_sats]
         sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
             _build_sim(n_planes=planes, sats_per_plane=per_plane, seed=seed)
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
@@ -353,9 +367,9 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E8: ILP vs greedy optimality gap (small instances)")
     from ordi.scheduler.ilp import solve_ilp
 
-    # Small constellation: 3 planes × 4 sats = 12 sats, 2 tasks
+    # Small constellation: 3 planes × 4 sats = 12 sats
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(n_planes=3, sats_per_plane=4, arrival_rate=1.0, seed=seed)
+        _build_sim(n_planes=3, sats_per_plane=4, arrival_rate=3.0, seed=seed)
 
     results = {"ORDI_greedy": [], "ORDI_ILP": []}
     sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
@@ -363,7 +377,7 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     greedy_sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
                                  deepcopy(states), deepcopy(reliability))
 
-    for epoch in range(min(20, N_EPOCHS)):  # first 20 epochs only
+    for epoch in range(N_EPOCHS):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         if not pending:

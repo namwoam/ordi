@@ -82,8 +82,10 @@ class DirectDownlink:
 
             for tile in task.tiles:
                 # Downlink raw tile directly from source
+                _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
-                    src, epoch, self.graphs, tile.d_in_bits, self.ground_stations
+                    src, epoch, self.graphs, tile.d_in_bits, self.ground_stations,
+                    max_search_epochs=_max_ep,
                 )
                 feasible = ell_down <= tau_k
                 p_down = self.reliability.default_downlink_pi if feasible else 0.0
@@ -134,8 +136,10 @@ class OnboardOnly:
 
             for tile in task.tiles:
                 t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
-                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations
+                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,
+                    max_search_epochs=_max_ep,
                 )
                 L = t_compute + ell_down
                 feasible = L <= tau_k
@@ -187,8 +191,10 @@ class CompressionOnly:
 
             for tile in task.tiles:
                 compressed_bits = tile.d_in_bits * COMPRESSION_RATIO
+                _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
-                    src, epoch, self.graphs, compressed_bits, self.ground_stations
+                    src, epoch, self.graphs, compressed_bits, self.ground_stations,
+                    max_search_epochs=_max_ep,
                 )
                 feasible = ell_down <= tau_k
                 p = self.reliability.default_downlink_pi if feasible else 0.0
@@ -253,8 +259,10 @@ class ServalLike:
             time_offset = 0.0
             for tile in high_priority + low_priority:
                 t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
-                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations
+                    src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,
+                    max_search_epochs=_max_ep,
                 )
                 L = time_offset + t_compute + ell_down
                 feasible = L <= tau_k
