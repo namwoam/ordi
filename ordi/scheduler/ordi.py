@@ -108,6 +108,13 @@ class ORDIScheduler:
         n = len(sat_ids_active)
         sat_index: Dict[str, int] = {sid: i for i, sid in enumerate(sat_ids_active)}
 
+        # node_index covers sats + ground stations so Dijkstra can use numpy
+        # dist arrays (no Python arena allocations) for every routing call.
+        node_index: Dict[str, int] = {
+            **sat_index,
+            **{gs: n + i for i, gs in enumerate(sorted(self.ground_stations))},
+        }
+
         unique_d_out: Set[float] = set()
         unique_d_in:  Set[float] = set()
         unique_sources: Set[str] = set()
@@ -132,7 +139,7 @@ class ORDIScheduler:
             for i, agg in enumerate(sat_ids_active):
                 arr[i] = earliest_downlink(
                     agg, epoch, self.graphs, d_out, self.ground_stations,
-                    max_search_epochs=max_search_ep,
+                    max_search_epochs=max_search_ep, node_index=node_index,
                 )
             ell_down_caches[d_out] = arr
 
@@ -149,7 +156,7 @@ class ORDIScheduler:
                         continue
                     arr[hi, ai] = earliest_arrival(
                         helper, sat_ids_active[ai], epoch, self.graphs, d_out,
-                        max_search_epochs=max_search_ep,
+                        max_search_epochs=max_search_ep, node_index=node_index,
                     )
             ell_ia_caches[d_out] = arr
 
@@ -164,7 +171,7 @@ class ORDIScheduler:
                         continue
                     arr[hi] = earliest_arrival(
                         source, helper, epoch, self.graphs, d_in,
-                        max_search_epochs=max_search_ep,
+                        max_search_epochs=max_search_ep, node_index=node_index,
                     )
                 per_src[source] = arr
             ell_ski_caches[d_in] = per_src

@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Tuple
 import heapq
 import math
 
+import numpy as np
+
 from ordi.orbit.contacts import ContactEvent
 
 
@@ -87,15 +89,19 @@ def earliest_arrival(
     graphs: List[EpochContactGraph],
     data_bits: float,
     max_search_epochs: Optional[int] = None,
+    node_index: Optional[Dict[str, int]] = None,
 ) -> float:
     """
     Compute the earliest-arrival transfer time (seconds) to send `data_bits`
     from `src` to `dst` starting at the given epoch, using a multi-hop path
     through the time-expanded contact graph.
 
-    max_search_epochs: if set, limit search to this many epochs ahead (e.g.
-    ceil(tau_k / epoch_length) + 1). Paths beyond that window would violate
-    the deadline anyway, so this is correct for feasibility checks.
+    node_index: optional name→int mapping. When provided, the dist table is a
+    numpy array (no Python arena allocations) and heap entries use integer node
+    indices — eliminating the main source of arena fragmentation for large N.
+
+    max_search_epochs: limit search to this many epochs ahead (correct for
+    feasibility checks since paths beyond tau_k are infeasible).
 
     Returns math.inf if no path exists within the remaining epochs.
     """
@@ -103,23 +109,92 @@ def earliest_arrival(
     if max_search_epochs is not None:
         n_epochs = min(n_epochs, epoch + max_search_epochs)
 
-    # Dijkstra over (epoch, node) states.
-    # State cost = wall-clock time elapsed from the start of `epoch`.
     INF = math.inf
-    dist: Dict[Tuple[int, str], float] = {}
-    # heap: (elapsed_seconds, current_epoch, current_node, bits_remaining)
-    heap = [(0.0, epoch, src, data_bits)]
 
-    while heap:
-        elapsed, ep, node, bits_left = heapq.heappop(heap)
+    if node_index is not None:
+        # ── fast path: numpy dist array, integer node indices in heap ──────────
+        src_idx = node_index.get(src, -1)
+        dst_idx = node_index.get(dst, -1)
+        if src_idx < 0 or dst_idx < 0:
+            return INF
+
+        n_ep = n_epochs - epoch
+        n_nodes = len(node_index)
+        dist = np.full((n_ep, n_nodes), INF)
+
+        # heap: (elapsed, ep_offset, node_idx, bits_remaining)
+        heap = [(0.0, 0, src_idx, data_bits)]
+
+        while heap:
+            elapsed, ep_off, n_idx, bits_left = heapq.heappop(heap)
+            ep = epoch + ep_off
+
+            if n_idx == dst_idx and bits_left <= 0:
+                return elapsed
+            if ep_off >= n_ep:
+                continue
+            if dist[ep_off, n_idx] < elapsed:
+                continue
+            dist[ep_off, n_idx] = elapsed
+
+            if ep >= n_epochs:
+                continue
+
+            g = graphs[ep]
+            ep_elapsed_so_far = elapsed - (g.t_start - graphs[epoch].t_start)
+
+            for (na, nb, rate, cap, _) in g.edges:
+                na_idx = node_index.get(na, -1)
+                if na_idx != n_idx:
+                    continue
+                nb_idx = node_index.get(nb, -1)
+                if nb_idx < 0:
+                    continue
+
+                ep_remaining = g.t_end - g.t_start - max(0.0, ep_elapsed_so_far)
+                if ep_remaining <= 0:
+                    continue
+                bits_sent = min(bits_left, min(cap, ep_remaining * rate))
+                new_bits_left = max(0.0, bits_left - bits_sent)
+                time_used = bits_sent / rate if rate > 0 else 0.0
+                new_elapsed = elapsed + time_used
+
+                if new_bits_left <= 0:
+                    if dist[ep_off, nb_idx] > new_elapsed:
+                        dist[ep_off, nb_idx] = new_elapsed
+                        heapq.heappush(heap, (new_elapsed, ep_off, nb_idx, 0.0))
+                else:
+                    next_ep_off = ep_off + 1
+                    if next_ep_off < n_ep:
+                        next_elapsed = new_elapsed + (graphs[ep + 1].t_start - g.t_end)
+                        if dist[next_ep_off, nb_idx] > next_elapsed:
+                            dist[next_ep_off, nb_idx] = next_elapsed
+                            heapq.heappush(heap, (next_elapsed, next_ep_off, nb_idx, new_bits_left))
+
+            next_ep_off = ep_off + 1
+            if next_ep_off < n_ep:
+                wait = graphs[ep + 1].t_start - g.t_start - max(0.0, ep_elapsed_so_far)
+                new_elapsed = elapsed + max(0.0, wait)
+                if dist[next_ep_off, n_idx] > new_elapsed:
+                    dist[next_ep_off, n_idx] = new_elapsed
+                    heapq.heappush(heap, (new_elapsed, next_ep_off, n_idx, bits_left))
+
+        return INF
+
+    # ── fallback: original dict-based Dijkstra ──────────────────────────────
+    dist_d: Dict[Tuple[int, str], float] = {}
+    heap_d = [(0.0, epoch, src, data_bits)]
+
+    while heap_d:
+        elapsed, ep, node, bits_left = heapq.heappop(heap_d)
 
         if node == dst and bits_left <= 0:
             return elapsed
 
         state = (ep, node)
-        if dist.get(state, INF) < elapsed:
+        if dist_d.get(state, INF) < elapsed:
             continue
-        dist[state] = elapsed
+        dist_d[state] = elapsed
 
         if ep >= n_epochs:
             continue
@@ -130,9 +205,6 @@ def earliest_arrival(
         for (na, nb, rate, cap, _) in g.edges:
             if na != node:
                 continue
-            # Time to transfer bits_left over this link in this epoch
-            time_to_send = bits_left / rate if rate > 0 else INF
-            # How much of the epoch is left?
             ep_remaining = g.t_end - g.t_start - max(0.0, ep_elapsed_so_far)
             if ep_remaining <= 0:
                 continue
@@ -142,26 +214,23 @@ def earliest_arrival(
             new_elapsed = elapsed + time_used
 
             if new_bits_left <= 0:
-                # Delivery complete on this hop
                 next_state = (ep, nb)
-                if dist.get(next_state, INF) > new_elapsed:
-                    heapq.heappush(heap, (new_elapsed, ep, nb, 0.0))
+                if dist_d.get(next_state, INF) > new_elapsed:
+                    heapq.heappush(heap_d, (new_elapsed, ep, nb, 0.0))
             else:
-                # Carry over to next epoch
                 next_ep = ep + 1
                 if next_ep < n_epochs:
                     next_elapsed = new_elapsed + (graphs[next_ep].t_start - g.t_end)
                     next_state = (next_ep, nb)
-                    if dist.get(next_state, INF) > next_elapsed:
-                        heapq.heappush(heap, (next_elapsed, next_ep, nb, new_bits_left))
+                    if dist_d.get(next_state, INF) > next_elapsed:
+                        heapq.heappush(heap_d, (next_elapsed, next_ep, nb, new_bits_left))
 
-        # Also allow waiting at current node for next epoch
         if ep + 1 < n_epochs:
             wait = graphs[ep + 1].t_start - g.t_start - max(0.0, ep_elapsed_so_far)
             next_state = (ep + 1, node)
             new_elapsed = elapsed + max(0.0, wait)
-            if dist.get(next_state, INF) > new_elapsed:
-                heapq.heappush(heap, (new_elapsed, ep + 1, node, bits_left))
+            if dist_d.get(next_state, INF) > new_elapsed:
+                heapq.heappush(heap_d, (new_elapsed, ep + 1, node, bits_left))
 
     return INF
 
@@ -173,12 +242,14 @@ def earliest_downlink(
     data_bits: float,
     ground_stations: set,
     max_search_epochs: Optional[int] = None,
+    node_index: Optional[Dict[str, int]] = None,
 ) -> float:
     """Earliest transfer time from `aggregator` to any reachable ground station."""
     best = math.inf
     for gs in ground_stations:
         t = earliest_arrival(aggregator, gs, epoch, graphs, data_bits,
-                             max_search_epochs=max_search_epochs)
+                             max_search_epochs=max_search_epochs,
+                             node_index=node_index)
         if t < best:
             best = t
     return best
