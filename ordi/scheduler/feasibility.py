@@ -43,29 +43,31 @@ def compute_candidates(
     reliability: ReliabilityModel,
     ground_stations: set,
     tau_k: float,           # remaining deadline budget (seconds)
+    ell_down_cache: Optional[Dict[str, float]] = None,
+    ell_ia_cache: Optional[Dict[Tuple[str, str], float]] = None,
+    ell_ski_cache: Optional[Dict[str, float]] = None,
 ) -> List[ReplicaCandidate]:
     """
     Enumerate all feasible (helper, aggregator) pairs for tile (k, v) at epoch t.
-    Returns a list of ReplicaCandidate (feasible and infeasible, for analysis).
+
+    Callers should pass epoch-level precomputed caches (ell_down_cache,
+    ell_ia_cache, ell_ski_cache) to avoid redundant Dijkstra calls across tiles.
+    If caches are absent they are computed locally (correct but slow for large N).
     """
     candidates = []
     sat_ids = [sid for sid, st in states.items() if st.A_i == 1]
 
-    # Limit Dijkstra to epochs within the task deadline (paths beyond tau_k are
-    # infeasible anyway, so this is correct — not just a heuristic).
     epoch_length = graphs[0].t_end - graphs[0].t_start if graphs else 60.0
     max_search_epochs = int(math.ceil(tau_k / epoch_length)) + 1
 
-    # Precompute ell_down once per aggregator.  ell_down(aggregator) does NOT
-    # depend on which helper is used, so computing it inside the helper loop
-    # (as O(N²)) was the primary performance bottleneck.
-    ell_down_cache: Dict[str, float] = {
-        agg: earliest_downlink(
-            agg, epoch, graphs, tile.d_out_bits, ground_stations,
-            max_search_epochs=max_search_epochs,
-        )
-        for agg in sat_ids
-    }
+    if ell_down_cache is None:
+        ell_down_cache = {
+            agg: earliest_downlink(
+                agg, epoch, graphs, tile.d_out_bits, ground_stations,
+                max_search_epochs=max_search_epochs,
+            )
+            for agg in sat_ids
+        }
 
     for helper in sat_ids:
         if helper == task.source_sat:
@@ -76,10 +78,13 @@ def compute_candidates(
             continue
 
         # ℓ_ski: source → helper transfer time for input tile
-        ell_ski = earliest_arrival(
-            task.source_sat, helper, epoch, graphs, tile.d_in_bits,
-            max_search_epochs=max_search_epochs,
-        )
+        if ell_ski_cache is not None:
+            ell_ski = ell_ski_cache.get(helper, math.inf)
+        else:
+            ell_ski = earliest_arrival(
+                task.source_sat, helper, epoch, graphs, tile.d_in_bits,
+                max_search_epochs=max_search_epochs,
+            )
         if math.isinf(ell_ski):
             continue
 
@@ -100,10 +105,13 @@ def compute_candidates(
                 continue
 
             # ℓ_ia: helper → aggregator transfer time for output
-            ell_ia = earliest_arrival(
-                helper, aggregator, epoch, graphs, tile.d_out_bits,
-                max_search_epochs=max_search_epochs,
-            )
+            if ell_ia_cache is not None:
+                ell_ia = ell_ia_cache.get((helper, aggregator), math.inf)
+            else:
+                ell_ia = earliest_arrival(
+                    helper, aggregator, epoch, graphs, tile.d_out_bits,
+                    max_search_epochs=max_search_epochs,
+                )
             if math.isinf(ell_ia):
                 continue
 

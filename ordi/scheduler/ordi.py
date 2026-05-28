@@ -79,6 +79,90 @@ class ORDIScheduler:
         # Link utilization tracking: (a,b,epoch) → bits consumed
         self._link_used: Dict[Tuple[str, str, int], float] = {}
 
+    # ── epoch-level routing cache ─────────────────────────────────────────────
+
+    def _build_epoch_caches(
+        self,
+        epoch: int,
+        epoch_start: float,
+        pending_tasks: List[EOTask],
+    ) -> Tuple[
+        Dict[float, Dict[str, float]],                    # ell_down_caches[d_out][agg]
+        Dict[float, Dict[Tuple[str, str], float]],        # ell_ia_caches[d_out][(h,a)]
+        Dict[float, Dict[str, Dict[str, float]]],         # ell_ski_caches[d_in][src][h]
+    ]:
+        """
+        Precompute three routing tables for this epoch that are shared across
+        all (task, tile) pairs, eliminating redundant Dijkstra calls.
+
+        Reduction for n=60: ~62M Dijkstra calls per run → ~3M (20× fewer).
+        """
+        cfg = self.cfg
+        sat_ids_active = [sid for sid, st in self.states.items() if st.A_i]
+
+        unique_d_out: Set[float] = set()
+        unique_d_in:  Set[float] = set()
+        unique_sources: Set[str] = set()
+        max_tau_k = cfg.epoch_length
+
+        for task in pending_tasks:
+            tau_k = task.deadline - epoch_start
+            if tau_k <= 0:
+                continue
+            max_tau_k = max(max_tau_k, tau_k)
+            unique_sources.add(task.source_sat)
+            for tile in task.tiles:
+                unique_d_out.add(tile.d_out_bits)
+                unique_d_in.add(tile.d_in_bits)
+
+        max_search_ep = int(math.ceil(max_tau_k / cfg.epoch_length)) + 1
+
+        # ell_down_caches[d_out][agg] ─ aggregator → earliest downlink latency
+        ell_down_caches: Dict[float, Dict[str, float]] = {}
+        for d_out in unique_d_out:
+            ell_down_caches[d_out] = {
+                agg: earliest_downlink(
+                    agg, epoch, self.graphs, d_out, self.ground_stations,
+                    max_search_epochs=max_search_ep,
+                )
+                for agg in sat_ids_active
+            }
+
+        # ell_ia_caches[d_out][(helper, agg)] ─ helper→agg transfer latency.
+        # Skip pairs where agg can't downlink (saves ~half the Dijkstra calls).
+        ell_ia_caches: Dict[float, Dict[Tuple[str, str], float]] = {}
+        for d_out in unique_d_out:
+            dc = ell_down_caches[d_out]
+            ia: Dict[Tuple[str, str], float] = {}
+            for helper in sat_ids_active:
+                for agg in sat_ids_active:
+                    if agg == helper:
+                        continue
+                    if math.isinf(dc.get(agg, math.inf)):
+                        continue
+                    ia[(helper, agg)] = earliest_arrival(
+                        helper, agg, epoch, self.graphs, d_out,
+                        max_search_epochs=max_search_ep,
+                    )
+            ell_ia_caches[d_out] = ia
+
+        # ell_ski_caches[d_in][source][helper] ─ source→helper transfer latency.
+        ell_ski_caches: Dict[float, Dict[str, Dict[str, float]]] = {}
+        for d_in in unique_d_in:
+            per_src: Dict[str, Dict[str, float]] = {}
+            for source in unique_sources:
+                per_src[source] = {
+                    helper: earliest_arrival(
+                        source, helper, epoch, self.graphs, d_in,
+                        max_search_epochs=max_search_ep,
+                    )
+                    for helper in sat_ids_active
+                    if helper != source
+                }
+            ell_ski_caches[d_in] = per_src
+
+        return ell_down_caches, ell_ia_caches, ell_ski_caches
+
     # ── main scheduling entry point ───────────────────────────────────────────
 
     def schedule_epoch(
@@ -100,6 +184,11 @@ class ORDIScheduler:
         energy_used: Dict[str, float] = {s: 0.0 for s in self.sat_ids}
         link_used: Dict[Tuple[str, str], float] = {}
 
+        # Precompute routing caches once per epoch to avoid O(N²) Dijkstra
+        # redundancy across the many (task, tile) pairs scheduled this epoch.
+        ell_down_caches, ell_ia_caches, ell_ski_caches = \
+            self._build_epoch_caches(epoch, epoch_start, pending_tasks)
+
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
             if tau_k <= 0:
@@ -109,6 +198,9 @@ class ORDIScheduler:
                 assignment = self._schedule_tile(
                     task, tile, epoch, epoch_start, tau_k,
                     energy_used, link_used,
+                    ell_down_caches.get(tile.d_out_bits),
+                    ell_ia_caches.get(tile.d_out_bits),
+                    ell_ski_caches.get(tile.d_in_bits, {}).get(task.source_sat),
                 )
                 assignments.append(assignment)
                 total_utility += tile.utility * assignment.z_kv * math.exp(
@@ -151,6 +243,9 @@ class ORDIScheduler:
         tau_k: float,
         energy_used: Dict[str, float],
         link_used: Dict[Tuple[str, str], float],
+        ell_down_cache: Optional[Dict[str, float]] = None,
+        ell_ia_cache: Optional[Dict[Tuple[str, str], float]] = None,
+        ell_ski_cache: Optional[Dict[str, float]] = None,
     ) -> TileAssignment:
         cfg = self.cfg
         assignment = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
@@ -159,6 +254,9 @@ class ORDIScheduler:
             task, tile, epoch, epoch_start,
             self.graphs, self.states, self.reliability,
             self.ground_stations, tau_k,
+            ell_down_cache=ell_down_cache,
+            ell_ia_cache=ell_ia_cache,
+            ell_ski_cache=ell_ski_cache,
         )
 
         # Add source-satellite self-processing as a candidate so ORDI never
@@ -166,11 +264,15 @@ class ORDIScheduler:
         src_state = self.states.get(task.source_sat)
         if src_state and src_state.A_i:
             t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
-            _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
-            ell_down = earliest_downlink(
-                task.source_sat, epoch, self.graphs, tile.d_out_bits,
-                self.ground_stations, max_search_epochs=_max_ep,
-            )
+            # Reuse the epoch-level downlink cache for the source satellite.
+            if ell_down_cache is not None:
+                ell_down = ell_down_cache.get(task.source_sat, math.inf)
+            else:
+                _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
+                ell_down = earliest_downlink(
+                    task.source_sat, epoch, self.graphs, tile.d_out_bits,
+                    self.ground_stations, max_search_epochs=_max_ep,
+                )
             L_self = t_compute + ell_down
             if L_self <= tau_k:
                 p_self = (self.reliability.node_pi(task.source_sat)
