@@ -133,7 +133,7 @@ def _run_parallel(job_args: List[Tuple], desc: str = "") -> Dict[str, List[Epoch
     """Submit a list of _parallel_run_algorithm arg-tuples and collect results."""
     n = len(job_args)
     results: Dict[str, List[EpochMetrics]] = {}
-    n_workers = min(n, os.cpu_count() or 4)
+    n_workers = min(n, 16)
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_parallel_run_algorithm, args): args[0] for args in job_args}
         for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="job"):
