@@ -156,10 +156,22 @@ class FaultInjector:
                 if key in self.reliability._link_overrides:
                     del self.reliability._link_overrides[key]
 
-        elif ft in ("battery_shortage", "thermal_throttle"):
+        elif ft == "battery_shortage":
             for sat_id in fault.targets:
                 if sat_id in self.states:
-                    self.states[sat_id].recover()
+                    s = self.states[sat_id]
+                    # Restore battery above minimum so _update_availability sets A_i=1.
+                    s.B_i = s.params.battery_min_j * 1.5
+                    s.recover()
+
+        elif ft == "thermal_throttle":
+            for sat_id in fault.targets:
+                if sat_id in self.states:
+                    s = self.states[sat_id]
+                    # Restore temperature below throttle threshold.
+                    s.Theta_i = s.params.thermal_ambient_c
+                    s.C_i = s._throttled_compute_rate()
+                    s.recover()
 
     # ── convenience factory methods ───────────────────────────────────────────
 

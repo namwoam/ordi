@@ -108,11 +108,16 @@ class ORDIScheduler:
         n = len(sat_ids_active)
         sat_index: Dict[str, int] = {sid: i for i, sid in enumerate(sat_ids_active)}
 
-        # node_index covers sats + ground stations so Dijkstra can use numpy
-        # dist arrays (no Python arena allocations) for every routing call.
+        # node_index covers ALL sats (active or not) + ground stations.
+        # Inactive satellites can still act as ISL relay nodes; A_i only gates
+        # whether a satellite is eligible as a helper/aggregator (checked in
+        # compute_candidates). Using all nodes here matches baseline routing
+        # and prevents route-blocking when a satellite temporarily has A_i=0.
+        all_sat_ids = list(self.states.keys())
+        n_all = len(all_sat_ids)
         node_index: Dict[str, int] = {
-            **sat_index,
-            **{gs: n + i for i, gs in enumerate(sorted(self.ground_stations))},
+            **{sid: i for i, sid in enumerate(all_sat_ids)},
+            **{gs: n_all + i for i, gs in enumerate(sorted(self.ground_stations))},
         }
 
         unique_d_out: Set[float] = set()
