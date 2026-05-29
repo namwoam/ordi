@@ -59,7 +59,8 @@ def _pick_solver(time_limit_s: float, threads: int = 8) -> "pulp.LpSolver":
     """Return HiGHS if available, else CBC."""
     try:
         solver = pulp.HiGHS(msg=False, timeLimit=time_limit_s, threads=threads)
-        solver.available()
+        if not solver.available():
+            raise RuntimeError("HiGHS not available")
         return solver
     except Exception:
         return pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit_s, threads=threads)
@@ -245,7 +246,15 @@ def solve_ilp(
 
     # ── solve ─────────────────────────────────────────────────────────────────
     solver = _pick_solver(time_limit_s)
-    status = prob.solve(solver)
+    try:
+        status = prob.solve(solver)
+    except Exception:
+        # Solver binary unavailable at solve time — retry with CBC
+        solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit_s, threads=1)
+        try:
+            status = prob.solve(solver)
+        except Exception:
+            return None
 
     lp_status = pulp.LpStatus[status]
     if lp_status == "Infeasible":
