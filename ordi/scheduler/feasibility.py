@@ -101,6 +101,33 @@ def compute_candidates(
         # compute time on helper
         t_compute = tile.compute_ops / max(h_state.C_i, 1.0)
 
+        # helper-as-aggregator: helper processes AND downlinks directly (no ISL output)
+        if ell_down_cache is not None and h_idx is not None:
+            ell_down_h = float(ell_down_cache[h_idx])
+        else:
+            ell_down_h = _ell_down_dict.get(helper, math.inf)  # type: ignore[union-attr]
+        if not math.isinf(ell_down_h):
+            L_self = ell_ski + t_compute + ell_down_h
+            if L_self <= tau_k:
+                p_self = (reliability.node_pi(helper)
+                          * reliability.link_pi(task.source_sat, helper, "isl")
+                          * reliability.default_downlink_pi)
+                candidates.append(ReplicaCandidate(
+                    task_id=task.task_id,
+                    tile_id=tile.tile_id,
+                    helper=helper,
+                    aggregator=helper,
+                    epoch=epoch,
+                    latency=L_self,
+                    p_success=p_self,
+                    e_compute=h_state.energy_for_compute(tile.compute_ops),
+                    e_rx=h_state.energy_for_rx(tile.d_in_bits),
+                    e_tx=0.0,
+                    feasible=True,
+                    d_in_bits=tile.d_in_bits,
+                    d_out_bits=0.0,
+                ))
+
         for aggregator in sat_ids:
             if aggregator == helper:
                 continue

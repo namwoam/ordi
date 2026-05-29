@@ -167,9 +167,18 @@ class OnboardOnly:
                 a.primary_aggregator = src
                 a.z_kv = z_kv
                 a.L_hat = L if feasible else math.inf
-                assignments.append(a)
                 if feasible:
+                    a.replicas = [ReplicaCandidate(
+                        task_id=task.task_id, tile_id=tile.tile_id,
+                        helper=src, aggregator=src, epoch=epoch,
+                        latency=L, p_success=p,
+                        e_compute=src_state.energy_for_compute(tile.compute_ops),
+                        e_rx=0.0, e_tx=0.0,
+                        feasible=True,
+                        d_in_bits=0.0, d_out_bits=0.0,
+                    )]
                     total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * L)
+                assignments.append(a)
 
         return SchedulerResult(
             epoch=epoch, assignments=assignments, total_utility=total_utility,
@@ -222,9 +231,19 @@ class CompressionOnly:
                 a.primary_aggregator = src
                 a.z_kv = z_kv
                 a.L_hat = ell_down if feasible else math.inf
-                assignments.append(a)
                 if feasible:
+                    # Compression compute is ~10% of full inference cost
+                    a.replicas = [ReplicaCandidate(
+                        task_id=task.task_id, tile_id=tile.tile_id,
+                        helper=src, aggregator=src, epoch=epoch,
+                        latency=ell_down, p_success=p,
+                        e_compute=src_state.energy_for_compute(tile.compute_ops * 0.1),
+                        e_rx=0.0, e_tx=0.0,
+                        feasible=True,
+                        d_in_bits=0.0, d_out_bits=0.0,
+                    )]
                     total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * ell_down)
+                assignments.append(a)
 
         return SchedulerResult(
             epoch=epoch, assignments=assignments, total_utility=total_utility,
@@ -292,10 +311,19 @@ class ServalLike:
                 a.primary_aggregator = src
                 a.z_kv = z_kv
                 a.L_hat = L if feasible else math.inf
-                assignments.append(a)
                 if feasible:
+                    a.replicas = [ReplicaCandidate(
+                        task_id=task.task_id, tile_id=tile.tile_id,
+                        helper=src, aggregator=src, epoch=epoch,
+                        latency=L, p_success=p,
+                        e_compute=src_state.energy_for_compute(tile.compute_ops),
+                        e_rx=0.0, e_tx=0.0,
+                        feasible=True,
+                        d_in_bits=0.0, d_out_bits=0.0,
+                    )]
                     total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * L)
                 time_offset += t_compute  # sequential on source sat
+                assignments.append(a)
 
         return SchedulerResult(
             epoch=epoch, assignments=assignments, total_utility=total_utility,

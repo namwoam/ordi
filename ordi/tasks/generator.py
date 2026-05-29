@@ -2,22 +2,36 @@
 EO task and tile generator.
 
 Task k:
-  source satellite s_k (uniformly sampled from constellation)
-  release time r_k     (Poisson arrivals)
+  source satellite s_k — the satellite whose camera covers target_k at r_k
+  release time r_k     (Poisson arrivals over ground targets)
   deadline D_k         = r_k + deadline_slack_s
   tile set V_k         = grid of n_tiles_side × n_tiles_side tiles
 
-Each tile v ∈ V_k inherits the parent task's TileProfile with slight
-spatial variation in utility (center tiles often higher priority).
+When sat_groundtrack is supplied (FOV-aware mode), each task event samples a
+random ground target and picks a satellite currently within fov_range_km of
+it as the source.  This replaces the original uniform-random source assignment
+with physically motivated imaging geometry.
 """
 
 from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import Dict, List, Optional, Tuple
 
 from ordi.tasks.profiles import TileProfile, PROFILES, TASK_TYPES
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two (lat, lon) points in degrees."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1))
+         * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return 2.0 * R * math.asin(math.sqrt(max(0.0, min(1.0, a))))
 
 
 @dataclass
@@ -57,17 +71,34 @@ def generate_tasks(
     sat_ids: List[str],
     sim_duration_s: float,
     arrival_rate_per_orbit: float = 3.0,
-    orbit_period_s: float = 5400.0,    # ~90 min LEO orbit
-    deadline_slack_s: float = 300.0,   # 5-minute deadline
+    orbit_period_s: float = 5760.0,    # ~96 min LEO orbit at 550 km
+    deadline_slack_s: float = 300.0,
     n_tiles_side: int = 4,
     task_type_weights: Dict[str, float] = None,
     n_replicas_max: int = 2,
     seed: int = 0,
+    # ── FOV-aware mode (optional) ──────────────────────────────────────────
+    sat_groundtrack: Optional[Dict[str, List[Tuple[float, float, float]]]] = None,
+    # {sat_id: [(t_s, lat_deg, lon_deg), ...]} sampled at regular intervals
+    ground_targets: Optional[List[Tuple[float, float]]] = None,
+    # [(lat_deg, lon_deg), ...] imaging targets
+    fov_range_km: float = 500.0,
+    # max ground distance for the camera footprint at 550 km altitude
+    # ~500 km corresponds to ±arctan(500/550) ≈ 42° off-nadir (wide-field)
 ) -> List[EOTask]:
     """
     Generate EO tasks via a Poisson arrival process.
 
-    arrival_rate_per_orbit : expected tasks arriving per orbit
+    arrival_rate_per_orbit : expected task events per orbit
+
+    FOV-aware mode (when sat_groundtrack and ground_targets are given):
+      Each task event first picks a random ground target, then finds all
+      satellites with their sub-satellite point within fov_range_km of the
+      target at time t.  If none are in range the event is skipped; otherwise
+      one of the visible satellites is chosen as the source.  This ensures
+      that every task corresponds to a satellite that is physically overhead
+      the imaging target at the moment of data capture — the physically
+      correct model for EO scheduling.
     """
     rng = random.Random(seed)
 
@@ -78,6 +109,21 @@ def generate_tasks(
     weights = [task_type_weights[t] for t in types]
 
     lam = arrival_rate_per_orbit / orbit_period_s  # tasks per second
+
+    # Build a time→index lookup for the groundtrack (O(1) per event)
+    gt_dt: float = 0.0
+    gt_n: int = 0
+    if sat_groundtrack:
+        sample_ts = next(iter(sat_groundtrack.values()))
+        if len(sample_ts) >= 2:
+            gt_dt = sample_ts[1][0] - sample_ts[0][0]
+            gt_n = len(sample_ts)
+
+    def _sat_pos_at(sat_id: str, t: float) -> Tuple[float, float]:
+        """Nearest-sample lat/lon for sat at time t."""
+        track = sat_groundtrack[sat_id]
+        idx = min(max(0, int(round(t / gt_dt))), gt_n - 1)
+        return track[idx][1], track[idx][2]
 
     tasks: List[EOTask] = []
     t = 0.0
@@ -90,7 +136,26 @@ def generate_tasks(
         if t >= sim_duration_s:
             break
 
-        src = rng.choice(sat_ids)
+        # ── source satellite selection ──────────────────────────────────────
+        if sat_groundtrack and ground_targets:
+            # FOV-aware: find every satellite that is over at least one target.
+            # Scanning all targets for each satellite is fast (100 targets × 24
+            # sats = 2400 checks) and avoids the "pick random target first" bias
+            # that skips ~94% of events when per-target coverage is ~5%.
+            visible = []
+            for sid in sat_ids:
+                s_lat, s_lon = _sat_pos_at(sid, t)
+                if any(_haversine_km(g_lat, g_lon, s_lat, s_lon) <= fov_range_km
+                       for g_lat, g_lon in ground_targets):
+                    visible.append(sid)
+            if not visible:
+                # No satellite over any target; skip event (very rare with
+                # dense targets, ~0% of the time per the coverage analysis).
+                continue
+            src = rng.choice(visible)
+        else:
+            src = rng.choice(sat_ids)
+
         ttype = rng.choices(types, weights=weights, k=1)[0]
         profile = PROFILES[ttype]
 

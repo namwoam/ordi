@@ -204,24 +204,30 @@ class ORDIScheduler:
         sat_index, ell_down_caches, ell_ia_caches, ell_ski_caches = \
             self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
+        # Sort (task, tile) pairs by descending utility/urgency so high-value
+        # tiles claim routing resources before lower-priority ones.
+        pending_tile_list = []
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
             if tau_k <= 0:
                 continue  # already past deadline
-
             for tile in task.tiles:
-                assignment = self._schedule_tile(
-                    task, tile, epoch, epoch_start, tau_k,
-                    energy_used, link_used,
-                    sat_index,
-                    ell_down_caches.get(tile.d_out_bits),
-                    ell_ia_caches.get(tile.d_out_bits),
-                    ell_ski_caches.get(tile.d_in_bits, {}).get(task.source_sat),
-                )
-                assignments.append(assignment)
-                total_utility += tile.utility * assignment.z_kv * math.exp(
-                    -cfg.alpha * (assignment.L_hat if not math.isinf(assignment.L_hat) else 0)
-                )
+                pending_tile_list.append((tile.utility / max(tau_k, 1.0), task, tile, tau_k))
+        pending_tile_list.sort(key=lambda x: -x[0])
+
+        for _, task, tile, tau_k in pending_tile_list:
+            assignment = self._schedule_tile(
+                task, tile, epoch, epoch_start, tau_k,
+                energy_used, link_used,
+                sat_index,
+                ell_down_caches.get(tile.d_out_bits),
+                ell_ia_caches.get(tile.d_out_bits),
+                ell_ski_caches.get(tile.d_in_bits, {}).get(task.source_sat),
+            )
+            assignments.append(assignment)
+            total_utility += tile.utility * assignment.z_kv * math.exp(
+                -cfg.alpha * (assignment.L_hat if not math.isinf(assignment.L_hat) else 0)
+            )
 
         # Compute penalties
         e_total = sum(

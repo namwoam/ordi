@@ -220,3 +220,34 @@ def _tt_to_unix(tt: float) -> float:
     # TT epoch: J2000.0 = 2000-01-01 12:00 TT = unix 946727935.816
     J2000_TT_UNIX = 946727935.816
     return J2000_TT_UNIX + (tt - 2451545.0) * 86400.0
+
+
+def compute_sat_groundtracks(
+    satellites: list,
+    t_start_unix: float,
+    t_end_unix: float,
+    dt_seconds: float = 60.0,
+) -> "Dict[str, List[Tuple[float, float, float]]]":
+    """
+    Return {sat_id: [(t_unix, lat_deg, lon_deg), ...]} sampled every dt_seconds.
+
+    Used by the FOV-aware task generator to determine which satellite is
+    overhead a ground target at a given time.
+    """
+    ts = load.timescale()
+    n_steps = int((t_end_unix - t_start_unix) / dt_seconds) + 1
+    t_grid = [t_start_unix + i * dt_seconds for i in range(n_steps)]
+
+    result: dict = {}
+    for sat in satellites:
+        track = []
+        for t_unix in t_grid:
+            import datetime
+            dt_utc = datetime.datetime.utcfromtimestamp(t_unix).replace(
+                tzinfo=datetime.timezone.utc
+            )
+            t_sf = ts.from_datetime(dt_utc)
+            geo = wgs84.subpoint_of(sat.at(t_sf))
+            track.append((t_unix, geo.latitude.degrees, geo.longitude.degrees))
+        result[sat.name] = track
+    return result

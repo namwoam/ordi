@@ -4,12 +4,17 @@ Experiment runner for E1–E8.
 Each experiment returns a dict: {algorithm_name: List[EpochMetrics]}.
 Results are saved to results/<experiment_id>.csv.
 
-Simulation setup (shared):
+Shared realistic LEO-EO simulation setup (all experiments unless overridden):
   - Synthetic Walker constellation: 6 planes × 6 sats = 36 sats (default)
-  - 10 ground stations
-  - Simulation horizon: 2 orbits = 10,800 s
-  - Epoch length: 60 s → 180 epochs
-  - Tasks: Poisson arrivals, 3 tasks/orbit, deadline 300 s
+  - 2 Northern-hemisphere ground stations (Fairbanks, Greenwich) — typical
+    for a Northern-focus EO mission; creates genuine routing pressure since
+    Southern-hemisphere source sats have no direct downlink within 300 s.
+  - FOV-constrained task generation: tasks arise only when a satellite is
+    within 600 km of one of 100 random ground targets — physically correct
+    for an EO system whose camera covers a finite swath.
+  - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
+  - Simulation horizon: 10 800 s (~1.875 orbits); 180 × 60 s epochs.
+  - Tasks: Poisson arrivals, 6 tasks/orbit, deadline 300 s.
 """
 
 from __future__ import annotations
@@ -23,7 +28,10 @@ from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from ordi.orbit.contacts import build_synthetic_walker, compute_contact_windows, DEFAULT_GROUND_STATIONS
+from ordi.orbit.contacts import (
+    build_synthetic_walker, compute_contact_windows,
+    compute_sat_groundtracks, DEFAULT_GROUND_STATIONS,
+)
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
 from ordi.sim.reliability import ReliabilityModel
@@ -34,28 +42,49 @@ from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEven
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
 
 RESULTS_DIR = "results"
-SIM_DURATION_S = 10_800       # 2 orbits
+SIM_DURATION_S = 10_800       # ~1.875 orbits at 550 km
 EPOCH_LENGTH_S = 60.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
+
+# Two Northern-hemisphere GS used as the shared ground segment across all
+# experiments — Fairbanks (65°N) and Greenwich (51°N).
+_NORTHERN_GS = [
+    gs for gs in DEFAULT_GROUND_STATIONS
+    if gs[0] in {"fairbanks", "greenwich"}
+]
 
 
 # ── simulation bootstrap ──────────────────────────────────────────────────────
 
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
-               arrival_rate=3.0):
-    """Build all shared simulation objects."""
+               arrival_rate=6.0, ground_stations=None,
+               orbit_period_s=5760.0,
+               use_fov=True, fov_range_km=600.0, n_targets=100):
+    """Build all shared simulation objects.
+
+    orbit_period_s : realistic LEO period at 550 km altitude (~5760 s / 96 min).
+    use_fov        : FOV-constrained task generation — tasks arise only when a
+                     satellite is within fov_range_km of a ground target.
+    fov_range_km   : camera footprint radius (600 km ≈ ±42° off-nadir at 550 km
+                     altitude; realistic for a wide-field EO imager).
+    n_targets      : number of random ground targets (uniformly in ±60° lat).
+    """
+    import random as _rng_mod
+    if ground_stations is None:
+        ground_stations = _NORTHERN_GS
     sats = build_synthetic_walker(n_planes=n_planes, sats_per_plane=sats_per_plane)
     sat_ids = [s.name for s in sats]
-    gs_names = {gs[0] for gs in DEFAULT_GROUND_STATIONS}
+    gs_names = {gs[0] for gs in ground_stations}
 
-    print(f"  Computing contact windows for {len(sats)} sats × {len(DEFAULT_GROUND_STATIONS)} GS ...")
+    print(f"  Computing contact windows for {len(sats)} sats × {len(ground_stations)} GS ...")
     t0 = time.time()
     contacts = compute_contact_windows(
         sats,
         t_start_unix=0.0,
         t_end_unix=SIM_DURATION_S,
-        dt_seconds=60.0,   # coarser sampling for speed
+        dt_seconds=60.0,
+        ground_stations=ground_stations,
     )
     print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
 
@@ -63,11 +92,31 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
     states = make_constellation_states(sat_ids, seed=seed)
     reliability = ReliabilityModel()
 
+    sat_groundtrack = None
+    ground_targets = None
+    if use_fov:
+        print("  Computing satellite groundtracks for FOV task generation ...")
+        t1 = time.time()
+        sat_groundtrack = compute_sat_groundtracks(
+            sats, 0.0, SIM_DURATION_S, dt_seconds=60.0
+        )
+        # Random ground targets uniformly distributed in [-60°, 60°] latitude
+        rng_t = _rng_mod.Random(seed + 99)
+        ground_targets = [
+            (rng_t.uniform(-60.0, 60.0), rng_t.uniform(-180.0, 180.0))
+            for _ in range(n_targets)
+        ]
+        print(f"  Groundtracks done in {time.time()-t1:.1f}s, {n_targets} targets")
+
     tasks = generate_tasks(
         sat_ids, SIM_DURATION_S,
         arrival_rate_per_orbit=arrival_rate,
+        orbit_period_s=orbit_period_s,
         deadline_slack_s=deadline_slack,
         seed=seed,
+        sat_groundtrack=sat_groundtrack,
+        ground_targets=ground_targets,
+        fov_range_km=fov_range_km,
     )
     cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
 
@@ -167,11 +216,20 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
     print(f"  Saved: {path}")
 
 
-# ── E1: Core performance (ORDI vs all baselines, no faults) ──────────────────
+# ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
 def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E1: Core performance comparison (no faults)")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = _build_sim(seed=seed)
+    """
+    Core performance comparison using the shared realistic LEO-EO setup.
+
+    Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
+    with arrival_rate=8 so the FOV filter still yields ~13 tasks.
+    All other parameters (GS, FOV, orbit period) come from _build_sim defaults.
+    """
+    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s, FOV tasks)")
+    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
+        _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
+                   arrival_rate=8.0)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
     job_args = [
