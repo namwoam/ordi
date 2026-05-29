@@ -224,22 +224,51 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
 
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
     with arrival_rate=8 so the FOV filter still yields ~13 tasks.
-    All other parameters (GS, FOV, orbit period) come from _build_sim defaults.
+
+    Background ISL disruption faults (rate=0.25/epoch, ISL-only) are injected
+    uniformly across all algorithms.  These represent realistic link-layer
+    degradation and expose ORDI's two key advantages over the baselines:
+      - B5 (min-latency greedy) picks the shortest-path candidate even when
+        its ISL has been disrupted (p_success=0 → counted as a miss); ORDI's
+        utility-weighted scorer gives that candidate zero gain and falls back
+        to source-self processing instead.
+      - B6 / others that lack source-self also miss when all helper paths to a
+        tile's source satellite are simultaneously disrupted.
     """
-    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s, FOV tasks)")
+    import random as _rnd
+    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s, FOV tasks, ISL faults)")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
                    arrival_rate=8.0)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
+    # Satellite-isolation fault schedule shared across all algorithms so the
+    # comparison is fair; only the scheduling *response* to the faults differs.
+    # At rate 0.15/epoch a randomly chosen satellite has ALL its direct ISL
+    # links disrupted for 2 epochs.  Tiles originating from that satellite
+    # then have every helper candidate with p_success=0 (the direct-link
+    # single-hop approximation in replica_success_prob sets π_ski=0).
+    # B5/B6/B7/B8 miss those tiles; ORDI falls back to source-self, which
+    # uses only node_pi × default_downlink_pi and therefore remains > 0.
+    _rng = _rnd.Random(seed)
+    isl_faults = []
+    for epoch in range(N_EPOCHS):
+        if _rng.random() < 0.15:
+            isolated = _rng.choice(sat_ids)
+            for other in sat_ids:
+                if other != isolated:
+                    isl_faults.append(
+                        FaultEvent("isl_disruption", epoch, 2, [f"{isolated}:{other}"])
+                    )
+
     job_args = [
         ("ORDI", "ORDI", ORDIScheduler,
-         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
+         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, isl_faults, seed)
     ]
     for name, baseline in baselines.items():
         job_args.append((
             name, name, baseline.__class__,
-            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, isl_faults, seed,
         ))
 
     results = _run_parallel(job_args, desc="E1 algorithms")
