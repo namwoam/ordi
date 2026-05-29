@@ -24,8 +24,9 @@ import csv
 import math
 import os
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
@@ -38,7 +39,9 @@ from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
-from ordi.scheduler.ordi import ORDIScheduler, ORDIConfig
+from ordi.scheduler.ordi import (
+    ORDIScheduler, ORDIConfig, SchedulerResult, TileAssignment,
+)
 from ordi.baselines.baselines import build_all_baselines
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
@@ -133,6 +136,75 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     return sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg
 
 
+# ── stateful rolling-horizon helpers ──────────────────────────────────────────
+
+def _assignment_viable(a: TileAssignment, states) -> bool:
+    """In-flight tile survives if any replica's helper+aggregator are both alive
+    (a surviving backup avoids re-transmission). No-helper assignments never replan."""
+    if not a.replicas:
+        return True
+    for r in a.replicas:
+        h = states.get(r.helper)
+        g = states.get(r.aggregator)
+        if h is not None and g is not None and h.A_i and g.A_i:
+            return True
+    return False
+
+
+def _uncommitted_tasks(pending, committed):
+    """Shallow task copies holding only not-yet-committed tiles."""
+    out = []
+    for task in pending:
+        rem = [t for t in task.tiles if (task.task_id, t.tile_id) not in committed]
+        if not rem:
+            continue
+        sub = copy(task)
+        sub.tiles = rem
+        out.append(sub)
+    return out
+
+
+def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None):
+    """Run one stateful rolling-horizon simulation and return a lifetime
+    EpochMetrics.  schedule_fn(epoch, todo_tasks) -> SchedulerResult dispatches
+    to ORDI / a baseline / the ILP.  A committed tile stays in-flight (not
+    re-scheduled, not re-charged) until a fault invalidates all its replicas."""
+    sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
+    all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
+    committed: Dict[Tuple[int, int], TileAssignment] = {}
+
+    for epoch in range(N_EPOCHS):
+        ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
+        if injector:
+            injector.apply_epoch(epoch)
+        # Drop committed tiles whose every replica lost a node → re-planned.
+        for key in list(committed.keys()):
+            if not _assignment_viable(committed[key], states):
+                del committed[key]
+        pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
+        todo = _uncommitted_tasks(pending, committed)
+        result = schedule_fn(epoch, todo)
+        for a in result.assignments:
+            if a.z_kv > 0 and not math.isinf(a.L_hat):
+                committed[(a.task_id, a.tile_id)] = a
+        if injector:
+            injector.withdraw_epoch(epoch + 1)
+
+    final = [committed.get(k) or TileAssignment(task_id=k[0], tile_id=k[1])
+             for k in all_tiles]
+    res = SchedulerResult(
+        epoch=N_EPOCHS - 1, assignments=final, total_utility=0.0,
+        energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
+        objective=0.0, link_utilization={},
+    )
+    m = compute_metrics(res, tasks, 0.0, sat_cap, cfg.alpha)
+    r_total = sum(max(0, len(a.replicas) - 1) for a in final)
+    m.objective = (m.delivered_utility
+                   - cfg.lambda_E * m.energy_joules
+                   - cfg.lambda_R * r_total)
+    return m
+
+
 # ── parallel worker (module-level so multiprocessing can pickle it) ───────────
 
 def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
@@ -142,9 +214,10 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
             tasks, graphs, states, reliability,
             sat_ids, gs_names, cfg, faults, seed)
 
-    result_key  : key stored in the results dict
-    sched_name  : "ORDI" or the baseline name (controls dispatch)
-    scheduler_class : class to instantiate
+    Stateful rolling-horizon: a committed tile stays in-flight and is not
+    re-scheduled (nor re-charged) until a fault invalidates all its replicas.
+    Metrics are aggregated once per tile lifetime, so ISL/energy count one
+    transfer per tile instead of once per epoch it stayed pending.
     """
     (result_key, sched_name, scheduler_class,
      tasks, graphs, states, reliability,
@@ -161,31 +234,13 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
 
     if sched_name == "ORDI":
         sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
+        schedule_fn = lambda ep, td: sched.schedule_epoch(ep, T_SIM_START, td)
     else:
         sched = scheduler_class(graphs, local_states, gs_names, local_rel, cfg)
+        schedule_fn = lambda ep, td: sched.schedule(ep, T_SIM_START, td)
 
-    sat_cap = {s: local_states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
-    epoch_metrics = []
-
-    for epoch in range(N_EPOCHS):
-        ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
-
-        if injector:
-            injector.apply_epoch(epoch)
-
-        pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
-
-        if sched_name == "ORDI":
-            result = sched.schedule_epoch(epoch, T_SIM_START, pending)
-        else:
-            result = sched.schedule(epoch, T_SIM_START, pending)
-
-        epoch_metrics.append(compute_metrics(result, pending, ep_start, sat_cap, cfg.alpha))
-
-        if injector:
-            injector.withdraw_epoch(epoch + 1)
-
-    return result_key, epoch_metrics
+    m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector)
+    return result_key, [m]
 
 
 def _run_parallel(job_args: List[Tuple], desc: str = "") -> Dict[str, List[EpochMetrics]]:
@@ -279,15 +334,26 @@ def run_E2(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E2: Fault type profile (ORDI)")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = _build_sim(seed=seed)
 
+    # Every scenario hits the SAME satellites for the SAME duration, so the
+    # differences across bars reflect each fault type's intrinsic severity, not
+    # its scale.  Targets are the satellites that actually carry the most tasks
+    # (FOV sources); hitting idle satellites would be invisible.  Sustained 40
+    # epochs so ORDI's re-planning cannot fully absorb the loss.
+    src_counts = Counter(t.source_sat for t in tasks)
+    K = max(1, len(src_counts) // 2)
+    aff = [s for s, _ in src_counts.most_common(K)]
+    S, D = 10, 40
+    isl_links = [f"{a}:{b}" for a in aff for b in sat_ids if a != b]
+
     fault_scenarios = {
         "no_fault": [],
-        "isl_disruption": [FaultEvent("isl_disruption", 30, 10, [f"{sat_ids[0]}:{sat_ids[1]}"])],
-        "plane_outage":   [FaultEvent("plane_outage", 20, 8, sat_ids[:6])],
-        "helper_failure": [FaultEvent("helper_failure", 15, 5, [sat_ids[3]])],
-        "straggler":      [FaultEvent("straggler", 10, 3, [sat_ids[4]], {"factor": 0.1})],
-        "ground_miss":    [FaultEvent("ground_contact_miss", 25, 5, [sat_ids[2]])],
-        "battery":        [FaultEvent("battery_shortage", 20, 4, [sat_ids[5]])],
-        "thermal":        [FaultEvent("thermal_throttle", 18, 3, [sat_ids[6]])],
+        "isl_disruption": [FaultEvent("isl_disruption", S, D, isl_links)],
+        "plane_outage":   [FaultEvent("plane_outage", S, D, aff)],
+        "helper_failure": [FaultEvent("helper_failure", S, D, aff)],
+        "straggler":      [FaultEvent("straggler", S, D, aff, {"factor": 0.1})],
+        "ground_miss":    [FaultEvent("ground_contact_miss", S, D, aff)],
+        "battery":        [FaultEvent("battery_shortage", S, D, aff)],
+        "thermal":        [FaultEvent("thermal_throttle", S, D, aff)],
     }
 
     # result_key = scenario name; sched_name = "ORDI" for all
@@ -312,18 +378,36 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
     fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
     alg_names = ["ORDI", "B5_seco_like", "B6_full_replication"]
 
+    # Average over multiple fault seeds per rate: a single random schedule makes
+    # the miss curve jagged (one unlucky draw hitting a hot source spikes it).
+    # Averaging N draws recovers the underlying monotone degradation trend.
+    N_SEEDS = 8
+
     job_args = []
     for rate in fault_rates:
-        faults = random_fault_schedule(sat_ids, N_EPOCHS, fault_rate=rate, seed=seed)
-        for alg_name in alg_names:
-            key = f"{alg_name}@fault={rate:.2f}"
-            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-            job_args.append((
-                key, alg_name, cls,
-                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed,
-            ))
+        for s in range(N_SEEDS):
+            faults = random_fault_schedule(sat_ids, N_EPOCHS, fault_rate=rate, seed=seed + s)
+            for alg_name in alg_names:
+                key = f"{alg_name}@fault={rate:.2f}#s{s}"
+                cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
+                job_args.append((
+                    key, alg_name, cls,
+                    tasks, graphs, states, reliability, sat_ids, gs_names, cfg,
+                    faults, seed + s,
+                ))
 
-    results = _run_parallel(job_args, desc="E3 rate×alg")
+    raw = _run_parallel(job_args, desc="E3 rate×alg×seed")
+
+    # Collapse the per-seed lifetime records into one list per (rate, alg) so
+    # _save_csv's aggregate_metrics averages them.
+    results: Dict[str, List[EpochMetrics]] = {}
+    for rate in fault_rates:
+        for alg_name in alg_names:
+            metrics: List[EpochMetrics] = []
+            for s in range(N_SEEDS):
+                metrics += raw[f"{alg_name}@fault={rate:.2f}#s{s}"]
+            results[f"{alg_name}@fault={rate:.2f}"] = metrics
+
     _save_csv("E3_fault_intensity", results)
     return results
 
@@ -456,34 +540,23 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=3, sats_per_plane=4, arrival_rate=3.0, seed=seed)
 
-    results = {"ORDI_greedy": [], "ORDI_ILP": []}
-    sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
-
+    # Same stateful lifetime accounting as E1-E7 so E8 is directly comparable.
+    greedy_states = deepcopy(states)
     greedy_sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                 deepcopy(states), deepcopy(reliability))
+                                 greedy_states, deepcopy(reliability))
+    greedy_fn = lambda ep, td: greedy_sched.schedule_epoch(ep, T_SIM_START, td)
 
-    for epoch in range(N_EPOCHS):
-        ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
-        pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
-        if not pending:
-            continue
+    def ilp_fn(ep, td):
+        r = solve_ilp(ep, T_SIM_START, td, graphs, deepcopy(states),
+                      deepcopy(reliability), gs_names, cfg, time_limit_s=30.0)
+        return r if r else SchedulerResult(
+            epoch=ep, assignments=[], total_utility=0.0, energy_penalty=0.0,
+            comm_penalty=0.0, rep_penalty=0.0, objective=0.0, link_utilization={})
 
-        # Greedy
-        g_result = greedy_sched.schedule_epoch(epoch, T_SIM_START, pending)
-        results["ORDI_greedy"].append(
-            compute_metrics(g_result, pending, ep_start, sat_cap, cfg.alpha)
-        )
+    m_greedy = _simulate_stateful(greedy_fn, tasks, sat_ids, greedy_states, cfg)
+    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, deepcopy(states), cfg)
 
-        # ILP (HiGHS uses 8 threads internally)
-        ilp_result = solve_ilp(
-            epoch, T_SIM_START, pending, graphs, deepcopy(states),
-            deepcopy(reliability), gs_names, cfg, time_limit_s=30.0,
-        )
-        if ilp_result:
-            results["ORDI_ILP"].append(
-                compute_metrics(ilp_result, pending, ep_start, sat_cap, cfg.alpha)
-            )
-
+    results = {"ORDI_greedy": [m_greedy], "ORDI_ILP": [m_ilp]}
     _save_csv("E8_ilp_gap", results)
     return results
 

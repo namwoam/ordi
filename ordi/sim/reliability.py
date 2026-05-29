@@ -83,7 +83,9 @@ class ReliabilityModel:
 
         If paths are not provided, uses single-hop approximation.
         """
-        pi_node = self.node_pi(helper_id)
+        # Both the helper (does the compute) and the source (must emit the input
+        # tile) have to survive; a dead source cannot be rescued by any helper.
+        pi_node = self.node_pi(helper_id) * self.node_pi(source_id)
 
         if src_helper_path:
             pi_ski = self.path_pi(src_helper_path, "isl")

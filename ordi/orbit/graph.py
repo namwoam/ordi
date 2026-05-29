@@ -9,7 +9,7 @@ using Dijkstra on the time-expanded graph.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import heapq
 import math
@@ -36,11 +36,20 @@ class EpochContactGraph:
     t_end: float
     edges: List[Tuple[str, str, float, float, str]]  # (a, b, rate, capacity, type)
     nodes: set
+    # Adjacency list (src → [(dst, rate, capacity)]) so earliest_arrival walks a
+    # node's out-edges instead of scanning all edges per pop. Same result, faster.
+    adj: Dict[str, List[Tuple[str, float, float]]] = field(
+        default_factory=dict, compare=False, repr=False)
+
+    def __post_init__(self):
+        adj: Dict[str, List[Tuple[str, float, float]]] = {}
+        for (na, nb, rate, cap, _t) in self.edges:
+            adj.setdefault(na, []).append((nb, rate, cap))
+        self.adj = adj
 
     def capacity_between(self, a: str, b: str) -> float:
         """Total bits available from a→b in this epoch."""
-        return sum(cap for (na, nb, _, cap, _) in self.edges
-                   if na == a and nb == b)
+        return sum(cap for (nb, _r, cap) in self.adj.get(a, ()) if nb == b)
 
     def rate_between(self, a: str, b: str) -> float:
         """Peak rate from a→b (first matching edge)."""
@@ -122,6 +131,11 @@ def earliest_arrival(
         n_nodes = len(node_index)
         dist = np.full((n_ep, n_nodes), INF)
 
+        # idx→name reverse map for adjacency lookup (built once per call).
+        idx2name: List[Optional[str]] = [None] * n_nodes
+        for _nm, _ix in node_index.items():
+            idx2name[_ix] = _nm
+
         # heap: (elapsed, ep_offset, node_idx, bits_remaining)
         heap = [(0.0, 0, src_idx, data_bits)]
 
@@ -143,10 +157,8 @@ def earliest_arrival(
             g = graphs[ep]
             ep_elapsed_so_far = elapsed - (g.t_start - graphs[epoch].t_start)
 
-            for (na, nb, rate, cap, _) in g.edges:
-                na_idx = node_index.get(na, -1)
-                if na_idx != n_idx:
-                    continue
+            _name = idx2name[n_idx]
+            for (nb, rate, cap) in g.adj.get(_name, ()):
                 nb_idx = node_index.get(nb, -1)
                 if nb_idx < 0:
                     continue
@@ -202,9 +214,7 @@ def earliest_arrival(
         g = graphs[ep]
         ep_elapsed_so_far = elapsed - (g.t_start - graphs[epoch].t_start)
 
-        for (na, nb, rate, cap, _) in g.edges:
-            if na != node:
-                continue
+        for (nb, rate, cap) in g.adj.get(node, ()):
             ep_remaining = g.t_end - g.t_start - max(0.0, ep_elapsed_so_far)
             if ep_remaining <= 0:
                 continue
