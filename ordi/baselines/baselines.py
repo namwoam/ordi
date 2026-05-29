@@ -30,6 +30,21 @@ from ordi.scheduler.ordi import ORDIConfig, TileAssignment, SchedulerResult
 COMPRESSION_RATIO = 0.15   # compressed to 15% of original size
 
 
+def _build_node_index(
+    states: Dict[str, any],
+    ground_stations: set,
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Build sat_index and node_index enabling the numpy Dijkstra fast path."""
+    sat_ids = list(states.keys())
+    n = len(sat_ids)
+    sat_index: Dict[str, int] = {sid: i for i, sid in enumerate(sat_ids)}
+    node_index: Dict[str, int] = {
+        **sat_index,
+        **{gs: n + i for i, gs in enumerate(sorted(ground_stations))},
+    }
+    return sat_index, node_index
+
+
 # ── shared helpers ────────────────────────────────────────────────────────────
 
 def _empty_result(epoch: int) -> SchedulerResult:
@@ -64,6 +79,7 @@ class DirectDownlink:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -85,7 +101,7 @@ class DirectDownlink:
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, tile.d_in_bits, self.ground_stations,
-                    max_search_epochs=_max_ep,
+                    max_search_epochs=_max_ep, node_index=self.node_index,
                 )
                 feasible = ell_down <= tau_k
                 p_down = self.reliability.default_downlink_pi if feasible else 0.0
@@ -118,6 +134,7 @@ class OnboardOnly:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -139,7 +156,7 @@ class OnboardOnly:
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,
-                    max_search_epochs=_max_ep,
+                    max_search_epochs=_max_ep, node_index=self.node_index,
                 )
                 L = t_compute + ell_down
                 feasible = L <= tau_k
@@ -173,6 +190,7 @@ class CompressionOnly:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -194,7 +212,7 @@ class CompressionOnly:
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, compressed_bits, self.ground_stations,
-                    max_search_epochs=_max_ep,
+                    max_search_epochs=_max_ep, node_index=self.node_index,
                 )
                 feasible = ell_down <= tau_k
                 p = self.reliability.default_downlink_pi if feasible else 0.0
@@ -233,6 +251,7 @@ class ServalLike:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -262,7 +281,7 @@ class ServalLike:
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,
-                    max_search_epochs=_max_ep,
+                    max_search_epochs=_max_ep, node_index=self.node_index,
                 )
                 L = time_offset + t_compute + ell_down
                 feasible = L <= tau_k
@@ -301,6 +320,7 @@ class SECOLike:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -317,6 +337,7 @@ class SECOLike:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
+                    sat_index=self.sat_index, node_index=self.node_index,
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
@@ -347,6 +368,7 @@ class FullReplication:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -363,6 +385,7 @@ class FullReplication:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
+                    sat_index=self.sat_index, node_index=self.node_index,
                 )
                 # Use up to r_max replicas with distinct aggregators
                 selected = []
@@ -405,6 +428,7 @@ class RandomReplication:
         self.reliability = reliability
         self.cfg = cfg
         self.rng = random.Random(seed)
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -421,6 +445,7 @@ class RandomReplication:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
+                    sat_index=self.sat_index, node_index=self.node_index,
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
@@ -465,6 +490,7 @@ class CoCoILike:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
+        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def _k_of_n_prob(self, probs: List[float], k: int) -> float:
         """P(at least k of n succeed) using inclusion-exclusion / DP."""
@@ -500,6 +526,7 @@ class CoCoILike:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
+                    sat_index=self.sat_index, node_index=self.node_index,
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))

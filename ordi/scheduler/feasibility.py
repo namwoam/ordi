@@ -49,6 +49,7 @@ def compute_candidates(
     ell_down_cache: Optional[np.ndarray] = None,  # shape (n_active,)
     ell_ia_cache: Optional[np.ndarray] = None,    # shape (n_active, n_active)
     ell_ski_cache: Optional[np.ndarray] = None,   # shape (n_active,)
+    node_index: Optional[Dict[str, int]] = None,  # sats+GS → int, enables numpy Dijkstra
 ) -> List[ReplicaCandidate]:
     """
     Enumerate all feasible (helper, aggregator) pairs for tile (k, v) at epoch t.
@@ -70,6 +71,7 @@ def compute_candidates(
             agg: earliest_downlink(
                 agg, epoch, graphs, tile.d_out_bits, ground_stations,
                 max_search_epochs=max_search_epochs,
+                node_index=node_index,
             )
             for agg in sat_ids
         }
@@ -91,6 +93,7 @@ def compute_candidates(
             ell_ski = earliest_arrival(
                 task.source_sat, helper, epoch, graphs, tile.d_in_bits,
                 max_search_epochs=max_search_epochs,
+                node_index=node_index,
             )
         if math.isinf(ell_ski):
             continue
@@ -123,6 +126,7 @@ def compute_candidates(
                 ell_ia = earliest_arrival(
                     helper, aggregator, epoch, graphs, tile.d_out_bits,
                     max_search_epochs=max_search_epochs,
+                    node_index=node_index,
                 )
             if math.isinf(ell_ia):
                 continue
