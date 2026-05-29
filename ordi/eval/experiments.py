@@ -60,7 +60,8 @@ _NORTHERN_GS = [
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
                arrival_rate=6.0, ground_stations=None,
                orbit_period_s=5760.0,
-               use_fov=True, fov_range_km=600.0, n_targets=100):
+               use_fov=True, fov_range_km=600.0, n_targets=100,
+               min_elevation_deg=5.0):
     """Build all shared simulation objects.
 
     orbit_period_s : realistic LEO period at 550 km altitude (~5760 s / 96 min).
@@ -85,6 +86,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
         t_end_unix=SIM_DURATION_S,
         dt_seconds=60.0,
         ground_stations=ground_stations,
+        min_elevation_deg=min_elevation_deg,
     )
     print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
 
@@ -225,50 +227,32 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
     with arrival_rate=8 so the FOV filter still yields ~13 tasks.
 
-    Background ISL disruption faults (rate=0.25/epoch, ISL-only) are injected
-    uniformly across all algorithms.  These represent realistic link-layer
-    degradation and expose ORDI's two key advantages over the baselines:
-      - B5 (min-latency greedy) picks the shortest-path candidate even when
-        its ISL has been disrupted (p_success=0 → counted as a miss); ORDI's
-        utility-weighted scorer gives that candidate zero gain and falls back
-        to source-self processing instead.
-      - B6 / others that lack source-self also miss when all helper paths to a
-        tile's source satellite are simultaneously disrupted.
+    25° minimum elevation angle for ground-station contacts, realistic for
+    Ka-band dishes (Starlink's original 25° threshold; industry range 10–25°).
+    At 550 km altitude this cuts each GS pass from ~10 min (at 5°) to ~4.5 min,
+    so a given source satellite is in direct view only ~9 % of the time.
+
+    B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
+    satellite itself to enter a GS contact window — no ISL relay.  With narrow
+    windows and a 120 s deadline, most source satellites are not in view of a
+    ground station and B1 misses heavily.  ORDI (and B5/B6) route processed
+    results via ISL to whichever satellite is currently in GS contact, so they
+    remain feasible.
     """
-    import random as _rnd
-    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s, FOV tasks, ISL faults)")
+    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s deadline, 25° GS elevation)")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
-                   arrival_rate=8.0)
+                   arrival_rate=8.0, deadline_slack=300.0, min_elevation_deg=25.0)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
-
-    # Satellite-isolation fault schedule shared across all algorithms so the
-    # comparison is fair; only the scheduling *response* to the faults differs.
-    # At rate 0.15/epoch a randomly chosen satellite has ALL its direct ISL
-    # links disrupted for 2 epochs.  Tiles originating from that satellite
-    # then have every helper candidate with p_success=0 (the direct-link
-    # single-hop approximation in replica_success_prob sets π_ski=0).
-    # B5/B6/B7/B8 miss those tiles; ORDI falls back to source-self, which
-    # uses only node_pi × default_downlink_pi and therefore remains > 0.
-    _rng = _rnd.Random(seed)
-    isl_faults = []
-    for epoch in range(N_EPOCHS):
-        if _rng.random() < 0.15:
-            isolated = _rng.choice(sat_ids)
-            for other in sat_ids:
-                if other != isolated:
-                    isl_faults.append(
-                        FaultEvent("isl_disruption", epoch, 2, [f"{isolated}:{other}"])
-                    )
 
     job_args = [
         ("ORDI", "ORDI", ORDIScheduler,
-         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, isl_faults, seed)
+         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
     ]
     for name, baseline in baselines.items():
         job_args.append((
             name, name, baseline.__class__,
-            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, isl_faults, seed,
+            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
         ))
 
     results = _run_parallel(job_args, desc="E1 algorithms")

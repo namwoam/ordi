@@ -70,7 +70,18 @@ def _make_assignment_from_replica(
 # ── B1: Direct downlink ───────────────────────────────────────────────────────
 
 class DirectDownlink:
-    """All raw tiles downlinked directly from source satellite to ground."""
+    """
+    Raw tiles downlinked directly from the source satellite to a ground station
+    — no ISL relay, no onboard inference.  The source satellite must have an
+    active satellite-to-ground contact window within the deadline; if not, the
+    tile is a miss.  This models the naive baseline where the operator simply
+    waits for the satellite to orbit into view of a ground dish.
+
+    At realistic minimum elevation angles (≥ 20°) each pass lasts only 4–6 min,
+    so with tight deadlines most source satellites are not in view and B1 misses
+    heavily — highlighting ORDI's advantage of routing results via ISL to
+    whichever satellite is currently visible.
+    """
     name = "B1_direct_downlink"
 
     def __init__(self, graphs, states, ground_stations, reliability, cfg):
@@ -79,7 +90,6 @@ class DirectDownlink:
         self.ground_stations = ground_stations
         self.reliability = reliability
         self.cfg = cfg
-        self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -97,12 +107,21 @@ class DirectDownlink:
                 continue
 
             for tile in task.tiles:
-                # Downlink raw tile directly from source
+                # Direct-only: scan forward for the earliest epoch where src has
+                # a live satellite-to-ground downlink edge.  No ISL relay used.
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
-                ell_down = earliest_downlink(
-                    src, epoch, self.graphs, tile.d_in_bits, self.ground_stations,
-                    max_search_epochs=_max_ep, node_index=self.node_index,
-                )
+                ell_down = math.inf
+                for ep_offset in range(_max_ep):
+                    ep_idx = min(epoch + ep_offset, len(self.graphs) - 1)
+                    g = self.graphs[ep_idx]
+                    t_wait = ep_offset * cfg.epoch_length
+                    for (na, nb, rate, cap, lt) in g.edges:
+                        if na == src and nb in self.ground_stations and lt == 'downlink':
+                            t_xfer = tile.d_in_bits / max(rate, 1.0)
+                            ell_down = min(ell_down, t_wait + t_xfer)
+                    if not math.isinf(ell_down):
+                        break  # earliest direct contact found
+
                 feasible = ell_down <= tau_k
                 p_down = self.reliability.default_downlink_pi if feasible else 0.0
                 z_kv = p_down

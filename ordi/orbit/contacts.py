@@ -123,12 +123,20 @@ def compute_contact_windows(
     ground_stations: List[Tuple[str, float, float]] = None,
     isl_max_range_km: float = ISL_MAX_RANGE_KM,
     dt_seconds: float = 30.0,  # sampling interval for coarse pass
+    min_elevation_deg: float = GS_MIN_ELEVATION_DEG,
 ) -> List[ContactEvent]:
     """
     Compute all contact windows (sat-ground + sat-sat ISL) in [t_start, t_end].
 
     Uses a coarse sampling pass to detect contacts, then refines boundaries
     via bisection. Returns sorted ContactEvent list.
+
+    min_elevation_deg : minimum satellite elevation above horizon for a ground
+        contact to be valid.  5° (current default) is the absolute geometric
+        minimum; 10–25° is the operational range for real ground-station dishes
+        (10–15° for large parabolic GS antennas, 20–25° for Ka-band/user
+        terminals such as Starlink's original 25° threshold).  Higher values
+        produce shorter contact windows and model more realistic antenna limits.
     """
     if ground_stations is None:
         ground_stations = DEFAULT_GROUND_STATIONS
@@ -147,7 +155,7 @@ def compute_contact_windows(
             gs = wgs84.latlon(lat, lon)
             try:
                 raw_times, raw_events = sat.find_events(
-                    gs, t_start, t_end, altitude_degrees=GS_MIN_ELEVATION_DEG
+                    gs, t_start, t_end, altitude_degrees=min_elevation_deg
                 )
             except Exception:
                 continue
