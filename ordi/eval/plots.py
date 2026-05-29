@@ -1,7 +1,7 @@
 """
 Figure generation for all experiments.
 
-Reads CSVs from results/ and writes PNG figures to results/figures/.
+Reads CSVs from results/ and writes PNG figures to figure/.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 RESULTS_DIR = "results"
-FIGURES_DIR = os.path.join(RESULTS_DIR, "figures")
+FIGURES_DIR = "figure"
 
 ALG_COLORS = {
     "ORDI":                   "#e63946",
