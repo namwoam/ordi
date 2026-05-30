@@ -213,24 +213,31 @@ def plot_E5():
         print("No E5 data"); return
 
     algs = ["ORDI", "B2_onboard_only", "B4_serval_like"]
-    slacks = sorted(set(
+    scales = sorted(set(
         int(r["algorithm"].split("slack=")[1].rstrip("s"))
         for r in rows if "slack=" in r["algorithm"]
     ))
 
+    # Wildfire-median equivalent (most urgent task type) at each scale:
+    # wildfire_median = scale × (300/600) = scale/2
+    wildfire_medians = [s // 2 for s in scales]
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    fig.suptitle("E5: Deadline Miss Rate vs. Deadline Slack", fontsize=11, fontweight="bold")
+    fig.suptitle("E5: Deadline Miss Rate vs. Deadline Scale\n"
+                 "(log-normal σ=0.6; wildfire median = scale/2)",
+                 fontsize=11, fontweight="bold")
 
     for alg in algs:
         miss_vals = []
-        for sl in slacks:
+        for sl in scales:
             key = f"{alg}@slack={sl}s"
             row = next((r for r in rows if r["algorithm"] == key), None)
             miss_vals.append(_float(row, "deadline_miss_ratio") if row else 1.0)
-        ax.plot(slacks, miss_vals, label=ALG_LABELS.get(alg, alg),
+        ax.plot(wildfire_medians, miss_vals, label=ALG_LABELS.get(alg, alg),
                 color=ALG_COLORS.get(alg, "#888"), linewidth=2, marker="^")
 
-    ax.set_xlabel("Deadline Slack (s)"); ax.set_ylabel("Deadline Miss Ratio (↓)")
+    ax.set_xlabel("Wildfire-task Deadline Median (s)  [scale × ½]")
+    ax.set_ylabel("Deadline Miss Ratio (↓)")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E5_deadline.png")

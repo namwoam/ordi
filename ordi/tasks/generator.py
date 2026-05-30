@@ -67,12 +67,16 @@ class EOTask:
         return self.deadline - self.release_time
 
 
+_DEADLINE_SCALE_BASE = 600.0  # reference scale for deadline_slack_s
+
+
 def generate_tasks(
     sat_ids: List[str],
     sim_duration_s: float,
     arrival_rate_per_orbit: float = 3.0,
     orbit_period_s: float = 5760.0,    # ~96 min LEO orbit at 550 km
-    deadline_slack_s: float = 300.0,
+    deadline_slack_s: float = 600.0,
+    deadline_lognorm_sigma: float = 0.6,
     n_tiles_side: int = 4,
     task_type_weights: Dict[str, float] = None,
     n_replicas_max: int = 2,
@@ -90,6 +94,17 @@ def generate_tasks(
     Generate EO tasks via a Poisson arrival process.
 
     arrival_rate_per_orbit : expected task events per orbit
+
+    deadline_slack_s : global deadline scale (reference = 600 s).  Each task
+        type has its own median deadline (from TileProfile.deadline_median_s)
+        which is multiplied by deadline_slack_s / _DEADLINE_SCALE_BASE.  Set to
+        600 to use profile medians as-is; E5 sweeps this to vary overall tightness.
+
+    deadline_lognorm_sigma : log-space std-dev for per-task deadline sampling.
+        σ=0.6 gives a realistic spread (5th/95th percentile ≈ 0.30× / 3.32×
+        the median), consistent with cluster-job deadline distributions
+        (Lublin & Feitelson 2003; Google Borg trace analysis).
+        Set to 0.0 for deterministic (fixed) deadlines.
 
     FOV-aware mode (when sat_groundtrack and ground_targets are given):
       Each task event first picks a random ground target, then finds all
@@ -159,8 +174,14 @@ def generate_tasks(
         ttype = rng.choices(types, weights=weights, k=1)[0]
         profile = PROFILES[ttype]
 
-        # Vary deadline slightly per-task
-        slack = deadline_slack_s * rng.uniform(0.8, 1.2)
+        # Per-task deadline from type-specific median scaled by deadline_slack_s.
+        # Log-normal with σ=deadline_lognorm_sigma produces a right-skewed
+        # distribution matching empirical cluster-job deadline patterns.
+        type_median = profile.deadline_median_s * (deadline_slack_s / _DEADLINE_SCALE_BASE)
+        if deadline_lognorm_sigma > 0.0:
+            slack = max(type_median * math.exp(rng.gauss(0.0, deadline_lognorm_sigma)), 60.0)
+        else:
+            slack = type_median
         task = EOTask(
             task_id=task_id,
             source_sat=src,

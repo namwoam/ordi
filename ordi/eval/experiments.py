@@ -14,7 +14,9 @@ Shared realistic LEO-EO simulation setup (all experiments unless overridden):
     for an EO system whose camera covers a finite swath.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
   - Simulation horizon: 10 800 s (~1.875 orbits); 180 × 60 s epochs.
-  - Tasks: Poisson arrivals, 6 tasks/orbit, deadline 300 s.
+  - Tasks: Poisson arrivals, 6 tasks/orbit, log-normal deadlines (σ=0.6)
+    with per-type medians: wildfire 300 s, change 480 s, ship 600 s,
+    cloud_filter 1200 s (EO SLA tiers; Lemaître et al. 2002).
 """
 
 from __future__ import annotations
@@ -57,19 +59,24 @@ _NORTHERN_GS = [
 
 # ── simulation bootstrap ──────────────────────────────────────────────────────
 
-def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
+def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
+               deadline_lognorm_sigma=0.6,
                arrival_rate=6.0, ground_stations=None,
                orbit_period_s=5760.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=5.0):
     """Build all shared simulation objects.
 
-    orbit_period_s : realistic LEO period at 550 km altitude (~5760 s / 96 min).
-    use_fov        : FOV-constrained task generation — tasks arise only when a
-                     satellite is within fov_range_km of a ground target.
-    fov_range_km   : camera footprint radius (600 km ≈ ±42° off-nadir at 550 km
-                     altitude; realistic for a wide-field EO imager).
-    n_targets      : number of random ground targets (uniformly in ±60° lat).
+    orbit_period_s        : realistic LEO period at 550 km altitude (~5760 s / 96 min).
+    deadline_slack        : global deadline scale (reference = 600 s).  Per-type medians
+                            (wildfire 300 s, change 480 s, ship 600 s, cloud_filter 1200 s)
+                            are multiplied by deadline_slack / 600.
+    deadline_lognorm_sigma: log-space std-dev for per-task deadline sampling (σ=0.6).
+    use_fov               : FOV-constrained task generation — tasks arise only when a
+                            satellite is within fov_range_km of a ground target.
+    fov_range_km          : camera footprint radius (600 km ≈ ±42° off-nadir at 550 km
+                            altitude; realistic for a wide-field EO imager).
+    n_targets             : number of random ground targets (uniformly in ±60° lat).
     """
     import random as _rng_mod
     if ground_stations is None:
@@ -115,6 +122,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=300.0,
         arrival_rate_per_orbit=arrival_rate,
         orbit_period_s=orbit_period_s,
         deadline_slack_s=deadline_slack,
+        deadline_lognorm_sigma=deadline_lognorm_sigma,
         seed=seed,
         sat_groundtrack=sat_groundtrack,
         ground_targets=ground_targets,
@@ -234,15 +242,20 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
 
     B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
     satellite itself to enter a GS contact window — no ISL relay.  With narrow
-    windows and a 120 s deadline, most source satellites are not in view of a
-    ground station and B1 misses heavily.  ORDI (and B5/B6) route processed
-    results via ISL to whichever satellite is currently in GS contact, so they
-    remain feasible.
+    windows and log-normal deadlines whose medians range from 300 s (wildfire)
+    to 1200 s (cloud_filter), source satellites are often not in direct GS view
+    and B1 misses heavily.  ORDI (and B5/B6) route via ISL to whichever
+    satellite is currently in GS contact, so they remain feasible.
+
+    Deadline distribution: log-normal σ=0.6, per-type medians at scale 600 s
+    (wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s) matching
+    empirical EO SLA tiers (Lemaître et al. 2002; Globus et al. 2004).
     """
-    print("E1: Core performance (6×4 Walker, 2 Northern GS, 300 s deadline, 25° GS elevation)")
+    print("E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, 25° GS elevation)")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
-                   arrival_rate=8.0, deadline_slack=300.0, min_elevation_deg=25.0)
+                   arrival_rate=8.0, deadline_slack=600.0, deadline_lognorm_sigma=0.6,
+                   min_elevation_deg=25.0)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
     job_args = [
@@ -355,14 +368,15 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
 # ── E5: Deadline tightness sweep ──────────────────────────────────────────────
 
 def run_E5(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E5: Deadline tightness sweep")
+    print("E5: Deadline tightness sweep (log-normal deadline distribution, σ=0.6)")
     results = {}
 
-    # Sim is rebuilt per slack → keep outer loop sequential,
-    # parallelize the 3 algorithms per slack.
-    for slack in tqdm([60, 120, 180, 300, 600], desc="E5 deadline slacks", unit="slack"):
+    # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
+    # are wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s.
+    # Smaller scales compress all medians proportionally, increasing miss rate.
+    for slack in tqdm([150, 300, 450, 600, 900], desc="E5 deadline scales", unit="scale"):
         sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-            _build_sim(seed=seed, deadline_slack=float(slack))
+            _build_sim(seed=seed, deadline_slack=float(slack), deadline_lognorm_sigma=0.6)
         baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
         job_args = []
