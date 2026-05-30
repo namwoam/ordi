@@ -234,10 +234,13 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
 
     if sched_name == "ORDI":
         sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
-        schedule_fn = lambda ep, td: sched.schedule_epoch(ep, T_SIM_START, td)
     else:
         sched = scheduler_class(graphs, local_states, gs_names, local_rel, cfg)
-        schedule_fn = lambda ep, td: sched.schedule(ep, T_SIM_START, td)
+
+    def schedule_fn(ep, td):
+        if sched_name == "ORDI":
+            return sched.schedule_epoch(ep, T_SIM_START, td)
+        return sched.schedule(ep, T_SIM_START, td)
 
     m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector)
     return result_key, [m]
@@ -544,7 +547,8 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     greedy_states = deepcopy(states)
     greedy_sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
                                  greedy_states, deepcopy(reliability))
-    greedy_fn = lambda ep, td: greedy_sched.schedule_epoch(ep, T_SIM_START, td)
+    def greedy_fn(ep, td):
+        return greedy_sched.schedule_epoch(ep, T_SIM_START, td)
 
     def ilp_fn(ep, td):
         r = solve_ilp(ep, T_SIM_START, td, graphs, deepcopy(states),
