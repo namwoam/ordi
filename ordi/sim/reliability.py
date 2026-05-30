@@ -104,18 +104,20 @@ class ReliabilityModel:
 
         return pi_node * pi_ski * pi_ia * pi_down
 
-    def tile_delivery_prob(self, replica_probs: list) -> float:
+    def tile_delivery_prob(self, replica_probs: list, source_pi: float = 1.0) -> float:
         """
-        z_kv = 1 - Π_replicas (1 - p_kvia)
+        z_kv = π_source · [1 - Π_replicas (1 - p_kvia / π_source)]
 
-        At-least-one-succeeds probability across independent replicas.
+        Source survival is a shared single point of failure, factored once at
+        the tile level instead of per replica (which would overcount redundancy).
         """
-        if not replica_probs:
+        if not replica_probs or source_pi <= 0.0:
             return 0.0
         fail_all = 1.0
         for p in replica_probs:
-            fail_all *= (1.0 - p)
-        return 1.0 - fail_all
+            pc = min(1.0, p / source_pi)
+            fail_all *= (1.0 - pc)
+        return source_pi * (1.0 - fail_all)
 
     # ── fault injection helpers ───────────────────────────────────────────────
 

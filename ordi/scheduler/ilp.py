@@ -297,11 +297,9 @@ def solve_ilp(
             elif (pulp.value(yB.get((k, a), 0)) or 0.0) > 0.5:
                 a_obj.backup_aggregator = a
 
-        # Compute actual delivery probability from independent replicas
-        a_obj.z_kv = (
-            1.0 - math.prod(1.0 - p for p in replica_probs)
-            if replica_probs else 0.0
-        )
+        # Source survival factored at tile level (see tile_delivery_prob).
+        a_obj.z_kv = reliability.tile_delivery_prob(
+            replica_probs, reliability.node_pi(task_map[k].source_sat))
         a_obj.L_hat = best_latency if not math.isinf(best_latency) else 0.0
 
         if a_obj.z_kv > 0:

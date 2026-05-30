@@ -449,7 +449,8 @@ class FullReplication:
                     if len(selected) > 1:
                         a.backup_aggregator = selected[1].aggregator
                     probs = [c.p_success for c in selected]
-                    a.z_kv = self.reliability.tile_delivery_prob(probs)
+                    a.z_kv = self.reliability.tile_delivery_prob(
+                        probs, self.reliability.node_pi(task.source_sat))
                     a.L_hat = min(c.latency for c in selected)
                     total_utility += tile.utility * a.z_kv * math.exp(-cfg.alpha * a.L_hat)
 
@@ -506,7 +507,8 @@ class RandomReplication:
                 if selected:
                     a.primary_aggregator = selected[0].aggregator
                     probs = [c.p_success for c in selected]
-                    a.z_kv = self.reliability.tile_delivery_prob(probs)
+                    a.z_kv = self.reliability.tile_delivery_prob(
+                        probs, self.reliability.node_pi(task.source_sat))
                     a.L_hat = min(c.latency for c in selected)
                     total_utility += tile.utility * a.z_kv * math.exp(-cfg.alpha * a.L_hat)
 
@@ -539,8 +541,11 @@ class CoCoILike:
         self.cfg = cfg
         self.sat_index, self.node_index = _build_node_index(states, ground_stations)
 
-    def _k_of_n_prob(self, probs: List[float], k: int) -> float:
-        """P(at least k of n succeed) using inclusion-exclusion / DP."""
+    def _k_of_n_prob(self, probs: List[float], k: int, source_pi: float = 1.0) -> float:
+        """P(at least k of n succeed); source survival factored once at tile level."""
+        if source_pi <= 0.0:
+            return 0.0
+        probs = [min(1.0, p / source_pi) for p in probs]
         n = len(probs)
         if k > n:
             return 0.0
@@ -556,7 +561,7 @@ class CoCoILike:
                     new_dp[j + 1] += dp[j] * p
                 new_dp[j] += dp[j] * (1 - p)
             dp = new_dp
-        return sum(dp[j] for j in range(k, n + 1))
+        return source_pi * sum(dp[j] for j in range(k, n + 1))
 
     def schedule(self, epoch, t_sim_start, pending_tasks) -> SchedulerResult:
         cfg = self.cfg
@@ -584,7 +589,8 @@ class CoCoILike:
                 selected = sorted(candidates, key=lambda c: -c.p_success)[:n]
                 k_thresh = math.ceil(n / 2)  # need at least half to succeed
                 probs = [c.p_success for c in selected]
-                z_kv = self._k_of_n_prob(probs, k_thresh)
+                z_kv = self._k_of_n_prob(probs, k_thresh,
+                                         self.reliability.node_pi(task.source_sat))
 
                 a = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
                 a.replicas = selected
