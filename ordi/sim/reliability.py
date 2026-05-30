@@ -83,7 +83,9 @@ class ReliabilityModel:
 
         If paths are not provided, uses single-hop approximation.
         """
-        pi_node = self.node_pi(helper_id)
+        # Both the helper (does the compute) and the source (must emit the input
+        # tile) have to survive; a dead source cannot be rescued by any helper.
+        pi_node = self.node_pi(helper_id) * self.node_pi(source_id)
 
         if src_helper_path:
             pi_ski = self.path_pi(src_helper_path, "isl")
@@ -102,18 +104,20 @@ class ReliabilityModel:
 
         return pi_node * pi_ski * pi_ia * pi_down
 
-    def tile_delivery_prob(self, replica_probs: list) -> float:
+    def tile_delivery_prob(self, replica_probs: list, source_pi: float = 1.0) -> float:
         """
-        z_kv = 1 - Π_replicas (1 - p_kvia)
+        z_kv = π_source · [1 - Π_replicas (1 - p_kvia / π_source)]
 
-        At-least-one-succeeds probability across independent replicas.
+        Source survival is a shared single point of failure, factored once at
+        the tile level instead of per replica (which would overcount redundancy).
         """
-        if not replica_probs:
+        if not replica_probs or source_pi <= 0.0:
             return 0.0
         fail_all = 1.0
         for p in replica_probs:
-            fail_all *= (1.0 - p)
-        return 1.0 - fail_all
+            pc = min(1.0, p / source_pi)
+            fail_all *= (1.0 - pc)
+        return source_pi * (1.0 - fail_all)
 
     # ── fault injection helpers ───────────────────────────────────────────────
 

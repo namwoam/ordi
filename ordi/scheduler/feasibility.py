@@ -110,6 +110,7 @@ def compute_candidates(
             L_self = ell_ski + t_compute + ell_down_h
             if L_self <= tau_k:
                 p_self = (reliability.node_pi(helper)
+                          * reliability.node_pi(task.source_sat)
                           * reliability.link_pi(task.source_sat, helper, "isl")
                           * reliability.default_downlink_pi)
                 candidates.append(ReplicaCandidate(

@@ -277,6 +277,7 @@ class ORDIScheduler:
     ) -> TileAssignment:
         cfg = self.cfg
         assignment = TileAssignment(task_id=task.task_id, tile_id=tile.tile_id)
+        source_pi = self.reliability.node_pi(task.source_sat)
 
         candidates = compute_candidates(
             task, tile, epoch, epoch_start,
@@ -364,7 +365,7 @@ class ORDIScheduler:
 
         # Update delivery probability
         replica_probs = [primary.p_success]
-        assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs)
+        assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
 
         # ── backup replica ────────────────────────────────────────────────────
         if tile.n_replicas_max >= 2:
@@ -383,7 +384,7 @@ class ORDIScheduler:
 
                 # Check marginal gain: reliability improvement vs. replica penalty
                 new_z = self.reliability.tile_delivery_prob(
-                    replica_probs + [backup.p_success]
+                    replica_probs + [backup.p_success], source_pi
                 )
                 delta_z = new_z - assignment.z_kv
                 delta_utility = tile.utility * delta_z * math.exp(-cfg.alpha * backup.latency)
@@ -394,7 +395,7 @@ class ORDIScheduler:
                     assignment.replicas.append(backup)
                     assignment.backup_aggregator = backup.aggregator
                     replica_probs.append(backup.p_success)
-                    assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs)
+                    assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
                     assignment.L_hat = min(assignment.L_hat, backup.latency)
                     _charge_resources(backup, energy_used, link_used, task.source_sat)
                     break  # one backup is sufficient per proposal
