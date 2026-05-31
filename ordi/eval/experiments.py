@@ -13,7 +13,7 @@ Shared realistic LEO-EO simulation setup (all experiments unless overridden):
     within 600 km of one of 100 random ground targets — physically correct
     for an EO system whose camera covers a finite swath.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
-  - Simulation horizon: 10 800 s (~1.875 orbits); 180 × 60 s epochs.
+  - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
   - Tasks: Poisson arrivals, 6 tasks/orbit, log-normal deadlines (σ=0.6)
     with per-type medians: wildfire 300 s, change 480 s, ship 600 s,
     cloud_filter 1200 s (EO SLA tiers; Lemaître et al. 2002).
@@ -47,7 +47,7 @@ from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEven
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
 
 RESULTS_DIR = "results"
-SIM_DURATION_S = 10_800       # ~1.875 orbits at 550 km
+SIM_DURATION_S = 17_280       # 3 complete orbits at 550 km (3 × 5760 s)
 EPOCH_LENGTH_S = 60.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
