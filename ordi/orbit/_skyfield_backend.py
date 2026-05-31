@@ -1,8 +1,11 @@
 """Skyfield-based orbital contact computation backend."""
 
 from __future__ import annotations
+import logging
 import math
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from skyfield.api import EarthSatellite, load, wgs84
@@ -120,7 +123,11 @@ def compute_contact_windows(
                 raw_times, raw_events = sat.find_events(
                     gs, t_start, t_end, altitude_degrees=min_elevation_deg
                 )
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "find_events failed for sat=%s gs=%s: %s",
+                    sat.name, gs_name, e, exc_info=True,
+                )
                 continue
             # Skyfield returns event codes: 0=rise, 1=culminate, 2=set
             rise_t = None

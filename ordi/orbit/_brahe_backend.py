@@ -16,6 +16,11 @@ from ordi.orbit._contact_types import (
 # Cached to ~/.cache/brahe/ after the first download (~2 MB).
 bh.initialize_eop()
 
+# Propagation step size for KeplerianPropagator (seconds).
+# 30 s gives sub-km position accuracy for LEO orbits while keeping
+# the internal cache small enough for a single simulation run.
+_PROPAGATION_STEP_S = 30.0
+
 
 class _NamedPropagator:
     """Wraps a brahe KeplerianPropagator and exposes a .name attribute.
@@ -73,7 +78,7 @@ def build_synthetic_walker(
         pattern=bh.WalkerPattern.DELTA,
     ).with_base_name("SAT")
 
-    return [_NamedPropagator(p) for p in gen.as_keplerian_propagators(30.0)]
+    return [_NamedPropagator(p) for p in gen.as_keplerian_propagators(_PROPAGATION_STEP_S)]
 
 
 def compute_contact_windows(
