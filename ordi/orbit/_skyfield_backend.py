@@ -39,10 +39,18 @@ def build_synthetic_walker(n_planes: int = 6, sats_per_plane: int = 6,
                             epoch_str: str = "2024-01-01") -> List[EarthSatellite]:
     """
     Generate synthetic TLE-like objects for a Walker-Delta constellation.
-    Returns a list of (name, line1, line2) but uses Skyfield EarthSatellite
-    constructed via sgp4 directly; we store them as (name, sat_object, None).
-    For simplicity we return EarthSatellite objects directly.
+    Returns EarthSatellite objects constructed directly via sgp4.
+
+    epoch_str is accepted for API compatibility but ignored. The SGP4 epoch
+    is always fixed to 1970-01-01 (t_start_unix=0) so that both backends
+    place satellites at the same initial position. Pass a non-default value
+    only if you update the internal epoch logic accordingly.
     """
+    if epoch_str != "2024-01-01":
+        raise ValueError(
+            f"epoch_str={epoch_str!r} is not supported by the skyfield backend; "
+            "the epoch is locked to 1970-01-01 to align with the brahe backend."
+        )
     from sgp4.api import Satrec, WGS84
 
     ts = load.timescale()
@@ -129,26 +137,39 @@ def compute_contact_windows(
                     sat.name, gs_name, e, exc_info=True,
                 )
                 continue
-            # Skyfield returns event codes: 0=rise, 1=culminate, 2=set
+            # Skyfield returns event codes: 0=rise, 1=culminate, 2=set.
+            # rise_t=t_start.tt seeds partial passes already in progress at
+            # window open; a final flush handles passes open at window close.
             rise_t = None
             for ti, ev in zip(raw_times, raw_events):
                 if ev == 0:
                     rise_t = ti.tt
-                elif ev == 2 and rise_t is not None:
+                elif ev == 2:
+                    if rise_t is None:
+                        rise_t = t_start.tt  # satellite was already above threshold
                     t0 = _tt_to_unix(rise_t)
                     t1 = _tt_to_unix(ti.tt)
-                    # downlink
                     events.append(ContactEvent(t0, t1, sat.name, gs_name,
                                                DOWNLINK_RATE_BPS, "downlink"))
-                    # uplink
                     events.append(ContactEvent(t0, t1, gs_name, sat.name,
                                                UPLINK_RATE_BPS, "uplink"))
                     rise_t = None
+            # flush pass still open at window end
+            if rise_t is not None:
+                t0 = _tt_to_unix(rise_t)
+                t1 = _tt_to_unix(t_end.tt)
+                events.append(ContactEvent(t0, t1, sat.name, gs_name,
+                                           DOWNLINK_RATE_BPS, "downlink"))
+                events.append(ContactEvent(t0, t1, gs_name, sat.name,
+                                           UPLINK_RATE_BPS, "uplink"))
 
     # ── ISL contacts (coarse sampling) ──────────────────────────────────────
     n = len(satellites)
     n_steps = int((t_end_unix - t_start_unix) / dt_seconds) + 1
     times_tt = np.linspace(t_start.tt, t_end.tt, n_steps)
+    # Derive Unix timestamps from the actual TT samples so segment boundaries
+    # are consistent with the positions (TT ≠ Unix by ~42 s).
+    times_unix = np.array([_tt_to_unix(tt) for tt in times_tt])
 
     # Precompute GCRS positions for all sats × all times
     positions = np.zeros((n, n_steps, 3))  # km
@@ -170,9 +191,9 @@ def compute_contact_windows(
             seg_start = None
             for k, contact in enumerate(in_contact):
                 if contact and not prev:
-                    seg_start = t_start_unix + k * dt_seconds
+                    seg_start = times_unix[k]
                 elif not contact and prev and seg_start is not None:
-                    seg_end = t_start_unix + k * dt_seconds
+                    seg_end = times_unix[k]
                     events.append(ContactEvent(seg_start, seg_end,
                                                satellites[i].name, satellites[j].name,
                                                ISL_RATE_BPS, "isl"))
@@ -182,10 +203,10 @@ def compute_contact_windows(
                     seg_start = None
                 prev = contact
             if prev and seg_start is not None:
-                events.append(ContactEvent(seg_start, t_end_unix,
+                events.append(ContactEvent(seg_start, times_unix[-1],
                                            satellites[i].name, satellites[j].name,
                                            ISL_RATE_BPS, "isl"))
-                events.append(ContactEvent(seg_start, t_end_unix,
+                events.append(ContactEvent(seg_start, times_unix[-1],
                                            satellites[j].name, satellites[i].name,
                                            ISL_RATE_BPS, "isl"))
 
