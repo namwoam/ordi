@@ -1,7 +1,6 @@
 """Brahe-based orbital contact computation backend."""
 
 from __future__ import annotations
-import math
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -18,13 +17,36 @@ from ordi.orbit._contact_types import (
 bh.initialize_eop()
 
 
+class _NamedPropagator:
+    """Wraps a brahe KeplerianPropagator and exposes a .name attribute.
+
+    Necessary because callers use `sat.name` (skyfield convention) but brahe
+    propagators only provide `.get_name()` / `.set_name()`.
+    """
+
+    def __init__(self, propagator: bh.KeplerianPropagator) -> None:
+        self._prop = propagator
+        self.name: str = propagator.get_name()
+
+    # Delegate propagation calls so this object can be passed directly to
+    # brahe functions that expect a KeplerianPropagator.
+    def get_name(self) -> str:
+        return self.name
+
+    def states_ecef(self, epochs):
+        return self._prop.states_ecef(epochs)
+
+    def states_eci(self, epochs):
+        return self._prop.states_eci(epochs)
+
+
 def build_synthetic_walker(
     n_planes: int = 6,
     sats_per_plane: int = 6,
     alt_km: float = 550.0,
     inc_deg: float = 53.0,
     epoch_str: str = "2024-01-01",
-) -> List[bh.KeplerianPropagator]:
+) -> List[_NamedPropagator]:
     """
     Generate a Walker-Delta constellation using brahe's KeplerianPropagator.
 
@@ -51,11 +73,11 @@ def build_synthetic_walker(
         pattern=bh.WalkerPattern.DELTA,
     ).with_base_name("SAT")
 
-    return gen.as_keplerian_propagators(30.0)
+    return [_NamedPropagator(p) for p in gen.as_keplerian_propagators(30.0)]
 
 
 def compute_contact_windows(
-    satellites: List[bh.KeplerianPropagator],
+    satellites: List[_NamedPropagator],
     t_start_unix: float,
     t_end_unix: float,
     ground_stations: List[Tuple[str, float, float]] = None,
@@ -83,7 +105,8 @@ def compute_contact_windows(
         for gs_name, lat, lon in ground_stations
     ]
 
-    windows = bh.location_accesses(bh_locs, satellites, epc_start, epc_end, constraint)
+    raw_props = [s._prop for s in satellites]
+    windows = bh.location_accesses(bh_locs, raw_props, epc_start, epc_end, constraint)
     for w in windows:
         t0 = w.t_start.unix_timestamp()
         t1 = w.t_end.unix_timestamp()
@@ -117,19 +140,19 @@ def compute_contact_windows(
                 elif not contact and prev and seg_start is not None:
                     seg_end = t_start_unix + k * dt_seconds
                     events.append(ContactEvent(seg_start, seg_end,
-                                               satellites[i].get_name(), satellites[j].get_name(),
+                                               satellites[i].name, satellites[j].name,
                                                ISL_RATE_BPS, "isl"))
                     events.append(ContactEvent(seg_start, seg_end,
-                                               satellites[j].get_name(), satellites[i].get_name(),
+                                               satellites[j].name, satellites[i].name,
                                                ISL_RATE_BPS, "isl"))
                     seg_start = None
                 prev = contact
             if prev and seg_start is not None:
                 events.append(ContactEvent(seg_start, t_end_unix,
-                                           satellites[i].get_name(), satellites[j].get_name(),
+                                           satellites[i].name, satellites[j].name,
                                            ISL_RATE_BPS, "isl"))
                 events.append(ContactEvent(seg_start, t_end_unix,
-                                           satellites[j].get_name(), satellites[i].get_name(),
+                                           satellites[j].name, satellites[i].name,
                                            ISL_RATE_BPS, "isl"))
 
     events.sort(key=lambda e: e.t_start)
@@ -137,7 +160,7 @@ def compute_contact_windows(
 
 
 def compute_sat_groundtracks(
-    satellites: List[bh.KeplerianPropagator],
+    satellites: List[_NamedPropagator],
     t_start_unix: float,
     t_end_unix: float,
     dt_seconds: float = 60.0,
@@ -158,5 +181,5 @@ def compute_sat_groundtracks(
             # position_ecef_to_geodetic returns [lon_deg, lat_deg, alt_m]
             geodetic = bh.position_ecef_to_geodetic(pos_ecef_m, bh.AngleFormat.DEGREES)
             track.append((t_unix, float(geodetic[1]), float(geodetic[0])))
-        result[sat.get_name()] = track
+        result[sat.name] = track
     return result
