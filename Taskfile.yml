@@ -1,9 +1,9 @@
 version: '3'
 
 vars:
-  # Orbit propagation backend. Override with: ORBIT_BACKEND=brahe task e1
-  # Valid values: skyfield (default), brahe
-  ORBIT_BACKEND: '{{.ORBIT_BACKEND | default "skyfield"}}'
+  # Orbit propagation backend. Override with: ORBIT_BACKEND=skyfield task e1
+  # Valid values: brahe (default), skyfield
+  ORBIT_BACKEND: '{{.ORBIT_BACKEND | default "brahe"}}'
 
 tasks:
   setup:
