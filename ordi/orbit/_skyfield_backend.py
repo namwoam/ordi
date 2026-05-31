@@ -53,20 +53,24 @@ def build_synthetic_walker(n_planes: int = 6, sats_per_plane: int = 6,
             ma = (ma + 360.0 * p / total) % 360.0
             name = f"SAT_{p:02d}_{s:02d}"
             satrec = Satrec()
+            # Mean motion in rad/min: sqrt(GM/a^3) * 60
+            # GM = WGS84 Earth gravitational parameter (m^3/s^2)
+            _GM = 3.986004418e14
+            _a_m = (6371.0 + alt_km) * 1e3
+            n_radmin = math.sqrt(_GM / _a_m ** 3) * 60.0
             satrec.sgp4init(
                 WGS84,
                 'i',          # opsmode
                 0,            # satnum
-                24038.0,      # epoch (days from 1949-12-31)
-                2.5e-5,       # bstar drag
+                7306.0,       # epoch = 1970-01-01 (days from 1949-12-31), matches t_start_unix=0
+                0.0,          # bstar drag — zero to match brahe's Keplerian propagator
                 0.0,          # ndot
                 0.0,          # nddot
                 0.001,        # ecco (near-circular)
                 0.0,          # argpo
                 math.radians(inc_deg),
                 math.radians(ma),
-                (2 * math.pi) / (24 * 3600 / (2 * math.pi * (6371 + alt_km) * 1e3 /
-                                               math.sqrt(3.986e14 / ((6371 + alt_km) * 1e3)))) / (2 * math.pi),
+                n_radmin,
                 math.radians(raan),
             )
             sat = EarthSatellite.from_satrec(satrec, ts)
