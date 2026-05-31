@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
+    "brahe>=1.5.2",
     "highspy>=1.14.0",
     "matplotlib>=3.10.9",
     "networkx>=3.6.1",
