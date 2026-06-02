@@ -68,6 +68,13 @@ tasks:
     cmds:
       - uv run python -m ordi.main run E8
 
+  cots:
+    desc: "COTS - ORDI effectiveness with MobiCom24/BUPT-1 Atlas 200DK measurements"
+    env:
+      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
+    cmds:
+      - uv run python -m ordi.main run COTS
+
   # ── run all experiments ────────────────────────────────────────────────────
   run-all:
     desc: Run all experiments E1-E8 sequentially

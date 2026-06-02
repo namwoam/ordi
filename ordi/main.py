@@ -2,7 +2,7 @@
 ORDI CLI entry point.
 
 Usage:
-  python -m ordi.main run [E1|E2|...|E8|all]
+  python -m ordi.main run [E1|E2|...|E8|COTS|all]
   python -m ordi.main plot [E1|E2|...|E8|all]
   python -m ordi.main run all && python -m ordi.main plot all
 """

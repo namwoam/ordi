@@ -7,7 +7,7 @@ consistent with a COTS-equipped LEO nanosatellite (Jetson-class payload).
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 import math
 
 
@@ -183,7 +183,11 @@ class SatelliteState:
                 f"Q={self.Q_i/1e9:.1f}G, A={self.A_i})")
 
 
-def make_constellation_states(sat_ids: list, seed: int = 42) -> Dict[str, SatelliteState]:
+def make_constellation_states(
+    sat_ids: list,
+    seed: int = 42,
+    params_factory: Optional[Callable[[str], SatelliteParams]] = None,
+) -> Dict[str, SatelliteState]:
     """
     Create a dict of SatelliteState for each satellite ID with mild random variation
     in initial battery and thermal state to break symmetry.
@@ -192,7 +196,7 @@ def make_constellation_states(sat_ids: list, seed: int = 42) -> Dict[str, Satell
     rng = random.Random(seed)
     states = {}
     for sid in sat_ids:
-        p = SatelliteParams(sat_id=sid)
+        p = params_factory(sid) if params_factory else SatelliteParams(sat_id=sid)
         s = SatelliteState(params=p)
         # slight variation
         s.B_i = p.battery_j * rng.uniform(0.70, 0.95)
