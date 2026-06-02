@@ -336,8 +336,56 @@ def plot_E8():
     print(f"  Saved {path}")
 
 
+# ── COTS: MobiCom24/BUPT-1 measurement-backed evaluation ────────────────────
+
+def plot_COTS():
+    rows = _read_csv("COTS_mobicom24")
+    if not rows:
+        print("No COTS data"); return
+
+    metrics = ["deadline_miss_ratio", "delivered_utility", "objective",
+               "energy_joules", "isl_traffic_bits"]
+    titles = ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)",
+              "Objective (↑)", "Energy (J) (↓)", "ISL Traffic (bits) (↓)"]
+
+    preferred_order = [
+        "ORDI", "B5_seco_like", "B6_full_replication", "B8_cocoi_like",
+        "B3_compression_only", "B2_onboard_only", "B4_serval_like",
+        "B7_random_replication", "B1_direct_downlink",
+    ]
+    by_alg = {r["algorithm"]: r for r in rows}
+    ordered = [by_alg[a] for a in preferred_order if a in by_alg]
+    ordered += [r for r in rows if r["algorithm"] not in preferred_order]
+
+    algs = [r["algorithm"] for r in ordered]
+    colors = [ALG_COLORS.get(a, "#888") for a in algs]
+    labels = [ALG_LABELS.get(a, a) for a in algs]
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(18, 4))
+    fig.suptitle("COTS: ORDI with MobiCom24/BUPT-1 Atlas 200DK Measurements",
+                 fontsize=12, fontweight="bold")
+
+    for ax, metric, title in zip(axes, metrics, titles):
+        vals = [_float(r, metric) for r in ordered]
+        bars = ax.bar(range(len(algs)), vals, color=colors)
+        ax.set_title(title, fontsize=9)
+        ax.set_xticks(range(len(algs)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax.tick_params(axis="y", labelsize=8)
+        for bar, alg in zip(bars, algs):
+            if alg == "ORDI":
+                bar.set_edgecolor("black")
+                bar.set_linewidth(2)
+
+    plt.tight_layout()
+    path = os.path.join(FIGURES_DIR, "COTS_mobicom24.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved {path}")
+
+
 def plot_all():
     _ensure_figures()
     for fn in [plot_E1, plot_E2, plot_E3, plot_E4,
-               plot_E5, plot_E6, plot_E7, plot_E8]:
+               plot_E5, plot_E6, plot_E7, plot_E8, plot_COTS]:
         fn()

@@ -99,6 +99,11 @@ tasks:
     cmds:
       - uv run python -m ordi.main plot E1
 
+  plot-cots:
+    desc: Plot COTS measurement-backed evaluation figure only
+    cmds:
+      - uv run python -m ordi.main plot COTS
+
   # ── run all then plot ──────────────────────────────────────────────────────
   all:
     desc: Run all experiments then generate all figures

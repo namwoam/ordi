@@ -37,7 +37,9 @@ from ordi.orbit.contacts import (
 )
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
-from ordi.sim.cots_measurements import atlas_200dk_bupt1_params
+from ordi.sim.cots_measurements import (
+    atlas_200dk_bupt1_params, load_cots_measurement_profile,
+)
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.scheduler.ordi import (
@@ -578,6 +580,12 @@ def run_COTS(seed=0) -> Dict[str, List[EpochMetrics]]:
     power, battery, solar, and effective throughput values.
     """
     print("COTS: MobiCom24/BUPT-1 Atlas 200DK payload model (E1 scenario)")
+    profile = load_cots_measurement_profile()
+    print(f"  Loading SatelliteCOTS logs from {profile.source_root}")
+    print(f"  Atlas log: {profile.inference_log}")
+    print(f"  Measured payload: {profile.compute_rate_gflops:.2f} GFLOP/s, "
+          f"idle={profile.idle_power_w:.2f} W, active={profile.active_power_w:.2f} W, "
+          f"battery={profile.battery_wh:.1f} Wh")
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
                    arrival_rate=8.0, deadline_slack=600.0,
