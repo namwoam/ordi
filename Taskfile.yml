@@ -68,9 +68,16 @@ tasks:
     cmds:
       - uv run python -m ordi.main run E8
 
+  cots:
+    desc: "COTS - ORDI effectiveness with MobiCom24/BUPT-1 Atlas 200DK measurements"
+    env:
+      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
+    cmds:
+      - uv run python -m ordi.main run COTS
+
   # ── run all experiments ────────────────────────────────────────────────────
   run-all:
-    desc: Run all experiments E1-E8 sequentially
+    desc: Run all experiments E1-E8 and COTS sequentially
     cmds:
       - task: e1
       - task: e2
@@ -80,6 +87,7 @@ tasks:
       - task: e6
       - task: e7
       - task: e8
+      - task: cots
 
   # ── plotting ───────────────────────────────────────────────────────────────
   plot:
@@ -91,6 +99,11 @@ tasks:
     desc: Plot E1 figure only
     cmds:
       - uv run python -m ordi.main plot E1
+
+  plot-cots:
+    desc: Plot COTS measurement-backed evaluation figure only
+    cmds:
+      - uv run python -m ordi.main plot COTS
 
   # ── run all then plot ──────────────────────────────────────────────────────
   all:

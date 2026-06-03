@@ -37,6 +37,9 @@ from ordi.orbit.contacts import (
 )
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
+from ordi.sim.cots_measurements import (
+    atlas_200dk_bupt1_params, load_cots_measurement_profile,
+)
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.scheduler.ordi import (
@@ -67,7 +70,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                arrival_rate=6.0, ground_stations=None,
                orbit_period_s=5760.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
-               min_elevation_deg=5.0):
+               min_elevation_deg=5.0, satellite_params_factory=None):
     """Build all shared simulation objects.
 
     orbit_period_s        : realistic LEO period at 550 km altitude (~5760 s / 96 min).
@@ -101,7 +104,9 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
 
     graphs = build_epoch_graphs(contacts, T_SIM_START, EPOCH_LENGTH_S, N_EPOCHS)
-    states = make_constellation_states(sat_ids, seed=seed)
+    states = make_constellation_states(
+        sat_ids, seed=seed, params_factory=satellite_params_factory
+    )
     reliability = ReliabilityModel()
 
     sat_groundtrack = None
@@ -565,11 +570,50 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
     return results
 
 
+# ── COTS measurement-backed evaluation ────────────────────────────────────────
+
+def run_COTS(seed=0) -> Dict[str, List[EpochMetrics]]:
+    """Evaluate ORDI with BUPT-1 Atlas 200DK measurements from MobiCom24.
+
+    This keeps the E1 orbital/task setup fixed and replaces the generic
+    Jetson-class satellite parameters with measurement-derived Atlas 200DK-B
+    power, battery, solar, and effective throughput values.
+    """
+    print("COTS: MobiCom24/BUPT-1 Atlas 200DK payload model (E1 scenario)")
+    profile = load_cots_measurement_profile()
+    print(f"  Loading SatelliteCOTS logs from {profile.source_root}")
+    print(f"  Atlas log: {profile.inference_log}")
+    print(f"  Measured payload: {profile.compute_rate_gflops:.2f} GFLOP/s, "
+          f"idle={profile.idle_power_w:.2f} W, active={profile.active_power_w:.2f} W, "
+          f"battery={profile.battery_wh:.1f} Wh")
+    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
+        _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
+                   arrival_rate=8.0, deadline_slack=600.0,
+                   deadline_lognorm_sigma=0.6, min_elevation_deg=25.0,
+                   satellite_params_factory=atlas_200dk_bupt1_params)
+    baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+
+    job_args = [
+        ("ORDI", "ORDI", ORDIScheduler,
+         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
+    ]
+    for name, baseline in baselines.items():
+        job_args.append((
+            name, name, baseline.__class__,
+            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
+        ))
+
+    results = _run_parallel(job_args, desc="COTS algorithms")
+    _save_csv("COTS_mobicom24", results)
+    return results
+
+
 # ── master runner ─────────────────────────────────────────────────────────────
 
 ALL_EXPERIMENTS = {
     "E1": run_E1, "E2": run_E2, "E3": run_E3, "E4": run_E4,
     "E5": run_E5, "E6": run_E6, "E7": run_E7, "E8": run_E8,
+    "COTS": run_COTS,
 }
 
 
