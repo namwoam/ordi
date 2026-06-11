@@ -337,18 +337,24 @@ def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
     sequentially via _parallel_run_algorithm (sharing through _WORKER_SHARED).
     Keeping build + jobs in one worker avoids shipping the big sim objects.
 
-    jobs: (key, alg_name, scheduler_class[, fault_specs]); see
-    _resolve_fault_specs for the spec forms."""
+    jobs: (key, alg_name, scheduler_class[, fault_specs[, cfg_overrides]]);
+    see _resolve_fault_specs for the spec forms. cfg_overrides is an optional
+    dict of ORDIConfig attributes applied to a per-job copy of the built cfg."""
     build_kwargs, jobs, seed = args
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(seed=seed, **build_kwargs)
     _init_worker_shared((tasks, graphs, states, reliability, sat_ids, gs_names))
     out = []
     for job in jobs:
-        key, alg_name, cls, fault_specs = job if len(job) == 4 else (*job, None)
+        key, alg_name, cls, fault_specs, cfg_overrides = (tuple(job) + (None, None))[:5]
         faults = (None if fault_specs is None
                   else _resolve_fault_specs(fault_specs, sat_ids, tasks))
-        out.append(_parallel_run_algorithm((key, alg_name, cls, cfg, faults, seed)))
+        job_cfg = cfg
+        if cfg_overrides:
+            job_cfg = deepcopy(cfg)
+            for k, v in cfg_overrides.items():
+                setattr(job_cfg, k, v)
+        out.append(_parallel_run_algorithm((key, alg_name, cls, job_cfg, faults, seed)))
     return out
 
 
@@ -378,7 +384,7 @@ def _run_configs_parallel(config_args: List[Tuple],
 _CSV_METRIC_KEYS = [
     "deadline_miss_ratio", "delivered_utility", "partial_coverage",
     "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
-    "energy_joules", "helper_utilization", "objective",
+    "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
 ]
 _CSV_FIELDS = (["algorithm"] + _CSV_METRIC_KEYS
                + [f"{k}_std" for k in _CSV_METRIC_KEYS])
@@ -403,6 +409,12 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
 
 
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
+
+# The stressed reference scenario (shared by E1, E5, E6): a sparser Walker and
+# realistic 25° Ka-band GS elevation so deadlines actually bind.
+_E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
+                        arrival_rate=8.0, deadline_slack=600.0,
+                        deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
 
 def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
     """
@@ -432,9 +444,7 @@ def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
     """
     print(f"E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, "
           f"25° GS elevation, {n_seeds} seeds)")
-    build_kwargs = dict(n_planes=6, sats_per_plane=4,
-                        arrival_rate=8.0, deadline_slack=600.0,
-                        deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
+    build_kwargs = dict(_E1_BUILD_KWARGS)
     alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
 
     config_args = []
@@ -597,9 +607,7 @@ def run_E5(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
             jobs = [(f"{alg_name}@slack={slack}s#s{s}", alg_name, cls)
                     for alg_name, cls in alg_classes]
             config_args.append(
-                ({"n_planes": 6, "sats_per_plane": 4, "arrival_rate": 8.0,
-                  "min_elevation_deg": 25.0,
-                  "deadline_slack": float(slack), "deadline_lognorm_sigma": 0.6},
+                ({**_E1_BUILD_KWARGS, "deadline_slack": float(slack)},
                  jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E5 scale×seed")
@@ -618,21 +626,28 @@ def run_E5(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
 # ── E6: λ_R penalty sweep ─────────────────────────────────────────────────────
 
-def run_E6(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E6: λ_R (replication penalty) sweep")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, base_cfg = \
-        _build_sim(seed=seed)
+def run_E6(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    print(f"E6: λ_R (replication penalty) sweep ({n_seeds} seeds)")
 
+    # Uses the stressed E1 scenario so the penalty has consequences to trade
+    # against; the interesting output is how λ_R throttles backup placement
+    # (n_replicas_avg) and what that costs in utility.
     lambda_Rs = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = []
-    for lambda_R in lambda_Rs:
-        cfg = deepcopy(base_cfg)
-        cfg.lambda_R = lambda_R
-        key = f"ORDI@lambda_R={lambda_R}"
-        job_args.append((key, "ORDI", ORDIScheduler, cfg, None, seed))
+    config_args = []
+    for s in range(n_seeds):
+        jobs = [(f"ORDI@lambda_R={l}#s{s}", "ORDI", ORDIScheduler,
+                 None, {"lambda_R": l})
+                for l in lambda_Rs]
+        config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
 
-    results = _run_parallel(shared, job_args, desc="E6 lambda_R")
+    raw = _run_configs_parallel(config_args, desc="E6 seeds")
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    for l in lambda_Rs:
+        results[f"ORDI@lambda_R={l}"] = [
+            m for s in range(n_seeds) for m in raw[f"ORDI@lambda_R={l}#s{s}"]
+        ]
+
     _save_csv("E6_lambda_R", results)
     return results
 
@@ -728,33 +743,36 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
 
 # ── COTS measurement-backed evaluation ────────────────────────────────────────
 
-def run_COTS(seed=0) -> Dict[str, List[EpochMetrics]]:
+def run_COTS(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
     """Evaluate ORDI with BUPT-1 Atlas 200DK measurements from MobiCom24.
 
-    This keeps the E1 orbital/task setup fixed and replaces the generic
-    Jetson-class satellite parameters with measurement-derived Atlas 200DK-B
-    power, battery, solar, and effective throughput values.
+    This keeps the E1 orbital/task setup (and its 30-seed protocol) fixed and
+    replaces the generic Jetson-class satellite parameters with
+    measurement-derived Atlas 200DK-B power, battery, solar, and effective
+    throughput values.
     """
-    print("COTS: MobiCom24/BUPT-1 Atlas 200DK payload model (E1 scenario)")
+    print(f"COTS: MobiCom24/BUPT-1 Atlas 200DK payload model (E1 scenario, {n_seeds} seeds)")
     profile = load_cots_measurement_profile()
     print(f"  Loading SatelliteCOTS logs from {profile.source_root}")
     print(f"  Atlas log: {profile.inference_log}")
     print(f"  Measured payload: {profile.compute_rate_gflops:.2f} GFLOP/s, "
           f"idle={profile.idle_power_w:.2f} W, active={profile.active_power_w:.2f} W, "
           f"battery={profile.battery_wh:.1f} Wh")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
-                   arrival_rate=8.0, deadline_slack=600.0,
-                   deadline_lognorm_sigma=0.6, min_elevation_deg=25.0,
-                   satellite_params_factory=atlas_200dk_bupt1_params)
-    baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+    build_kwargs = {**_E1_BUILD_KWARGS,
+                    "satellite_params_factory": atlas_200dk_bupt1_params}
+    alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
 
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = [("ORDI", "ORDI", ORDIScheduler, cfg, None, seed)]
-    for name, baseline in baselines.items():
-        job_args.append((name, name, baseline.__class__, cfg, None, seed))
+    config_args = []
+    for s in range(n_seeds):
+        jobs = [(f"{alg}#s{s}", alg, cls) for alg, cls in alg_classes]
+        config_args.append((build_kwargs, jobs, seed + s))
 
-    results = _run_parallel(shared, job_args, desc="COTS algorithms")
+    raw = _run_configs_parallel(config_args, desc="COTS seeds")
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    for alg, _cls in alg_classes:
+        results[alg] = [m for s in range(n_seeds) for m in raw[f"{alg}#s{s}"]]
+
     _save_csv("COTS_mobicom24", results)
     return results
 

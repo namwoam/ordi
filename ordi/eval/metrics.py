@@ -33,6 +33,7 @@ class EpochMetrics:
     energy_joules: float = 0.0
     helper_utilization: float = 0.0
     objective: float = 0.0
+    n_replicas_avg: float = 0.0
     n_tiles_total: int = 0
     n_tiles_feasible: int = 0
 
@@ -100,6 +101,8 @@ def compute_metrics(
     m.partial_coverage = sum(partial_coverages) / len(partial_coverages) if partial_coverages else 0.0
     m.recovery_latency = sum(recovery_lats) / len(recovery_lats) if recovery_lats else 0.0
     m.objective = result.objective
+    m.n_replicas_avg = (sum(len(a.replicas) for a in result.assignments) / n_tiles
+                        if n_tiles > 0 else 0.0)
 
     # Helper utilization: fraction of total constellation compute used
     total_capacity = sum(sat_compute_capacity.values())
@@ -126,7 +129,7 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
     keys = [
         "deadline_miss_ratio", "delivered_utility", "partial_coverage",
         "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
-        "energy_joules", "helper_utilization", "objective",
+        "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
     ]
     out: Dict[str, float] = {}
     for k in keys:

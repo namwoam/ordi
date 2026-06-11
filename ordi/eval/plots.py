@@ -61,6 +61,11 @@ def _float(row, key):
         return 0.0
 
 
+def _std(row, key):
+    """Across-seed std column written by aggregate_metrics (0.0 if absent)."""
+    return _float(row, f"{key}_std")
+
+
 # ── E1: Core performance bar chart ───────────────────────────────────────────
 
 def plot_E1():
@@ -82,7 +87,9 @@ def plot_E1():
 
     for ax, metric, title in zip(axes, metrics, titles):
         vals = [_float(r, metric) for r in rows]
-        bars = ax.bar(range(len(algs)), vals, color=colors)
+        errs = [_std(r, metric) for r in rows]
+        bars = ax.bar(range(len(algs)), vals, color=colors,
+                      yerr=errs, capsize=2, error_kw={"linewidth": 0.8})
         ax.set_title(title, fontsize=9)
         ax.set_xticks(range(len(algs)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
@@ -108,17 +115,20 @@ def plot_E2():
 
     scenarios = [r["algorithm"] for r in rows]
     miss_ratios = [_float(r, "deadline_miss_ratio") for r in rows]
+    miss_errs   = [_std(r, "deadline_miss_ratio") for r in rows]
     utilities   = [_float(r, "delivered_utility")   for r in rows]
+    util_errs   = [_std(r, "delivered_utility") for r in rows]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     fig.suptitle("E2: ORDI Robustness Across Fault Types", fontsize=12, fontweight="bold")
 
-    ax1.bar(scenarios, miss_ratios, color="#e63946")
+    ax1.bar(scenarios, miss_ratios, color="#e63946", yerr=miss_errs, capsize=3)
     ax1.set_ylabel("Deadline Miss Ratio")
     ax1.set_xticklabels(scenarios, rotation=30, ha="right", fontsize=8)
     ax1.set_title("Deadline Miss Ratio (↓)")
+    ax1.set_ylim(bottom=0)
 
-    ax2.bar(scenarios, utilities, color="#2a9d8f")
+    ax2.bar(scenarios, utilities, color="#2a9d8f", yerr=util_errs, capsize=3)
     ax2.set_ylabel("Delivered Utility")
     ax2.set_xticklabels(scenarios, rotation=30, ha="right", fontsize=8)
     ax2.set_title("Delivered Utility (↑)")
@@ -147,21 +157,26 @@ def plot_E3():
     fig.suptitle("E3: Graceful Degradation Under Increasing Fault Rate", fontsize=11, fontweight="bold")
 
     for alg in algs:
-        miss_vals = []
-        util_vals = []
+        miss_vals, miss_errs = [], []
+        util_vals, util_errs = [], []
         for rate in fault_rates:
             key = f"{alg}@fault={rate:.2f}"
             row = next((r for r in rows if r["algorithm"] == key), None)
             miss_vals.append(_float(row, "deadline_miss_ratio") if row else 0)
+            miss_errs.append(_std(row, "deadline_miss_ratio") if row else 0)
             util_vals.append(_float(row, "delivered_utility")   if row else 0)
+            util_errs.append(_std(row, "delivered_utility") if row else 0)
         label = ALG_LABELS.get(alg, alg)
         color = ALG_COLORS.get(alg, "#888")
         lw = 2.5 if alg == "ORDI" else 1.5
-        ax1.plot(fault_rates, miss_vals, label=label, color=color, linewidth=lw, marker="o")
-        ax2.plot(fault_rates, util_vals, label=label, color=color, linewidth=lw, marker="o")
+        ax1.errorbar(fault_rates, miss_vals, yerr=miss_errs, label=label,
+                     color=color, linewidth=lw, marker="o", capsize=3)
+        ax2.errorbar(fault_rates, util_vals, yerr=util_errs, label=label,
+                     color=color, linewidth=lw, marker="o", capsize=3)
 
     ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (↓)")
     ax1.legend(fontsize=8); ax1.set_title("Deadline Miss Ratio")
+    ax1.set_ylim(bottom=0)
     ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("Delivered Utility (↑)")
     ax2.legend(fontsize=8); ax2.set_title("Delivered Utility")
 
@@ -188,13 +203,15 @@ def plot_E4():
     fig.suptitle("E4: Scalability vs. Constellation Size", fontsize=11, fontweight="bold")
 
     for alg in algs:
-        util_vals = []
+        util_vals, util_errs = [], []
         for n in sizes:
             key = f"{alg}@n={n}"
             row = next((r for r in rows if r["algorithm"] == key), None)
             util_vals.append(_float(row, "delivered_utility") if row else 0)
-        ax.plot(sizes, util_vals, label=ALG_LABELS.get(alg, alg),
-                color=ALG_COLORS.get(alg, "#888"), linewidth=2, marker="s")
+            util_errs.append(_std(row, "delivered_utility") if row else 0)
+        ax.errorbar(sizes, util_vals, yerr=util_errs, label=ALG_LABELS.get(alg, alg),
+                    color=ALG_COLORS.get(alg, "#888"), linewidth=2, marker="s",
+                    capsize=3)
 
     ax.set_xlabel("Number of Satellites"); ax.set_ylabel("Delivered Utility (↑)")
     ax.legend(); ax.grid(True, alpha=0.3)
@@ -227,14 +244,19 @@ def plot_E5():
                  "(log-normal σ=0.6; wildfire median = scale/2)",
                  fontsize=11, fontweight="bold")
 
+    # B2 and B4 nearly coincide in this scenario; dash B4 so B2 stays visible.
+    linestyles = {"ORDI": "-", "B2_onboard_only": "-", "B4_serval_like": "--"}
     for alg in algs:
-        miss_vals = []
+        miss_vals, miss_errs = [], []
         for sl in scales:
             key = f"{alg}@slack={sl}s"
             row = next((r for r in rows if r["algorithm"] == key), None)
             miss_vals.append(_float(row, "deadline_miss_ratio") if row else 1.0)
-        ax.plot(wildfire_medians, miss_vals, label=ALG_LABELS.get(alg, alg),
-                color=ALG_COLORS.get(alg, "#888"), linewidth=2, marker="^")
+            miss_errs.append(_std(row, "deadline_miss_ratio") if row else 0)
+        ax.errorbar(wildfire_medians, miss_vals, yerr=miss_errs,
+                    label=ALG_LABELS.get(alg, alg),
+                    color=ALG_COLORS.get(alg, "#888"), linewidth=2, marker="^",
+                    linestyle=linestyles.get(alg, "-"), capsize=3)
 
     ax.set_xlabel("Wildfire-task Deadline Median (s)  [scale × ½]")
     ax.set_ylabel("Deadline Miss Ratio (↓)")
@@ -258,17 +280,27 @@ def plot_E6():
         for r in rows if "lambda_R=" in r["algorithm"]
     ))
 
-    miss_vals = [_float(next((r for r in rows if f"lambda_R={l}" in r["algorithm"]), {}),
-                        "deadline_miss_ratio") for l in lambdas]
-    util_vals = [_float(next((r for r in rows if f"lambda_R={l}" in r["algorithm"]), {}),
-                        "delivered_utility")   for l in lambdas]
+    def _series(metric):
+        vals, errs = [], []
+        for l in lambdas:
+            row = next((r for r in rows if f"lambda_R={l}" in r["algorithm"]), {})
+            vals.append(_float(row, metric))
+            errs.append(_std(row, metric))
+        return vals, errs
+
+    rep_vals, rep_errs = _series("n_replicas_avg")
+    util_vals, util_errs = _series("delivered_utility")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
     fig.suptitle("E6: Effect of Replication Penalty λ_R", fontsize=11, fontweight="bold")
-    ax1.plot(lambdas, miss_vals, color="#e63946", linewidth=2, marker="o")
-    ax1.set_xlabel("λ_R"); ax1.set_ylabel("Deadline Miss Ratio (↓)")
-    ax2.plot(lambdas, util_vals, color="#2a9d8f", linewidth=2, marker="o")
+    ax1.errorbar(lambdas, rep_vals, yerr=rep_errs, color="#e63946",
+                 linewidth=2, marker="o", capsize=3)
+    ax1.set_xlabel("λ_R"); ax1.set_ylabel("Mean Replicas per Tile")
+    ax1.set_title("Backup placement vs. penalty")
+    ax2.errorbar(lambdas, util_vals, yerr=util_errs, color="#2a9d8f",
+                 linewidth=2, marker="o", capsize=3)
     ax2.set_xlabel("λ_R"); ax2.set_ylabel("Delivered Utility (↑)")
+    ax2.set_title("Utility cost of suppressing backups")
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E6_lambda_R.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -291,11 +323,13 @@ def plot_E7():
                                   ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)"]):
         labels = [r["algorithm"] for r in rows]
         vals   = [_float(r, metric) for r in rows]
+        errs   = [_std(r, metric) for r in rows]
         colors = ["#e63946" if "ORDI" in l else "#f4a261" for l in labels]
-        ax.bar(range(len(labels)), vals, color=colors)
+        ax.bar(range(len(labels)), vals, color=colors, yerr=errs, capsize=3)
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
         ax.set_title(title)
+        ax.set_ylim(bottom=0)
 
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E7_correlated.png")
@@ -317,18 +351,19 @@ def plot_E8():
         return
 
     metrics = ["delivered_utility", "deadline_miss_ratio"]
-    labels  = ["Delivered Utility", "Deadline Miss Ratio"]
-    g_vals  = [_float(greedy_row, m) for m in metrics]
-    i_vals  = [_float(ilp_row,    m) for m in metrics]
+    titles  = ["Delivered Utility (↑)", "Deadline Miss Ratio (↓)"]
 
-    x = np.arange(len(metrics))
-    w = 0.35
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
     fig.suptitle("E8: Greedy vs. ILP Optimality Gap", fontsize=11, fontweight="bold")
-    ax.bar(x - w/2, g_vals, w, label="Greedy", color="#e63946")
-    ax.bar(x + w/2, i_vals, w, label="ILP",    color="#457b9d")
-    ax.set_xticks(x); ax.set_xticklabels(labels)
-    ax.legend()
+    for ax, metric, title in zip(axes, metrics, titles):
+        g, i = _float(greedy_row, metric), _float(ilp_row, metric)
+        ax.bar([0, 1], [g, i], 0.6, color=["#e63946", "#457b9d"])
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["Greedy", "ILP"])
+        ax.set_title(title, fontsize=10)
+        gap = (g - i) / i * 100 if i else 0.0
+        ax.annotate(f"gap: {gap:+.1f}%", xy=(0.5, 0.92), xycoords="axes fraction",
+                    ha="center", fontsize=9)
+        ax.set_ylim(0, max(g, i) * 1.25 if max(g, i) > 0 else 1)
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E8_ilp_gap.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -348,15 +383,8 @@ def plot_COTS():
     titles = ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)",
               "Objective (↑)", "Energy (J) (↓)", "ISL Traffic (bits) (↓)"]
 
-    preferred_order = [
-        "ORDI", "B5_seco_like", "B6_full_replication", "B8_cocoi_like",
-        "B3_compression_only", "B2_onboard_only", "B4_serval_like",
-        "B7_random_replication", "B1_direct_downlink",
-    ]
-    by_alg = {r["algorithm"]: r for r in rows}
-    ordered = [by_alg[a] for a in preferred_order if a in by_alg]
-    ordered += [r for r in rows if r["algorithm"] not in preferred_order]
-
+    # CSV rows are already in submission order (ORDI, B1..B8), same as E1.
+    ordered = rows
     algs = [r["algorithm"] for r in ordered]
     colors = [ALG_COLORS.get(a, "#888") for a in algs]
     labels = [ALG_LABELS.get(a, a) for a in algs]
@@ -367,7 +395,9 @@ def plot_COTS():
 
     for ax, metric, title in zip(axes, metrics, titles):
         vals = [_float(r, metric) for r in ordered]
-        bars = ax.bar(range(len(algs)), vals, color=colors)
+        errs = [_std(r, metric) for r in ordered]
+        bars = ax.bar(range(len(algs)), vals, color=colors,
+                      yerr=errs, capsize=2, error_kw={"linewidth": 0.8})
         ax.set_title(title, fontsize=9)
         ax.set_xticks(range(len(algs)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
