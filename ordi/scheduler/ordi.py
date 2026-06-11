@@ -19,7 +19,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from ordi.orbit.graph import EpochContactGraph, earliest_arrival, earliest_downlink
+from ordi.orbit.graph import (
+    EpochContactGraph, earliest_arrival_all, earliest_downlink,
+)
 from ordi.sim.satellite import SatelliteState
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask, Tile
@@ -137,15 +139,22 @@ class ORDIScheduler:
 
         max_search_ep = int(math.ceil(max_tau_k / cfg.epoch_length)) + 1
 
+        # All three tables are filled from single-source Dijkstra sweeps
+        # (earliest_arrival_all): one search per source node instead of one per
+        # (source, destination) pair — same arrival times, ~n× fewer searches.
+        gs_idx = [node_index[gs] for gs in self.ground_stations]
+        active_idx = [node_index[sid] for sid in sat_ids_active]
+
         # ell_down_caches[d_out] → (n,) array: ell_down_caches[d_out][agg_idx]
         ell_down_caches: Dict[float, np.ndarray] = {}
         for d_out in unique_d_out:
             arr = np.full(n, np.inf)
             for i, agg in enumerate(sat_ids_active):
-                arr[i] = earliest_downlink(
-                    agg, epoch, self.graphs, d_out, self.ground_stations,
-                    max_search_epochs=max_search_ep, node_index=node_index,
+                t_all = earliest_arrival_all(
+                    agg, epoch, self.graphs, d_out, node_index,
+                    max_search_epochs=max_search_ep, targets=gs_idx,
                 )
+                arr[i] = t_all[gs_idx].min()
             ell_down_caches[d_out] = arr
 
         # ell_ia_caches[d_out] → (n, n) array: ell_ia_caches[d_out][h_idx, a_idx]
@@ -156,13 +165,17 @@ class ORDIScheduler:
             arr = np.full((n, n), np.inf)
             reachable = [i for i in range(n) if not np.isinf(dc[i])]
             for hi, helper in enumerate(sat_ids_active):
+                targets = [active_idx[ai] for ai in reachable if ai != hi]
+                if not targets:
+                    continue
+                t_all = earliest_arrival_all(
+                    helper, epoch, self.graphs, d_out, node_index,
+                    max_search_epochs=max_search_ep, targets=targets,
+                )
                 for ai in reachable:
                     if ai == hi:
                         continue
-                    arr[hi, ai] = earliest_arrival(
-                        helper, sat_ids_active[ai], epoch, self.graphs, d_out,
-                        max_search_epochs=max_search_ep, node_index=node_index,
-                    )
+                    arr[hi, ai] = t_all[active_idx[ai]]
             ell_ia_caches[d_out] = arr
 
         # ell_ski_caches[d_in][source] → (n,) array: arr[h_idx]
@@ -170,14 +183,17 @@ class ORDIScheduler:
         for d_in in unique_d_in:
             per_src: Dict[str, np.ndarray] = {}
             for source in unique_sources:
+                targets = [active_idx[hi] for hi, h in enumerate(sat_ids_active)
+                           if h != source]
+                t_all = earliest_arrival_all(
+                    source, epoch, self.graphs, d_in, node_index,
+                    max_search_epochs=max_search_ep, targets=targets,
+                )
                 arr = np.full(n, np.inf)
                 for hi, helper in enumerate(sat_ids_active):
                     if helper == source:
                         continue
-                    arr[hi] = earliest_arrival(
-                        source, helper, epoch, self.graphs, d_in,
-                        max_search_epochs=max_search_ep, node_index=node_index,
-                    )
+                    arr[hi] = t_all[active_idx[hi]]
                 per_src[source] = arr
             ell_ski_caches[d_in] = per_src
 
