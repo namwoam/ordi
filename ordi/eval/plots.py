@@ -83,7 +83,6 @@ def plot_E1():
     labels = [ALG_LABELS.get(a, a) for a in algs]
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(18, 4))
-    fig.suptitle("E1: Core Performance — ORDI vs. Baselines", fontsize=12, fontweight="bold")
 
     for ax, metric, title in zip(axes, metrics, titles):
         vals = [_float(r, metric) for r in rows]
@@ -120,7 +119,6 @@ def plot_E2():
     util_errs   = [_std(r, "delivered_utility") for r in rows]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle("E2: ORDI Robustness Across Fault Types", fontsize=12, fontweight="bold")
 
     ax1.bar(scenarios, miss_ratios, color="#e63946", yerr=miss_errs, capsize=3)
     ax1.set_ylabel("Deadline Miss Ratio")
@@ -154,7 +152,6 @@ def plot_E3():
     ))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle("E3: Graceful Degradation Under Increasing Fault Rate", fontsize=11, fontweight="bold")
 
     for alg in algs:
         miss_vals, miss_errs = [], []
@@ -200,7 +197,6 @@ def plot_E4():
     ))
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    fig.suptitle("E4: Scalability vs. Constellation Size", fontsize=11, fontweight="bold")
 
     for alg in algs:
         util_vals, util_errs = [], []
@@ -240,9 +236,6 @@ def plot_E5():
     wildfire_medians = [s // 2 for s in scales]
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    fig.suptitle("E5: Deadline Miss Rate vs. Deadline Scale\n"
-                 "(log-normal σ=0.6; wildfire median = scale/2)",
-                 fontsize=11, fontweight="bold")
 
     # B2 and B4 nearly coincide in this scenario; dash B4 so B2 stays visible.
     linestyles = {"ORDI": "-", "B2_onboard_only": "-", "B4_serval_like": "--"}
@@ -292,7 +285,6 @@ def plot_E6():
     util_vals, util_errs = _series("delivered_utility")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle("E6: Effect of Replication Penalty λ_R", fontsize=11, fontweight="bold")
     ax1.errorbar(lambdas, rep_vals, yerr=rep_errs, color="#e63946",
                  linewidth=2, marker="o", capsize=3)
     ax1.set_xlabel("λ_R"); ax1.set_ylabel("Mean Replicas per Tile")
@@ -316,7 +308,6 @@ def plot_E7():
         print("No E7 data"); return
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle("E7: Correlated Orbital-Plane Outage", fontsize=11, fontweight="bold")
 
     for ax, metric, title in zip(axes,
                                   ["deadline_miss_ratio", "delivered_utility"],
@@ -354,7 +345,6 @@ def plot_E8():
     titles  = ["Delivered Utility (↑)", "Deadline Miss Ratio (↓)"]
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-    fig.suptitle("E8: Greedy vs. ILP Optimality Gap", fontsize=11, fontweight="bold")
     for ax, metric, title in zip(axes, metrics, titles):
         g, i = _float(greedy_row, metric), _float(ilp_row, metric)
         ax.bar([0, 1], [g, i], 0.6, color=["#e63946", "#457b9d"])
@@ -390,8 +380,6 @@ def plot_COTS():
     labels = [ALG_LABELS.get(a, a) for a in algs]
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(18, 4))
-    fig.suptitle("COTS: ORDI with MobiCom24/BUPT-1 Atlas 200DK Measurements",
-                 fontsize=12, fontweight="bold")
 
     for ax, metric, title in zip(axes, metrics, titles):
         vals = [_float(r, metric) for r in ordered]
