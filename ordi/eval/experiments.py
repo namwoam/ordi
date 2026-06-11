@@ -46,7 +46,7 @@ from ordi.scheduler.ordi import (
     ORDIScheduler, ORDIConfig, SchedulerResult, TileAssignment,
 )
 from ordi.baselines.baselines import (
-    build_all_baselines, OnboardOnly, SECOLike, ServalLike,
+    build_all_baselines, ALL_BASELINES, OnboardOnly, SECOLike, ServalLike,
 )
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
@@ -288,7 +288,9 @@ def _run_parallel(shared: Tuple, job_args: List[Tuple],
         for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="job"):
             key, metrics = fut.result()
             results[key] = metrics
-    return results
+    # as_completed yields in finish order; reorder to submission order so CSV
+    # rows (and therefore plot bars) are stable across runs.
+    return {args[0]: results[args[0]] for args in job_args}
 
 
 def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
@@ -321,14 +323,19 @@ def _run_configs_parallel(config_args: List[Tuple],
         for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="config"):
             for key, metrics in fut.result():
                 results[key] = metrics
-    return results
+    # Reorder finish-order results to submission order for stable CSV rows.
+    return {key: results[key]
+            for (_bk, jobs, _seed) in config_args
+            for (key, _alg, _cls) in jobs}
 
 
-_CSV_FIELDS = [
-    "algorithm", "deadline_miss_ratio", "delivered_utility", "partial_coverage",
+_CSV_METRIC_KEYS = [
+    "deadline_miss_ratio", "delivered_utility", "partial_coverage",
     "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
     "energy_joules", "helper_utilization", "objective",
 ]
+_CSV_FIELDS = (["algorithm"] + _CSV_METRIC_KEYS
+               + [f"{k}_std" for k in _CSV_METRIC_KEYS])
 
 
 def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
@@ -351,7 +358,7 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
 
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
-def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -373,20 +380,30 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
     Deadline distribution: log-normal σ=0.6, per-type medians at scale 600 s
     (wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s) matching
     empirical EO SLA tiers (Lemaître et al. 2002; Globus et al. 2004).
+
+    Each seed rebuilds the full environment (orbital phasing, ground targets,
+    task arrivals, deadline draws); the CSV reports across-seed mean and std.
     """
-    print("E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, 25° GS elevation)")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(n_planes=6, sats_per_plane=4, seed=seed,
-                   arrival_rate=8.0, deadline_slack=600.0, deadline_lognorm_sigma=0.6,
-                   min_elevation_deg=25.0)
-    baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+    print(f"E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, "
+          f"25° GS elevation, {n_seeds} seeds)")
+    build_kwargs = dict(n_planes=6, sats_per_plane=4,
+                        arrival_rate=8.0, deadline_slack=600.0,
+                        deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
+    alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
 
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = [("ORDI", "ORDI", ORDIScheduler, cfg, None, seed)]
-    for name, baseline in baselines.items():
-        job_args.append((name, name, baseline.__class__, cfg, None, seed))
+    config_args = []
+    for s in range(n_seeds):
+        jobs = [(f"{alg}#s{s}", alg, cls) for alg, cls in alg_classes]
+        config_args.append((build_kwargs, jobs, seed + s))
 
-    results = _run_parallel(shared, job_args, desc="E1 algorithms")
+    raw = _run_configs_parallel(config_args, desc="E1 seeds")
+
+    # Collapse per-seed records so _save_csv reports mean ± std per algorithm.
+    results: Dict[str, List[EpochMetrics]] = {}
+    for alg, _cls in alg_classes:
+        results[alg] = [m for s in range(n_seeds)
+                        for m in raw[f"{alg}#s{s}"]]
+
     _save_csv("E1_core", results)
     return results
 

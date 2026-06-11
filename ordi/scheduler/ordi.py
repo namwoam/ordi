@@ -267,37 +267,51 @@ class ORDIScheduler(EpochRoutingCacheMixin):
         assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
 
         # ── backup replica ────────────────────────────────────────────────────
+        # Fault-domain-aware placement: a backup whose helper shares the
+        # primary's orbital plane gives no protection against plane outages
+        # (the dominant correlated-failure mode, cf. E7), so prefer a helper
+        # in a different plane and fall back to a same-plane backup only when
+        # no cross-plane candidate yields positive marginal gain.
         if tile.n_replicas_max >= 2:
-            for _, backup in scored[1:]:
-                # Must use a different aggregator than primary
-                if backup.aggregator == primary.aggregator:
-                    continue
-                if backup.helper == primary.helper:
-                    continue
+            primary_plane = _orbital_plane(primary.helper)
+            chosen = False
+            for cross_plane_pass in (True, False):
+                if chosen:
+                    break
+                for _, backup in scored[1:]:
+                    # Must use a different aggregator and helper than primary
+                    if backup.aggregator == primary.aggregator:
+                        continue
+                    if backup.helper == primary.helper:
+                        continue
+                    cross_plane = _orbital_plane(backup.helper) != primary_plane
+                    if cross_plane != cross_plane_pass:
+                        continue
 
-                h_state = self.states[backup.helper]
-                energy_budget = (h_state.B_i - h_state.params.battery_min_j
-                                 - energy_used.get(backup.helper, 0.0))
-                if energy_budget < (backup.e_compute + backup.e_rx + backup.e_tx):
-                    continue
+                    h_state = self.states[backup.helper]
+                    energy_budget = (h_state.B_i - h_state.params.battery_min_j
+                                     - energy_used.get(backup.helper, 0.0))
+                    if energy_budget < (backup.e_compute + backup.e_rx + backup.e_tx):
+                        continue
 
-                # Check marginal gain: reliability improvement vs. replica penalty
-                new_z = self.reliability.tile_delivery_prob(
-                    replica_probs + [backup.p_success], source_pi
-                )
-                delta_z = new_z - assignment.z_kv
-                delta_utility = tile.utility * delta_z * math.exp(-cfg.alpha * backup.latency)
-                delta_energy = cfg.lambda_E * (backup.e_compute + backup.e_rx + backup.e_tx)
-                delta_rep = cfg.lambda_R  # one extra replica
+                    # Check marginal gain: reliability improvement vs. replica penalty
+                    new_z = self.reliability.tile_delivery_prob(
+                        replica_probs + [backup.p_success], source_pi
+                    )
+                    delta_z = new_z - assignment.z_kv
+                    delta_utility = tile.utility * delta_z * math.exp(-cfg.alpha * backup.latency)
+                    delta_energy = cfg.lambda_E * (backup.e_compute + backup.e_rx + backup.e_tx)
+                    delta_rep = cfg.lambda_R  # one extra replica
 
-                if delta_utility - delta_energy - delta_rep > 0:
-                    assignment.replicas.append(backup)
-                    assignment.backup_aggregator = backup.aggregator
-                    replica_probs.append(backup.p_success)
-                    assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
-                    assignment.L_hat = min(assignment.L_hat, backup.latency)
-                    _charge_resources(backup, energy_used, link_used, task.source_sat)
-                    break  # one backup is sufficient per proposal
+                    if delta_utility - delta_energy - delta_rep > 0:
+                        assignment.replicas.append(backup)
+                        assignment.backup_aggregator = backup.aggregator
+                        replica_probs.append(backup.p_success)
+                        assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
+                        assignment.L_hat = min(assignment.L_hat, backup.latency)
+                        _charge_resources(backup, energy_used, link_used, task.source_sat)
+                        chosen = True
+                        break  # one backup is sufficient per proposal
 
         return assignment
 
@@ -324,6 +338,16 @@ class ORDIScheduler(EpochRoutingCacheMixin):
         affected = [task for task in pending_tasks if task.task_id in affected_task_ids]
 
         return self.schedule_epoch(epoch, t_sim_start, affected)
+
+
+def _orbital_plane(sat_id: str) -> str:
+    """Fault domain of a satellite: its orbital plane.
+
+    Walker satellites are named SAT_<plane>_<slot>; anything else (e.g. real
+    TLE names) falls back to the full id, i.e. its own fault domain.
+    """
+    parts = sat_id.split("_")
+    return parts[1] if len(parts) == 3 and parts[0] == "SAT" else sat_id
 
 
 def _charge_resources(

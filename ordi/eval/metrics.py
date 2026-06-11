@@ -115,7 +115,11 @@ def compute_metrics(
 
 
 def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
-    """Aggregate per-epoch metrics into a single summary dict."""
+    """Aggregate per-run metrics into mean plus sample std (<key>_std).
+
+    With one lifetime record per simulation run, the std columns are the
+    across-run (seed) dispersion; 0.0 when only a single run is supplied.
+    """
     if not epoch_metrics:
         return {}
     n = len(epoch_metrics)
@@ -124,4 +128,11 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
         "energy_joules", "helper_utilization", "objective",
     ]
-    return {k: sum(getattr(m, k) for m in epoch_metrics) / n for k in keys}
+    out: Dict[str, float] = {}
+    for k in keys:
+        vals = [getattr(m, k) for m in epoch_metrics]
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        out[k] = mean
+        out[f"{k}_std"] = math.sqrt(var)
+    return out
