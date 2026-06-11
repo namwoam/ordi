@@ -47,6 +47,7 @@ from ordi.scheduler.ordi import (
 )
 from ordi.baselines.baselines import (
     build_all_baselines, ALL_BASELINES, OnboardOnly, SECOLike, ServalLike,
+    FullReplication, RandomReplication,
 )
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
@@ -249,13 +250,14 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         for f in faults:
             injector.schedule(f)
 
-    if sched_name == "ORDI":
-        sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
+    is_ordi = isinstance(scheduler_class, type) and issubclass(scheduler_class, ORDIScheduler)
+    if is_ordi:
+        sched = scheduler_class(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
     else:
         sched = scheduler_class(graphs, local_states, gs_names, local_rel, cfg)
 
     def schedule_fn(ep, td):
-        if sched_name == "ORDI":
+        if is_ordi:
             return sched.schedule_epoch(ep, T_SIM_START, td)
         return sched.schedule(ep, T_SIM_START, td)
 
@@ -293,17 +295,61 @@ def _run_parallel(shared: Tuple, job_args: List[Tuple],
     return {args[0]: results[args[0]] for args in job_args}
 
 
+def _resolve_fault_specs(fault_specs, sat_ids, tasks) -> List[FaultEvent]:
+    """Translate declarative fault specs into FaultEvents post-build.
+
+    Spec forms (build-dependent targets cannot be resolved by the caller):
+      ("random_schedule", fault_rate, rng_seed)
+          → random_fault_schedule over the built constellation
+      (fault_type, start, duration, targets[, params]) with targets one of:
+          "hot_sources"   → the half of satellites sourcing the most tasks
+                            (ISL faults get the corresponding link strings)
+          (int, ...)      → orbital-plane numbers → that plane's satellites
+          [str, ...]      → used verbatim
+    """
+    faults: List[FaultEvent] = []
+    hot: Optional[List[str]] = None
+    for spec in fault_specs:
+        if spec[0] == "random_schedule":
+            _tag, rate, rng_seed = spec
+            faults.extend(random_fault_schedule(sat_ids, N_EPOCHS,
+                                                fault_rate=rate, seed=rng_seed))
+            continue
+        ft, start, dur, targets = spec[:4]
+        params = spec[4] if len(spec) > 4 else {}
+        if targets == "hot_sources":
+            if hot is None:
+                src_counts = Counter(t.source_sat for t in tasks)
+                k = max(1, len(src_counts) // 2)
+                hot = [s for s, _ in src_counts.most_common(k)]
+            targets = ([f"{a}:{b}" for a in hot for b in sat_ids if a != b]
+                       if ft == "isl_disruption" else hot)
+        elif targets and all(isinstance(t, int) for t in targets):
+            targets = [sid for sid in sat_ids
+                       if any(sid.startswith(f"SAT_{p:02d}_") for p in targets)]
+        faults.append(FaultEvent(ft, start, dur, targets, params))
+    return faults
+
+
 def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
-    """Worker for sweeps that rebuild the sim per configuration (E4/E5):
+    """Worker for sweeps that rebuild the sim per configuration (E1-E5, E7):
     build the environment in-process, then run that config's algorithms
     sequentially via _parallel_run_algorithm (sharing through _WORKER_SHARED).
-    Keeping build + jobs in one worker avoids shipping the big sim objects."""
+    Keeping build + jobs in one worker avoids shipping the big sim objects.
+
+    jobs: (key, alg_name, scheduler_class[, fault_specs]); see
+    _resolve_fault_specs for the spec forms."""
     build_kwargs, jobs, seed = args
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(seed=seed, **build_kwargs)
     _init_worker_shared((tasks, graphs, states, reliability, sat_ids, gs_names))
-    return [_parallel_run_algorithm((key, alg_name, cls, cfg, None, seed))
-            for (key, alg_name, cls) in jobs]
+    out = []
+    for job in jobs:
+        key, alg_name, cls, fault_specs = job if len(job) == 4 else (*job, None)
+        faults = (None if fault_specs is None
+                  else _resolve_fault_specs(fault_specs, sat_ids, tasks))
+        out.append(_parallel_run_algorithm((key, alg_name, cls, cfg, faults, seed)))
+    return out
 
 
 def _run_configs_parallel(config_args: List[Tuple],
@@ -324,9 +370,9 @@ def _run_configs_parallel(config_args: List[Tuple],
             for key, metrics in fut.result():
                 results[key] = metrics
     # Reorder finish-order results to submission order for stable CSV rows.
-    return {key: results[key]
+    return {job[0]: results[job[0]]
             for (_bk, jobs, _seed) in config_args
-            for (key, _alg, _cls) in jobs}
+            for job in jobs}
 
 
 _CSV_METRIC_KEYS = [
@@ -410,80 +456,79 @@ def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
 
 # ── E2: Fault type profile (each of 7 fault types, ORDI only) ────────────────
 
-def run_E2(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E2: Fault type profile (ORDI)")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = _build_sim(seed=seed)
+def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    print(f"E2: Fault type profile (ORDI, {n_seeds} seeds)")
 
     # Every scenario hits the SAME satellites for the SAME duration, so the
     # differences across bars reflect each fault type's intrinsic severity, not
     # its scale.  Targets are the satellites that actually carry the most tasks
-    # (FOV sources); hitting idle satellites would be invisible.  Sustained 40
-    # epochs so ORDI's re-planning cannot fully absorb the loss.
-    src_counts = Counter(t.source_sat for t in tasks)
-    K = max(1, len(src_counts) // 2)
-    aff = [s for s, _ in src_counts.most_common(K)]
+    # (FOV sources, resolved post-build by _resolve_fault_specs); hitting idle
+    # satellites would be invisible.  Sustained 40 epochs so ORDI's re-planning
+    # cannot fully absorb the loss.  Repeated across environment seeds.
     S, D = 10, 40
-    isl_links = [f"{a}:{b}" for a in aff for b in sat_ids if a != b]
-
     fault_scenarios = {
         "no_fault": [],
-        "isl_disruption": [FaultEvent("isl_disruption", S, D, isl_links)],
-        "plane_outage":   [FaultEvent("plane_outage", S, D, aff)],
-        "helper_failure": [FaultEvent("helper_failure", S, D, aff)],
-        "straggler":      [FaultEvent("straggler", S, D, aff, {"factor": 0.1})],
-        "ground_miss":    [FaultEvent("ground_contact_miss", S, D, aff)],
-        "battery":        [FaultEvent("battery_shortage", S, D, aff)],
-        "thermal":        [FaultEvent("thermal_throttle", S, D, aff)],
+        "isl_disruption": [("isl_disruption", S, D, "hot_sources")],
+        "plane_outage":   [("plane_outage", S, D, "hot_sources")],
+        "helper_failure": [("helper_failure", S, D, "hot_sources")],
+        "straggler":      [("straggler", S, D, "hot_sources", {"factor": 0.1})],
+        "ground_miss":    [("ground_contact_miss", S, D, "hot_sources")],
+        "battery":        [("battery_shortage", S, D, "hot_sources")],
+        "thermal":        [("thermal_throttle", S, D, "hot_sources")],
     }
 
-    # result_key = scenario name; sched_name = "ORDI" for all
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = [
-        (scenario_name, "ORDI", ORDIScheduler, cfg, faults, seed)
-        for scenario_name, faults in fault_scenarios.items()
-    ]
+    config_args = []
+    for s in range(n_seeds):
+        jobs = [(f"{name}#s{s}", "ORDI", ORDIScheduler, specs)
+                for name, specs in fault_scenarios.items()]
+        config_args.append(({}, jobs, seed + s))
 
-    results = _run_parallel(shared, job_args, desc="E2 scenarios")
+    raw = _run_configs_parallel(config_args, desc="E2 seeds")
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    for name in fault_scenarios:
+        results[name] = [m for s in range(n_seeds) for m in raw[f"{name}#s{s}"]]
+
     _save_csv("E2_fault_types", results)
     return results
 
 
 # ── E3: Fault intensity sweep (ORDI vs B5 vs B6) ─────────────────────────────
 
-def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E3: Fault intensity sweep")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = _build_sim(seed=seed)
-    baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
-
+def run_E3(seed=0, n_seeds=24) -> Dict[str, List[EpochMetrics]]:
+    """
+    Fault intensity sweep averaging over BOTH randomness sources: each seed
+    rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
+    random fault schedule, so the curves carry across-world error bars rather
+    than fault-draw jitter on one fixed world.
+    """
+    print(f"E3: Fault intensity sweep ({n_seeds} seeds)")
     fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
-    alg_names = ["ORDI", "B5_seco_like", "B6_full_replication"]
+    alg_classes = [("ORDI", ORDIScheduler),
+                   ("B5_seco_like", SECOLike),
+                   ("B6_full_replication", FullReplication)]
 
-    # Average over multiple fault seeds per rate: a single random schedule makes
-    # the miss curve jagged (one unlucky draw hitting a hot source spikes it).
-    # Averaging N draws recovers the underlying monotone degradation trend.
-    N_SEEDS = 8
+    config_args = []
+    for s in range(n_seeds):
+        jobs = []
+        for rate in fault_rates:
+            specs = [("random_schedule", rate, seed + s)]
+            for alg_name, cls in alg_classes:
+                jobs.append((f"{alg_name}@fault={rate:.2f}#s{s}",
+                             alg_name, cls, specs))
+        config_args.append(({}, jobs, seed + s))
 
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = []
-    for rate in fault_rates:
-        for s in range(N_SEEDS):
-            faults = random_fault_schedule(sat_ids, N_EPOCHS, fault_rate=rate, seed=seed + s)
-            for alg_name in alg_names:
-                key = f"{alg_name}@fault={rate:.2f}#s{s}"
-                cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-                job_args.append((key, alg_name, cls, cfg, faults, seed + s))
-
-    raw = _run_parallel(shared, job_args, desc="E3 rate×alg×seed")
+    raw = _run_configs_parallel(config_args, desc="E3 seeds")
 
     # Collapse the per-seed lifetime records into one list per (rate, alg) so
-    # _save_csv's aggregate_metrics averages them.
+    # _save_csv's aggregate_metrics reports across-seed mean ± std.
     results: Dict[str, List[EpochMetrics]] = {}
     for rate in fault_rates:
-        for alg_name in alg_names:
-            metrics: List[EpochMetrics] = []
-            for s in range(N_SEEDS):
-                metrics += raw[f"{alg_name}@fault={rate:.2f}#s{s}"]
-            results[f"{alg_name}@fault={rate:.2f}"] = metrics
+        for alg_name, _cls in alg_classes:
+            results[f"{alg_name}@fault={rate:.2f}"] = [
+                m for s in range(n_seeds)
+                for m in raw[f"{alg_name}@fault={rate:.2f}#s{s}"]
+            ]
 
     _save_csv("E3_fault_intensity", results)
     return results
@@ -499,47 +544,74 @@ _E4_CONFIGS = {
 }
 
 
-def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E4: Scalability sweep")
+def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    print(f"E4: Scalability sweep ({n_seeds} seeds)")
 
-    # Sim is rebuilt per constellation size. One config worker per (size,
-    # algorithm) — the duplicate build per algorithm is cheaper than chaining
-    # the two algorithms behind one build (n=60 ORDI is the long pole).
+    # Sim is rebuilt per (constellation size, seed); each config worker chains
+    # the 2 algorithms behind one build. With 32 configs the cores stay
+    # saturated, so chaining (which halves the builds) beats per-alg splitting.
+    alg_classes = [("ORDI", ORDIScheduler), ("B5_seco_like", SECOLike)]
+    sizes = [12, 24, 36, 60]
     config_args = []
-    for n_sats in [12, 24, 36, 60]:
+    for n_sats in sizes:
         planes, per_plane = _E4_CONFIGS[n_sats]
-        for alg_name, cls in [("ORDI", ORDIScheduler),
-                              ("B5_seco_like", SECOLike)]:
-            jobs = [(f"{alg_name}@n={n_sats}", alg_name, cls)]
+        for s in range(n_seeds):
+            jobs = [(f"{alg_name}@n={n_sats}#s{s}", alg_name, cls)
+                    for alg_name, cls in alg_classes]
             config_args.append(
-                ({"n_planes": planes, "sats_per_plane": per_plane}, jobs, seed))
+                ({"n_planes": planes, "sats_per_plane": per_plane}, jobs, seed + s))
 
-    results = _run_configs_parallel(config_args, desc="E4 constellation sizes")
+    raw = _run_configs_parallel(config_args, desc="E4 size×seed")
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    for n_sats in sizes:
+        for alg_name, _cls in alg_classes:
+            results[f"{alg_name}@n={n_sats}"] = [
+                m for s in range(n_seeds)
+                for m in raw[f"{alg_name}@n={n_sats}#s{s}"]
+            ]
+
     _save_csv("E4_scalability", results)
     return results
 
 
 # ── E5: Deadline tightness sweep ──────────────────────────────────────────────
 
-def run_E5(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E5: Deadline tightness sweep (log-normal deadline distribution, σ=0.6)")
+def run_E5(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    print(f"E5: Deadline tightness sweep (log-normal σ=0.6, {n_seeds} seeds)")
 
     # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
     # are wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s.
     # Smaller scales compress all medians proportionally, increasing miss rate.
-    # Sim is rebuilt per scale → one config worker per scale, all concurrent.
+    # Uses the E1 stressed setup (6×4 Walker, 25° GS elevation) — under the
+    # default 5° regime downlink windows are so plentiful that deadline
+    # tightness never bites and the sweep is flat.
+    # Sim is rebuilt per (scale, seed) → one config worker each, all concurrent.
     alg_classes = [("ORDI", ORDIScheduler),
                    ("B2_onboard_only", OnboardOnly),
                    ("B4_serval_like", ServalLike)]
+    slacks = [150, 300, 450, 600, 900]
     config_args = []
-    for slack in [150, 300, 450, 600, 900]:
-        jobs = [(f"{alg_name}@slack={slack}s", alg_name, cls)
-                for alg_name, cls in alg_classes]
-        config_args.append(
-            ({"deadline_slack": float(slack), "deadline_lognorm_sigma": 0.6},
-             jobs, seed))
+    for slack in slacks:
+        for s in range(n_seeds):
+            jobs = [(f"{alg_name}@slack={slack}s#s{s}", alg_name, cls)
+                    for alg_name, cls in alg_classes]
+            config_args.append(
+                ({"n_planes": 6, "sats_per_plane": 4, "arrival_rate": 8.0,
+                  "min_elevation_deg": 25.0,
+                  "deadline_slack": float(slack), "deadline_lognorm_sigma": 0.6},
+                 jobs, seed + s))
 
-    results = _run_configs_parallel(config_args, desc="E5 deadline scales")
+    raw = _run_configs_parallel(config_args, desc="E5 scale×seed")
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    for slack in slacks:
+        for alg_name, _cls in alg_classes:
+            results[f"{alg_name}@slack={slack}s"] = [
+                m for s in range(n_seeds)
+                for m in raw[f"{alg_name}@slack={slack}s#s{s}"]
+            ]
+
     _save_csv("E5_deadline", results)
     return results
 
@@ -567,25 +639,55 @@ def run_E6(seed=0) -> Dict[str, List[EpochMetrics]]:
 
 # ── E7: Correlated failures (orbital-plane outage) ────────────────────────────
 
-def run_E7(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E7: Correlated failures (plane outage) — ORDI vs B6")
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(seed=seed)
-    baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+def run_E7(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    """
+    Correlated orbital-plane outages probing replica-placement quality.
 
-    plane_sizes = [6, 12]  # 1 plane, 2 planes
-    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
-    job_args = []
-    for n_plane_sats in plane_sizes:
-        plane_sats = sat_ids[:n_plane_sats]
-        faults = [FaultEvent("plane_outage", 20, 10, plane_sats)]
-        label = f"plane_{n_plane_sats}_sats"
-        for alg_name in ["ORDI", "B6_full_replication"]:
-            key = f"{alg_name}@{label}"
-            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-            job_args.append((key, alg_name, cls, cfg, faults, seed))
+    Sustained outage (epochs 10-50, matching E2's severity) hits one plane or
+    two adjacent planes; the affected plane is swept over all positions so the
+    results cover planes that host many primaries and planes that host few,
+    and the whole sweep is repeated across environment seeds.
 
-    results = _run_parallel(shared, job_args, desc="E7 configs")
+    Algorithms: ORDI, B6 (full replication), B7 (random replication).
+    Differences isolate how much backup placement and count buy under
+    correlated failure.  (Measured property, stated rather than ablated:
+    ORDI's greedy scoring already places 100% of backups in a different
+    orbital plane than the primary in this constellation.)
+    """
+    N_PLANES = 6  # default _build_sim constellation is a 6-plane Walker
+    print(f"E7: Correlated plane outages (placement quality, {n_seeds} seeds)")
+    alg_classes = [("ORDI", ORDIScheduler),
+                   ("B6_full_replication", FullReplication),
+                   ("B7_random_replication", RandomReplication)]
+
+    # scale → list of affected-plane tuples covering all positions
+    scenarios = {
+        "1plane":  [(p,) for p in range(N_PLANES)],
+        "2planes": [(p, p + 1) for p in range(0, N_PLANES, 2)],
+    }
+
+    config_args = []
+    for s in range(n_seeds):
+        jobs = []
+        for label, plane_sets in scenarios.items():
+            for planes in plane_sets:
+                spec = [("plane_outage", 10, 40, planes)]
+                for alg_name, cls in alg_classes:
+                    key = f"{alg_name}@{label}#p{planes[0]}s{s}"
+                    jobs.append((key, alg_name, cls, spec))
+        config_args.append(({}, jobs, seed + s))
+
+    raw = _run_configs_parallel(config_args, desc="E7 seeds")
+
+    # Collapse over plane positions and seeds → mean ± std per (alg, scale).
+    results: Dict[str, List[EpochMetrics]] = {}
+    for alg_name, _cls in alg_classes:
+        for label, plane_sets in scenarios.items():
+            results[f"{alg_name}@{label}"] = [
+                m for s in range(n_seeds) for planes in plane_sets
+                for m in raw[f"{alg_name}@{label}#p{planes[0]}s{s}"]
+            ]
+
     _save_csv("E7_correlated", results)
     return results
 
