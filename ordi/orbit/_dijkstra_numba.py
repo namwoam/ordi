@@ -189,6 +189,17 @@ def _ea_all_kernel(src_idx, epoch, n_epochs_lim, data_bits,
     return arrival
 
 
+def warmup_jit() -> None:
+    """Compile the kernel on a trivial input so the on-disk numba cache is
+    populated before worker processes spawn (they then load it instead of
+    each paying the multi-second JIT compile)."""
+    _ea_all_kernel(0, 0, 1, 1.0,
+                   np.zeros((1, 2), dtype=np.int64),
+                   np.zeros(0, dtype=np.int64), np.zeros(0), np.zeros(0),
+                   np.zeros(1), np.ones(1),
+                   np.ones(1, dtype=np.bool_), 1)
+
+
 def earliest_arrival_all_numba(
     src: str,
     epoch: int,

@@ -45,7 +45,9 @@ from ordi.tasks.generator import generate_tasks
 from ordi.scheduler.ordi import (
     ORDIScheduler, ORDIConfig, SchedulerResult, TileAssignment,
 )
-from ordi.baselines.baselines import build_all_baselines
+from ordi.baselines.baselines import (
+    build_all_baselines, OnboardOnly, SECOLike, ServalLike,
+)
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
 
@@ -212,21 +214,31 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None):
 
 # ── parallel worker (module-level so multiprocessing can pickle it) ───────────
 
+# Simulation environment shared by all jobs of one _run_parallel call, shipped
+# once per worker via the pool initializer instead of pickled into every job.
+_WORKER_SHARED: Optional[Tuple] = None
+
+
+def _init_worker_shared(shared: Tuple) -> None:
+    global _WORKER_SHARED
+    _WORKER_SHARED = shared
+
+
 def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     """
     Worker for ProcessPoolExecutor.
-    args = (result_key, sched_name, scheduler_class,
-            tasks, graphs, states, reliability,
-            sat_ids, gs_names, cfg, faults, seed)
+    args = (result_key, sched_name, scheduler_class, cfg, faults, seed);
+    (tasks, graphs, states, reliability, sat_ids, gs_names) come from the
+    worker-global _WORKER_SHARED. Workers never mutate the shared objects:
+    states/reliability are deepcopied per job and tasks are shallow-copied.
 
     Stateful rolling-horizon: a committed tile stays in-flight and is not
     re-scheduled (nor re-charged) until a fault invalidates all its replicas.
     Metrics are aggregated once per tile lifetime, so ISL/energy count one
     transfer per tile instead of once per epoch it stayed pending.
     """
-    (result_key, sched_name, scheduler_class,
-     tasks, graphs, states, reliability,
-     sat_ids, gs_names, cfg, faults, seed) = args
+    (result_key, sched_name, scheduler_class, cfg, faults, seed) = args
+    (tasks, graphs, states, reliability, sat_ids, gs_names) = _WORKER_SHARED
 
     local_states = deepcopy(states)
     local_rel = deepcopy(reliability)
@@ -251,16 +263,64 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     return result_key, [m]
 
 
-def _run_parallel(job_args: List[Tuple], desc: str = "") -> Dict[str, List[EpochMetrics]]:
-    """Submit a list of _parallel_run_algorithm arg-tuples and collect results."""
+def _run_parallel(shared: Tuple, job_args: List[Tuple],
+                  desc: str = "") -> Dict[str, List[EpochMetrics]]:
+    """Submit a list of _parallel_run_algorithm arg-tuples and collect results.
+
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names) is shipped
+    once per worker via the pool initializer instead of pickled into every job.
+    """
+    # Populate the on-disk numba JIT cache before workers spawn so they load
+    # the compiled kernel instead of each paying the compile.
+    try:
+        from ordi.orbit._dijkstra_numba import warmup_jit
+        warmup_jit()
+    except ImportError:
+        pass
+
     n = len(job_args)
     results: Dict[str, List[EpochMetrics]] = {}
     n_workers = min(n, 16)
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+    with ProcessPoolExecutor(max_workers=n_workers,
+                             initializer=_init_worker_shared,
+                             initargs=(shared,)) as pool:
         futures = {pool.submit(_parallel_run_algorithm, args): args[0] for args in job_args}
         for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="job"):
             key, metrics = fut.result()
             results[key] = metrics
+    return results
+
+
+def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
+    """Worker for sweeps that rebuild the sim per configuration (E4/E5):
+    build the environment in-process, then run that config's algorithms
+    sequentially via _parallel_run_algorithm (sharing through _WORKER_SHARED).
+    Keeping build + jobs in one worker avoids shipping the big sim objects."""
+    build_kwargs, jobs, seed = args
+    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
+        _build_sim(seed=seed, **build_kwargs)
+    _init_worker_shared((tasks, graphs, states, reliability, sat_ids, gs_names))
+    return [_parallel_run_algorithm((key, alg_name, cls, cfg, None, seed))
+            for (key, alg_name, cls) in jobs]
+
+
+def _run_configs_parallel(config_args: List[Tuple],
+                          desc: str = "") -> Dict[str, List[EpochMetrics]]:
+    """Run _build_and_run_config over configurations concurrently.
+    config_args items: (build_kwargs, [(key, alg_name, scheduler_class)], seed)."""
+    try:
+        from ordi.orbit._dijkstra_numba import warmup_jit
+        warmup_jit()
+    except ImportError:
+        pass
+
+    results: Dict[str, List[EpochMetrics]] = {}
+    n = len(config_args)
+    with ProcessPoolExecutor(max_workers=min(n, 16)) as pool:
+        futures = [pool.submit(_build_and_run_config, args) for args in config_args]
+        for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="config"):
+            for key, metrics in fut.result():
+                results[key] = metrics
     return results
 
 
@@ -321,17 +381,12 @@ def run_E1(seed=0) -> Dict[str, List[EpochMetrics]]:
                    min_elevation_deg=25.0)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
-    job_args = [
-        ("ORDI", "ORDI", ORDIScheduler,
-         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
-    ]
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
+    job_args = [("ORDI", "ORDI", ORDIScheduler, cfg, None, seed)]
     for name, baseline in baselines.items():
-        job_args.append((
-            name, name, baseline.__class__,
-            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
-        ))
+        job_args.append((name, name, baseline.__class__, cfg, None, seed))
 
-    results = _run_parallel(job_args, desc="E1 algorithms")
+    results = _run_parallel(shared, job_args, desc="E1 algorithms")
     _save_csv("E1_core", results)
     return results
 
@@ -365,13 +420,13 @@ def run_E2(seed=0) -> Dict[str, List[EpochMetrics]]:
     }
 
     # result_key = scenario name; sched_name = "ORDI" for all
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
     job_args = [
-        (scenario_name, "ORDI", ORDIScheduler,
-         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed)
+        (scenario_name, "ORDI", ORDIScheduler, cfg, faults, seed)
         for scenario_name, faults in fault_scenarios.items()
     ]
 
-    results = _run_parallel(job_args, desc="E2 scenarios")
+    results = _run_parallel(shared, job_args, desc="E2 scenarios")
     _save_csv("E2_fault_types", results)
     return results
 
@@ -391,6 +446,7 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
     # Averaging N draws recovers the underlying monotone degradation trend.
     N_SEEDS = 8
 
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
     job_args = []
     for rate in fault_rates:
         for s in range(N_SEEDS):
@@ -398,13 +454,9 @@ def run_E3(seed=0) -> Dict[str, List[EpochMetrics]]:
             for alg_name in alg_names:
                 key = f"{alg_name}@fault={rate:.2f}#s{s}"
                 cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-                job_args.append((
-                    key, alg_name, cls,
-                    tasks, graphs, states, reliability, sat_ids, gs_names, cfg,
-                    faults, seed + s,
-                ))
+                job_args.append((key, alg_name, cls, cfg, faults, seed + s))
 
-    raw = _run_parallel(job_args, desc="E3 rate×alg×seed")
+    raw = _run_parallel(shared, job_args, desc="E3 rate×alg×seed")
 
     # Collapse the per-seed lifetime records into one list per (rate, alg) so
     # _save_csv's aggregate_metrics averages them.
@@ -432,27 +484,20 @@ _E4_CONFIGS = {
 
 def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E4: Scalability sweep")
-    results = {}
 
-    # Sim is rebuilt per constellation size → keep outer loop sequential,
-    # parallelize the 2 algorithms per size.
-    for n_sats in tqdm([12, 24, 36, 60], desc="E4 constellation sizes", unit="size"):
+    # Sim is rebuilt per constellation size. One config worker per (size,
+    # algorithm) — the duplicate build per algorithm is cheaper than chaining
+    # the two algorithms behind one build (n=60 ORDI is the long pole).
+    config_args = []
+    for n_sats in [12, 24, 36, 60]:
         planes, per_plane = _E4_CONFIGS[n_sats]
-        sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-            _build_sim(n_planes=planes, sats_per_plane=per_plane, seed=seed)
-        baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+        for alg_name, cls in [("ORDI", ORDIScheduler),
+                              ("B5_seco_like", SECOLike)]:
+            jobs = [(f"{alg_name}@n={n_sats}", alg_name, cls)]
+            config_args.append(
+                ({"n_planes": planes, "sats_per_plane": per_plane}, jobs, seed))
 
-        job_args = []
-        for alg_name in ["ORDI", "B5_seco_like"]:
-            key = f"{alg_name}@n={n_sats}"
-            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-            job_args.append((
-                key, alg_name, cls,
-                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
-            ))
-
-        results.update(_run_parallel(job_args, desc=f"E4 n={n_sats}"))
-
+    results = _run_configs_parallel(config_args, desc="E4 constellation sizes")
     _save_csv("E4_scalability", results)
     return results
 
@@ -461,27 +506,23 @@ def run_E4(seed=0) -> Dict[str, List[EpochMetrics]]:
 
 def run_E5(seed=0) -> Dict[str, List[EpochMetrics]]:
     print("E5: Deadline tightness sweep (log-normal deadline distribution, σ=0.6)")
-    results = {}
 
     # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
     # are wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s.
     # Smaller scales compress all medians proportionally, increasing miss rate.
-    for slack in tqdm([150, 300, 450, 600, 900], desc="E5 deadline scales", unit="scale"):
-        sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-            _build_sim(seed=seed, deadline_slack=float(slack), deadline_lognorm_sigma=0.6)
-        baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
+    # Sim is rebuilt per scale → one config worker per scale, all concurrent.
+    alg_classes = [("ORDI", ORDIScheduler),
+                   ("B2_onboard_only", OnboardOnly),
+                   ("B4_serval_like", ServalLike)]
+    config_args = []
+    for slack in [150, 300, 450, 600, 900]:
+        jobs = [(f"{alg_name}@slack={slack}s", alg_name, cls)
+                for alg_name, cls in alg_classes]
+        config_args.append(
+            ({"deadline_slack": float(slack), "deadline_lognorm_sigma": 0.6},
+             jobs, seed))
 
-        job_args = []
-        for alg_name in ["ORDI", "B2_onboard_only", "B4_serval_like"]:
-            key = f"{alg_name}@slack={slack}s"
-            cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-            job_args.append((
-                key, alg_name, cls,
-                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
-            ))
-
-        results.update(_run_parallel(job_args, desc=f"E5 slack={slack}s"))
-
+    results = _run_configs_parallel(config_args, desc="E5 deadline scales")
     _save_csv("E5_deadline", results)
     return results
 
@@ -494,17 +535,15 @@ def run_E6(seed=0) -> Dict[str, List[EpochMetrics]]:
         _build_sim(seed=seed)
 
     lambda_Rs = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
     job_args = []
     for lambda_R in lambda_Rs:
         cfg = deepcopy(base_cfg)
         cfg.lambda_R = lambda_R
         key = f"ORDI@lambda_R={lambda_R}"
-        job_args.append((
-            key, "ORDI", ORDIScheduler,
-            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
-        ))
+        job_args.append((key, "ORDI", ORDIScheduler, cfg, None, seed))
 
-    results = _run_parallel(job_args, desc="E6 lambda_R")
+    results = _run_parallel(shared, job_args, desc="E6 lambda_R")
     _save_csv("E6_lambda_R", results)
     return results
 
@@ -518,6 +557,7 @@ def run_E7(seed=0) -> Dict[str, List[EpochMetrics]]:
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
     plane_sizes = [6, 12]  # 1 plane, 2 planes
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
     job_args = []
     for n_plane_sats in plane_sizes:
         plane_sats = sat_ids[:n_plane_sats]
@@ -526,12 +566,9 @@ def run_E7(seed=0) -> Dict[str, List[EpochMetrics]]:
         for alg_name in ["ORDI", "B6_full_replication"]:
             key = f"{alg_name}@{label}"
             cls = ORDIScheduler if alg_name == "ORDI" else baselines[alg_name].__class__
-            job_args.append((
-                key, alg_name, cls,
-                tasks, graphs, states, reliability, sat_ids, gs_names, cfg, faults, seed,
-            ))
+            job_args.append((key, alg_name, cls, cfg, faults, seed))
 
-    results = _run_parallel(job_args, desc="E7 configs")
+    results = _run_parallel(shared, job_args, desc="E7 configs")
     _save_csv("E7_correlated", results)
     return results
 
@@ -593,17 +630,12 @@ def run_COTS(seed=0) -> Dict[str, List[EpochMetrics]]:
                    satellite_params_factory=atlas_200dk_bupt1_params)
     baselines = build_all_baselines(graphs, states, gs_names, reliability, cfg)
 
-    job_args = [
-        ("ORDI", "ORDI", ORDIScheduler,
-         tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed)
-    ]
+    shared = (tasks, graphs, states, reliability, sat_ids, gs_names)
+    job_args = [("ORDI", "ORDI", ORDIScheduler, cfg, None, seed)]
     for name, baseline in baselines.items():
-        job_args.append((
-            name, name, baseline.__class__,
-            tasks, graphs, states, reliability, sat_ids, gs_names, cfg, None, seed,
-        ))
+        job_args.append((name, name, baseline.__class__, cfg, None, seed))
 
-    results = _run_parallel(job_args, desc="COTS algorithms")
+    results = _run_parallel(shared, job_args, desc="COTS algorithms")
     _save_csv("COTS_mobicom24", results)
     return results
 

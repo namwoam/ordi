@@ -4,8 +4,12 @@ Measurement-backed COTS payload profiles loaded from SatelliteCOTS logs.
 The parser reads the public MobiCom '24 SatelliteCOTS artifact at runtime:
 https://github.com/TiansuanConstellation/MobiCom24-SatelliteCOTS
 
-Set MOBICOM24_COTS_ROOT to the cloned artifact root.  If unset, the local
-/tmp/MobiCom24-SatelliteCOTS clone is used.
+Set MOBICOM24_COTS_ROOT to the cloned artifact root.  If unset, the repo-local
+clone at data/MobiCom24-SatelliteCOTS is used (gitignored; clone it with
+  git clone --depth 1 \
+    https://github.com/TiansuanConstellation/MobiCom24-SatelliteCOTS \
+    data/MobiCom24-SatelliteCOTS
+).
 """
 
 from __future__ import annotations
@@ -20,7 +24,9 @@ from statistics import mean
 
 from ordi.sim.satellite import SatelliteParams
 
-DEFAULT_COTS_ROOT = Path("/tmp/MobiCom24-SatelliteCOTS")
+DEFAULT_COTS_ROOT = (
+    Path(__file__).resolve().parents[2] / "data" / "MobiCom24-SatelliteCOTS"
+)
 ATLAS_FULL_4T_LOG = Path("Energy-Efficiency/Data/sat_atlas_infer/200B_Sun_FULL_4T_180.csv")
 AVAILABLE_ENERGY_LOG = Path("Energy-Available/Data/longest_rounds_energy_df.csv")
 BATTERY_CURVE_DIR = Path("Energy-Available/battery_curve")

@@ -160,7 +160,12 @@ def compute_candidates(
                 continue
 
             L_kvia = ell_ski + t_compute + ell_ia + ell_down
-            feasible = (L_kvia <= tau_k) and bool(h_state.A_i) and bool(a_state.A_i)
+            # h_state.A_i and a_state.A_i already hold here (checked above), so
+            # the deadline is the only feasibility condition left. Skip before
+            # computing probabilities/energies: infeasible candidates were only
+            # ever built to be dropped by the final filter.
+            if L_kvia > tau_k:
+                continue
 
             p = reliability.replica_success_prob(
                 helper_id=helper,
@@ -184,9 +189,9 @@ def compute_candidates(
                 e_compute=e_comp,
                 e_rx=e_rx,
                 e_tx=e_tx,
-                feasible=feasible,
+                feasible=True,
                 d_in_bits=tile.d_in_bits,
                 d_out_bits=tile.d_out_bits,
             ))
 
-    return [c for c in candidates if c.feasible]
+    return candidates
