@@ -25,6 +25,7 @@ from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask, Tile
 from ordi.scheduler.feasibility import compute_candidates, ReplicaCandidate
 from ordi.scheduler.ordi import ORDIConfig, TileAssignment, SchedulerResult
+from ordi.scheduler.routing_cache import EpochRoutingCacheMixin
 
 # Compression ratio for B3 (JPEG-style lossy compression on raw EO tiles)
 COMPRESSION_RATIO = 0.15   # compressed to 15% of original size
@@ -353,7 +354,7 @@ class ServalLike:
 
 # ── B5: SECO-like ─────────────────────────────────────────────────────────────
 
-class SECOLike:
+class SECOLike(EpochRoutingCacheMixin):
     """
     Multi-satellite placement without redundancy, greedy min-latency.
     Inspired by SECO (INFOCOM '24): assign each tile to the helper
@@ -374,6 +375,8 @@ class SECOLike:
         epoch_start = t_sim_start + epoch * cfg.epoch_length
         assignments = []
         total_utility = 0.0
+        sat_index, ell_down_c, ell_ia_c, ell_ski_c = \
+            self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
@@ -384,7 +387,10 @@ class SECOLike:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
-                    sat_index=self.sat_index, node_index=self.node_index,
+                    sat_index=sat_index, node_index=self.node_index,
+                    ell_down_cache=ell_down_c[tile.d_out_bits],
+                    ell_ia_cache=ell_ia_c[tile.d_out_bits],
+                    ell_ski_cache=ell_ski_c[tile.d_in_bits][task.source_sat],
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
@@ -405,7 +411,7 @@ class SECOLike:
 
 # ── B6: Full replication ──────────────────────────────────────────────────────
 
-class FullReplication:
+class FullReplication(EpochRoutingCacheMixin):
     """Replicate every tile to all r_max feasible helpers."""
     name = "B6_full_replication"
 
@@ -422,6 +428,8 @@ class FullReplication:
         epoch_start = t_sim_start + epoch * cfg.epoch_length
         assignments = []
         total_utility = 0.0
+        sat_index, ell_down_c, ell_ia_c, ell_ski_c = \
+            self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
@@ -432,7 +440,10 @@ class FullReplication:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
-                    sat_index=self.sat_index, node_index=self.node_index,
+                    sat_index=sat_index, node_index=self.node_index,
+                    ell_down_cache=ell_down_c[tile.d_out_bits],
+                    ell_ia_cache=ell_ia_c[tile.d_out_bits],
+                    ell_ski_cache=ell_ski_c[tile.d_in_bits][task.source_sat],
                 )
                 # Use up to r_max replicas with distinct aggregators
                 selected = []
@@ -465,7 +476,7 @@ class FullReplication:
 
 # ── B7: Random replication ────────────────────────────────────────────────────
 
-class RandomReplication:
+class RandomReplication(EpochRoutingCacheMixin):
     """Replicate to random feasible helpers (up to r_max)."""
     name = "B7_random_replication"
 
@@ -483,6 +494,8 @@ class RandomReplication:
         epoch_start = t_sim_start + epoch * cfg.epoch_length
         assignments = []
         total_utility = 0.0
+        sat_index, ell_down_c, ell_ia_c, ell_ski_c = \
+            self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
@@ -493,7 +506,10 @@ class RandomReplication:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
-                    sat_index=self.sat_index, node_index=self.node_index,
+                    sat_index=sat_index, node_index=self.node_index,
+                    ell_down_cache=ell_down_c[tile.d_out_bits],
+                    ell_ia_cache=ell_ia_c[tile.d_out_bits],
+                    ell_ski_cache=ell_ski_c[tile.d_in_bits][task.source_sat],
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
@@ -523,7 +539,7 @@ class RandomReplication:
 
 # ── B8: CoCoI-like ────────────────────────────────────────────────────────────
 
-class CoCoILike:
+class CoCoILike(EpochRoutingCacheMixin):
     """
     MDS coded redundancy adapted to contact-window setting.
     Inspired by CoCoI (arXiv 2025): k-of-n MDS coding where any k
@@ -568,6 +584,8 @@ class CoCoILike:
         epoch_start = t_sim_start + epoch * cfg.epoch_length
         assignments = []
         total_utility = 0.0
+        sat_index, ell_down_c, ell_ia_c, ell_ski_c = \
+            self._build_epoch_caches(epoch, epoch_start, pending_tasks)
 
         for task in pending_tasks:
             tau_k = task.deadline - epoch_start
@@ -578,7 +596,10 @@ class CoCoILike:
                     task, tile, epoch, epoch_start,
                     self.graphs, self.states, self.reliability,
                     self.ground_stations, tau_k,
-                    sat_index=self.sat_index, node_index=self.node_index,
+                    sat_index=sat_index, node_index=self.node_index,
+                    ell_down_cache=ell_down_c[tile.d_out_bits],
+                    ell_ia_cache=ell_ia_c[tile.d_out_bits],
+                    ell_ski_cache=ell_ski_c[tile.d_in_bits][task.source_sat],
                 )
                 if not candidates:
                     assignments.append(TileAssignment(task_id=task.task_id, tile_id=tile.tile_id))
