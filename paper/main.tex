@@ -36,6 +36,10 @@ Low-Earth-orbit (LEO) Earth observation (EO) constellations capture far more ima
 LEO constellations, satellite edge computing, distributed inference, fault tolerance, scheduling
 \end{IEEEkeywords}
 
+\noindent\fbox{\parbox{0.97\columnwidth}{\textbf{Project Category:}\quad
+$\blacksquare$~\textbf{A} (Self-chosen topic)\qquad
+$\square$~\textbf{B} (AI-agent code optimization)\\[2pt]}}
+
 \section{Introduction}
 \label{sec:intro}
 
@@ -101,6 +105,7 @@ subject to per-replica deadline feasibility $L_{kvia} \le \tau_k(t)$, helper ene
 \section{ORDI Design}
 \label{sec:design}
 
+Our code is available at https://github.com/namwoam/ordi.
 \subsection{Rolling-Horizon Scheduling}
 Each epoch, \ordi{} (i) advances satellite states, (ii) rebuilds the epoch contact graph, (iii) sorts pending tiles by urgency-weighted utility $u_{kv}/\tau_k$, so scarce routing resources go to high-value, tight-deadline tiles first, and (iv) assigns replicas greedily per tile.
 
@@ -223,7 +228,7 @@ Sweeping the global deadline scale from 150 to 900\,s (Fig.~\ref{fig:e5}), \ordi
 \label{fig:e5}
 \end{figure}
 
-\subsection{Pricing Redundancy with $\lambda_R$}
+\subsection{Pricing Redundancy with \texorpdfstring{$\lambda_R$}{lambda\_R}}
 Sweeping $\lambda_R$ from 0 to 2 (Fig.~\ref{fig:e6}) moves mean replicas from 1.50 to 0.76 while the miss ratio is flat, confirming that in this regime backups protect utility (delivered utility falls from 154.1 to 142.6 as backups vanish) rather than feasibility, and giving operators a single dial trading energy for delivery confidence. We use $\lambda_R{=}0.05$ throughout, the knee of the curve.
 
 \begin{figure}[t]
