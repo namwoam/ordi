@@ -717,7 +717,11 @@ def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
                 spec = [("plane_outage", 10, 40, planes)]
                 for alg_name, cls in alg_classes:
                     key = f"{alg_name}@{label}#p{planes[0]}s{s}"
-                    jobs.append((key, alg_name, cls, spec))
+                    # ORDI enforces plane-disjoint backups under this
+                    # correlated-failure threat model (matches the abstract).
+                    overrides = ({"plane_disjoint_backup": True}
+                                 if alg_name == "ORDI" else None)
+                    jobs.append((key, alg_name, cls, spec, overrides))
         config_args.append(({}, jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E7 seeds")

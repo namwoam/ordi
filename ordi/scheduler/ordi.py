@@ -36,6 +36,10 @@ class ORDIConfig:
     alpha: float = 0.002      # freshness decay rate (1/s)
     epoch_length: float = 60.0  # seconds
     isl_rate_bps: float = 200e6
+    # Under a correlated-failure threat model (E7), require the backup's helper
+    # to occupy a different orbital plane than the primary's helper. Off by
+    # default so nominal experiments keep the emergent-placement framing.
+    plane_disjoint_backup: bool = False
 
 
 # ── assignment record ─────────────────────────────────────────────────────────
@@ -274,6 +278,12 @@ class ORDIScheduler(EpochRoutingCacheMixin):
                     continue
                 if backup.helper == primary.helper:
                     continue
+                # Under a correlated-failure threat model, reject backups whose
+                # helper shares an orbital plane with the primary's helper.
+                if cfg.plane_disjoint_backup:
+                    bp, pp = _plane_of(backup.helper), _plane_of(primary.helper)
+                    if bp is not None and bp == pp:
+                        continue
 
                 h_state = self.states[backup.helper]
                 energy_budget = (h_state.B_i - h_state.params.battery_min_j
@@ -324,6 +334,14 @@ class ORDIScheduler(EpochRoutingCacheMixin):
         affected = [task for task in pending_tasks if task.task_id in affected_task_ids]
 
         return self.schedule_epoch(epoch, t_sim_start, affected)
+
+
+def _plane_of(sat_id: str) -> Optional[str]:
+    """Parse the orbital-plane id from a ``SAT_<plane>_<idx>`` name.
+    Returns None if the name doesn't match, so unknown helpers never compare
+    equal to each other (an unparseable pair is treated as plane-disjoint)."""
+    parts = sat_id.split("_")
+    return parts[1] if len(parts) >= 3 and parts[0] == "SAT" else None
 
 
 def _charge_resources(

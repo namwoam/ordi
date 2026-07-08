@@ -44,29 +44,27 @@ probability mass.
 
 ---
 
-## 3. E7 plane-disjoint backup constraint is asserted, not implemented
+## 3. E7 plane-disjoint backup constraint is asserted, not implemented — **FIXED**
 
-**Where:** `ordi/scheduler/ordi.py:270-300` (backup selection)
+**Where:** `ordi/scheduler/ordi.py` (backup selection)
 
 The abstract says "backups are constrained to fault-disjoint helpers and
-aggregators... a different orbital plane." The code only requires a different
-**helper** and **aggregator** (`ordi.py:273-276`); there is no plane check. The
-paper footnote (§E7) admits disjointness is an *emergent measured property*
-("greedy scoring already places 100% of backups in a different plane in this
-constellation").
+aggregators... a different orbital plane." The code only required a different
+**helper** and **aggregator**; there was no plane check. The paper footnote
+(§E7) admitted disjointness was an *emergent measured property* ("greedy scoring
+already places 100% of backups in a different plane in this constellation").
 
-**Consequence:** abstract and code disagree; the headline correlated-failure
-result rests on a property that happens to hold for the 6-plane Walker but isn't
-guaranteed.
+**Consequence:** abstract and code disagreed; the headline correlated-failure
+result rested on a property that happens to hold for the 6-plane Walker but
+isn't guaranteed.
 
-**Fix (choose one):**
-- Implement the constraint: under a correlated-failure threat model, reject a
-  backup candidate whose helper shares an orbital plane with the primary's
-  helper (plane id is parseable from `SAT_<plane>_<idx>` names). Add a config
-  flag so it's only active for E7-style scenarios.
-- Or soften the abstract to match the code and keep the emergent-property framing.
-
-Implementing it is the stronger paper.
+**Fix applied:** implemented the constraint (the stronger paper). `ORDIConfig`
+gains a `plane_disjoint_backup` flag (default `False`); when set, the backup
+loop rejects any candidate whose helper shares an orbital plane with the
+primary's helper. Plane id is parsed from `SAT_<plane>_<idx>` names via
+`_plane_of`; unparseable names are treated as disjoint (only both-known-and-equal
+is rejected). E7 enables the flag for ORDI only (via per-job `cfg_overrides`),
+so nominal experiments keep the emergent-placement framing.
 
 ---
 
