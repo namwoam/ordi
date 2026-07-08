@@ -77,7 +77,7 @@ def plot_E1():
     # coverage panels are deterministic.
     metrics = ["realized_miss_ratio", "realized_utility", "partial_coverage",
                "energy_joules", "isl_traffic_bits"]
-    titles  = ["Deadline Miss Ratio (realized, ↓)", "Delivered Utility (realized, ↑)",
+    titles  = ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)",
                "Partial Coverage (↑)", "Energy (J) (↓)", "ISL Traffic (bits) (↓)"]
 
     algs = [r["algorithm"] for r in rows]
@@ -173,11 +173,11 @@ def plot_E3():
         ax2.errorbar(fault_rates, util_vals, yerr=util_errs, label=label,
                      color=color, linewidth=lw, marker="o", capsize=3)
 
-    ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (realized, ↓)")
-    ax1.legend(fontsize=8); ax1.set_title("Deadline Miss Ratio (realized)")
+    ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (↓)")
+    ax1.legend(fontsize=8); ax1.set_title("Deadline Miss Ratio")
     ax1.set_ylim(bottom=0)
-    ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("Delivered Utility (realized, ↑)")
-    ax2.legend(fontsize=8); ax2.set_title("Delivered Utility (realized)")
+    ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("Delivered Utility (↑)")
+    ax2.legend(fontsize=8); ax2.set_title("Delivered Utility")
 
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E3_intensity.png")
@@ -317,8 +317,8 @@ def plot_E7():
 
     for ax, metric, title in zip(axes,
                                   ["realized_miss_ratio", "realized_utility"],
-                                  ["Deadline Miss Ratio (realized, ↓)",
-                                   "Delivered Utility (realized, ↑)"]):
+                                  ["Deadline Miss Ratio (↓)",
+                                   "Delivered Utility (↑)"]):
         vals = [_float(r, metric) for r in rows]
         errs = [_std(r, metric) for r in rows]
         ax.bar(x, vals, color=colors, yerr=errs, capsize=3)
@@ -347,7 +347,7 @@ def plot_E8():
         return
 
     metrics = ["realized_utility", "realized_miss_ratio"]
-    titles  = ["Delivered Utility (realized, ↑)", "Deadline Miss Ratio (realized, ↓)"]
+    titles  = ["Delivered Utility (↑)", "Deadline Miss Ratio (↓)"]
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4))
     for ax, metric, title in zip(axes, metrics, titles):

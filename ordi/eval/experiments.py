@@ -175,7 +175,7 @@ def _uncommitted_tasks(pending, committed):
 
 
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
-                       reliability=None, realized_trials=200, realized_seed=0):
+                       reliability=None, realized_trials=500, realized_seed=0):
     """Run one stateful rolling-horizon simulation and return a lifetime
     EpochMetrics.  schedule_fn(epoch, todo_tasks) -> SchedulerResult dispatches
     to ORDI / a baseline / the ILP.  A committed tile stays in-flight (not
@@ -436,7 +436,7 @@ _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         arrival_rate=8.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
 
-def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -486,7 +486,7 @@ def run_E1(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
 
 # ── E2: Fault type profile (each of 7 fault types, ORDI only) ────────────────
 
-def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E2(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     print(f"E2: Fault type profile (ORDI, {n_seeds} seeds)")
 
     # Every scenario hits the SAME satellites for the SAME duration, so the
@@ -525,7 +525,7 @@ def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
 # ── E3: Fault intensity sweep (ORDI vs B5 vs B6) ─────────────────────────────
 
-def run_E3(seed=0, n_seeds=24) -> Dict[str, List[EpochMetrics]]:
+def run_E3(seed=0, n_seeds=48) -> Dict[str, List[EpochMetrics]]:
     """
     Fault intensity sweep averaging over BOTH randomness sources: each seed
     rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
@@ -574,7 +574,7 @@ _E4_CONFIGS = {
 }
 
 
-def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E4(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     print(f"E4: Scalability sweep ({n_seeds} seeds)")
 
     # Sim is rebuilt per (constellation size, seed); each config worker chains
@@ -607,7 +607,7 @@ def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
 # ── E5: Deadline tightness sweep ──────────────────────────────────────────────
 
-def run_E5(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E5(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     print(f"E5: Deadline tightness sweep (log-normal σ=0.6, {n_seeds} seeds)")
 
     # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
@@ -646,7 +646,7 @@ def run_E5(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
 # ── E6: λ_R penalty sweep ─────────────────────────────────────────────────────
 
-def run_E6(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E6(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     print(f"E6: λ_R (replication penalty) sweep ({n_seeds} seeds)")
 
     # Uses the stressed E1 scenario so the penalty has consequences to trade
@@ -674,7 +674,7 @@ def run_E6(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
 # ── E7: Correlated failures (orbital-plane outage) ────────────────────────────
 
-def run_E7(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     """
     Correlated orbital-plane outages probing replica-placement quality.
 
@@ -765,7 +765,7 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
 
 # ── COTS measurement-backed evaluation ────────────────────────────────────────
 
-def run_COTS(seed=0, n_seeds=30) -> Dict[str, List[EpochMetrics]]:
+def run_COTS(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     """Evaluate ORDI with BUPT-1 Atlas 200DK measurements from MobiCom24.
 
     This keeps the E1 orbital/task setup (and its 30-seed protocol) fixed and
