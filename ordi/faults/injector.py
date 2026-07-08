@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from ordi.sim.satellite import SatelliteState
 from ordi.sim.reliability import ReliabilityModel
 from ordi.orbit.contacts import ContactEvent
+from ordi.orbit.graph import EpochContactGraph
 
 
 @dataclass
@@ -46,13 +47,19 @@ class FaultInjector:
         reliability: ReliabilityModel,
         contacts: List[ContactEvent],
         rng_seed: int = 0,
+        graphs: Optional[List[EpochContactGraph]] = None,
+        gs_names: Optional[Set[str]] = None,
     ):
         self.states = states
         self.reliability = reliability
         self.contacts = contacts
         self.rng = random.Random(rng_seed)
+        self.graphs = graphs or []
+        self.gs_names = gs_names or set()
         self._active: List[FaultEvent] = []
         self._scheduled: List[FaultEvent] = []
+        # Maps fault id → {ep_idx: [(a, b, rate, cap, ltype), ...]} for ground_contact_miss
+        self._removed_edges: Dict[int, Dict[int, list]] = {}
 
     def schedule(self, fault: FaultEvent):
         """Register a fault to be applied at its start_epoch."""
@@ -104,10 +111,29 @@ class FaultInjector:
                     self.states[sat_id].C_i *= factor
 
         elif ft == "ground_contact_miss":
-            # Set downlink probability to 0 for targeted satellites
-            for sat_id in fault.targets:
-                self.reliability.set_link_pi(sat_id, "__ground__", 0.0)
-                self.reliability._node_overrides[sat_id + "_down"] = 0.0
+            # Remove sat→ground edges from epoch graphs for the fault duration
+            # so both feasibility routing and the realized-MC layer see no downlink.
+            fault_id = id(fault)
+            self._removed_edges[fault_id] = {}
+            for ep_idx in range(fault.start_epoch, fault.end_epoch):
+                if ep_idx >= len(self.graphs):
+                    continue
+                g = self.graphs[ep_idx]
+                kept, removed = [], []
+                for edge in g.edges:
+                    a, b = edge[0], edge[1]
+                    if (a in fault.targets and b in self.gs_names) or \
+                       (b in fault.targets and a in self.gs_names):
+                        removed.append(edge)
+                    else:
+                        kept.append(edge)
+                if removed:
+                    self._removed_edges[fault_id][ep_idx] = removed
+                    g.edges = kept
+                    g.adj = {na: [(nb, r, c) for (nb, r, c) in neighbors
+                                  if not (na in fault.targets and nb in self.gs_names)
+                                  and not (nb in fault.targets and na in self.gs_names)]
+                             for na, neighbors in g.adj.items()}
 
         elif ft == "battery_shortage":
             for sat_id in fault.targets:
@@ -151,10 +177,17 @@ class FaultInjector:
                     self.states[sat_id].C_i = self.states[sat_id]._throttled_compute_rate()
 
         elif ft == "ground_contact_miss":
-            for sat_id in fault.targets:
-                key = (sat_id, "__ground__")
-                if key in self.reliability._link_overrides:
-                    del self.reliability._link_overrides[key]
+            fault_id = id(fault)
+            removed_by_ep = self._removed_edges.pop(fault_id, {})
+            for ep_idx, edges in removed_by_ep.items():
+                if ep_idx < len(self.graphs):
+                    g = self.graphs[ep_idx]
+                    g.edges.extend(edges)
+                    # Rebuild adj from scratch to restore removed entries cleanly.
+                    adj: Dict[str, list] = {}
+                    for (na, nb, rate, cap, _t) in g.edges:
+                        adj.setdefault(na, []).append((nb, rate, cap))
+                    g.adj = adj
 
         elif ft == "battery_shortage":
             for sat_id in fault.targets:

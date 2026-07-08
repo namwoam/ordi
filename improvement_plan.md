@@ -7,31 +7,15 @@ Ordered by impact on the credibility of the paper's claims.
 
 ---
 
-## 1. `ground_contact_miss` fault is a no-op (bug)
+## 1. `ground_contact_miss` fault is a no-op (bug) — **FIXED**
 
-**Where:** `ordi/faults/injector.py:106-110`, `:153-157`
-
-```python
-self.reliability.set_link_pi(sat_id, "__ground__", 0.0)
-self.reliability._node_overrides[sat_id + "_down"] = 0.0
-```
-
-Nothing in the codebase ever reads the key `(sat_id, "__ground__")` or
-`sat_id + "_down"`. `replica_success_prob` always passes
-`downlink_pi=default_downlink_pi` (`feasibility.py:174`), and downlink
-*feasibility* comes from `earliest_downlink` routing, which this fault never
-touches. So the fault fires but changes nothing.
-
-**Consequence:** the paper's E2 claim that "ground-contact misses leave the miss
-ratio statistically unchanged... absorbed by rerouting" is measuring a fault
-that never happened.
-
-**Fix:** make the fault actually remove the aggregator's downlink window — either
-remove the satellite→ground edges from the affected epoch graphs for the fault
-duration, or plumb a real per-node downlink-π override that `feasibility.py`,
-`ordi.py`, and the baselines consult (currently they hardcode
-`default_downlink_pi`). Prefer removing the routing edge so both feasibility and
-the new realized-MC layer see it. Then re-run E2.
+**Fix applied (commit TBD):** `_apply` now removes sat→ground edges from
+`EpochContactGraph.edges` and `adj` for each epoch in `[start_epoch, end_epoch)`.
+`_withdraw` restores them by replaying the stored removed-edge list and
+rebuilding `adj`. The worker in `experiments.py` deepcopies `graphs` per job
+when any fault is `ground_contact_miss`, preserving the shared object invariant.
+E2 re-run confirmed: ground_miss still shows miss_ratio ≈ no_fault, which is
+now a genuine measurement (rerouting absorbs the fault) rather than a phantom.
 
 ---
 

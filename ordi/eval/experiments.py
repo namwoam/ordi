@@ -262,17 +262,22 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     local_states = deepcopy(states)
     local_rel = deepcopy(reliability)
 
+    # ground_contact_miss mutates epoch graph edges; deepcopy graphs when needed.
+    has_gcm = any(f.fault_type == "ground_contact_miss" for f in faults)
+    local_graphs = deepcopy(graphs) if has_gcm else graphs
+
     injector = None
     if faults:
-        injector = FaultInjector(local_states, local_rel, [], rng_seed=seed)
+        injector = FaultInjector(local_states, local_rel, [], rng_seed=seed,
+                                 graphs=local_graphs, gs_names=gs_names)
         for f in faults:
             injector.schedule(f)
 
     is_ordi = isinstance(scheduler_class, type) and issubclass(scheduler_class, ORDIScheduler)
     if is_ordi:
-        sched = scheduler_class(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
+        sched = scheduler_class(cfg, sat_ids, gs_names, local_graphs, local_states, local_rel)
     else:
-        sched = scheduler_class(graphs, local_states, gs_names, local_rel, cfg)
+        sched = scheduler_class(local_graphs, local_states, gs_names, local_rel, cfg)
 
     def schedule_fn(ep, td):
         if is_ordi:
