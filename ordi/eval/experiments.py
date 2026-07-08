@@ -740,18 +740,28 @@ def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
 
 
 # ── E8: ILP vs greedy optimality gap ─────────────────────────────────────────
-# Left sequential: greedy and ILP are compared epoch-by-epoch, and HiGHS
-# already uses 8 threads internally.
+# Each (size, seed) instance runs greedy and ILP on the same built sim in one
+# worker; instances run concurrently. ILP is capped to few threads per worker
+# since parallelism now comes from the instance sweep, not from HiGHS internals.
 
-def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
-    print("E8: ILP vs greedy optimality gap (small instances)")
+# Sizes kept within ILP tractability (≤12 sats); arrival_rate low so per-epoch
+# tile counts stay small enough for the MILP to solve within the time limit.
+_E8_SIZES = [(3, 3), (3, 4)]          # (n_planes, sats_per_plane) → 9, 12 sats
+_E8_ARRIVAL_RATE = 3.0
+_E8_ILP_TIME_LIMIT_S = 30.0
+_E8_ILP_THREADS = 2
+
+
+def _run_E8_instance(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
+    """Worker: build one small (size, seed) instance and score greedy + ILP on
+    it with identical stateful lifetime accounting, so the pair is directly
+    comparable and the realized-MC layer sees the same reliability draws."""
     from ordi.scheduler.ilp import solve_ilp
-
-    # Small constellation: 3 planes × 4 sats = 12 sats
+    n_planes, sats_per_plane, seed = args
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(n_planes=3, sats_per_plane=4, arrival_rate=3.0, seed=seed)
+        _build_sim(n_planes=n_planes, sats_per_plane=sats_per_plane,
+                   arrival_rate=_E8_ARRIVAL_RATE, seed=seed)
 
-    # Same stateful lifetime accounting as E1-E7 so E8 is directly comparable.
     greedy_states = deepcopy(states)
     greedy_sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
                                  greedy_states, deepcopy(reliability))
@@ -760,7 +770,8 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
 
     def ilp_fn(ep, td):
         r = solve_ilp(ep, T_SIM_START, td, graphs, deepcopy(states),
-                      deepcopy(reliability), gs_names, cfg, time_limit_s=30.0)
+                      deepcopy(reliability), gs_names, cfg,
+                      time_limit_s=_E8_ILP_TIME_LIMIT_S, threads=_E8_ILP_THREADS)
         return r if r else SchedulerResult(
             epoch=ep, assignments=[], total_utility=0.0, energy_penalty=0.0,
             comm_penalty=0.0, rep_penalty=0.0, objective=0.0, link_utilization={})
@@ -769,8 +780,49 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
                                   reliability=deepcopy(reliability), realized_seed=seed)
     m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, deepcopy(states), cfg,
                                reliability=deepcopy(reliability), realized_seed=seed)
+    n_sats = n_planes * sats_per_plane
+    return [(f"ORDI_greedy#n{n_sats}s{seed}", [m_greedy]),
+            (f"ORDI_ILP#n{n_sats}s{seed}", [m_ilp])]
 
-    results = {"ORDI_greedy": [m_greedy], "ORDI_ILP": [m_ilp]}
+
+def run_E8(seed=0, n_seeds=12) -> Dict[str, List[EpochMetrics]]:
+    """ILP-vs-greedy optimality gap over a distribution of small instances.
+
+    Runs every (size, seed) instance and reports the mean ± std gap across the
+    distribution, replacing the prior single-instance anecdote. Both modeled
+    and realized (Monte-Carlo) metrics are aggregated so the gap is reported on
+    delivery outcomes as well as the modeled objective.
+    """
+    sizes = [f"{p}×{spp}" for p, spp in _E8_SIZES]
+    print(f"E8: ILP vs greedy optimality gap "
+          f"(sizes {sizes}, {n_seeds} seeds each)")
+
+    instances = [(p, spp, seed + s)
+                 for p, spp in _E8_SIZES for s in range(n_seeds)]
+
+    try:
+        from ordi.orbit._dijkstra_numba import warmup_jit
+        warmup_jit()
+    except ImportError:
+        pass
+
+    raw: Dict[str, List[EpochMetrics]] = {}
+    with ProcessPoolExecutor(max_workers=min(len(instances), 16)) as pool:
+        futures = [pool.submit(_run_E8_instance, inst) for inst in instances]
+        for fut in tqdm(as_completed(futures), total=len(instances),
+                        desc="E8 instances", unit="instance"):
+            for key, metrics in fut.result():
+                raw[key] = metrics
+
+    # Collapse over sizes and seeds → one greedy row and one ILP row, each
+    # aggregating the full instance distribution (mean ± across-instance std).
+    results: Dict[str, List[EpochMetrics]] = {"ORDI_greedy": [], "ORDI_ILP": []}
+    for p, spp in _E8_SIZES:
+        n_sats = p * spp
+        for s in range(n_seeds):
+            results["ORDI_greedy"].extend(raw[f"ORDI_greedy#n{n_sats}s{seed + s}"])
+            results["ORDI_ILP"].extend(raw[f"ORDI_ILP#n{n_sats}s{seed + s}"])
+
     _save_csv("E8_ilp_gap", results)
     return results
 

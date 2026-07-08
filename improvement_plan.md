@@ -68,18 +68,24 @@ so nominal experiments keep the emergent-placement framing.
 
 ---
 
-## 4. ILP comparison (E8) is a single instance, single seed
+## 4. ILP comparison (E8) is a single instance, single seed — **FIXED**
 
-**Where:** `ordi/eval/experiments.py:714` (`run_E8`, `seed=0`, one instance);
-Table VII confirms "Seeds: 1".
+**Where:** `ordi/eval/experiments.py` (`run_E8`).
 
-The "greedy matches ILP" claim rests on one over-constrained 12-sat instance.
+The "greedy matches ILP" claim rested on one over-constrained 12-sat instance.
 
-**Fix:** run a distribution of small instances (multiple seeds, maybe a couple of
-sizes within ILP tractability) and report the optimality gap with error bars —
-this is the quantified greedy-vs-optimal gap the research plan promised, instead
-of an anecdote. Now that realized-MC scoring exists, report both modeled and
-realized gaps.
+**Fix applied:** `run_E8` now sweeps a distribution of small ILP-tractable
+instances — two sizes (9 and 12 sats, `_E8_SIZES`) × 12 seeds — via a new
+`_run_E8_instance` worker that builds each instance and scores greedy + ILP with
+identical stateful lifetime accounting. Instances run concurrently in a
+`ProcessPoolExecutor`; `solve_ilp` gained a `threads` param (E8 caps HiGHS to 2
+threads per worker since parallelism now comes from the instance sweep). Both
+greedy and ILP rows aggregate the full distribution, so the CSV `*_std` columns
+report across-instance dispersion and `plot_E8` now draws error bars. Modeled
+and realized gaps are both reported. Result: matching mean miss ratios (59.2%),
+statistically indistinguishable utility (greedy marginally ahead on realized),
+ILP spending 3.6× the ISL traffic and 62% more energy. Abstract, intro, §E8, and
+the config table (Seeds 1→12) updated accordingly.
 
 ---
 

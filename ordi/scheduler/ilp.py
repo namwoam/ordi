@@ -76,6 +76,7 @@ def solve_ilp(
     ground_stations: set,
     cfg: ORDIConfig,
     time_limit_s: float = 60.0,
+    threads: int = 8,
 ) -> Optional[SchedulerResult]:
     """
     Solve the MILP exactly for one epoch.
@@ -245,7 +246,7 @@ def solve_ilp(
             prob += pulp.lpSum(terms) <= cap
 
     # ── solve ─────────────────────────────────────────────────────────────────
-    solver = _pick_solver(time_limit_s)
+    solver = _pick_solver(time_limit_s, threads=threads)
     try:
         status = prob.solve(solver)
     except Exception:

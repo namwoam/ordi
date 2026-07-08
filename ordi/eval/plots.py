@@ -352,13 +352,15 @@ def plot_E8():
     fig, axes = plt.subplots(1, 2, figsize=(9, 4))
     for ax, metric, title in zip(axes, metrics, titles):
         g, i = _float(greedy_row, metric), _float(ilp_row, metric)
-        ax.bar([0, 1], [g, i], 0.6, color=["#e63946", "#457b9d"])
+        ge, ie = _std(greedy_row, metric), _std(ilp_row, metric)
+        ax.bar([0, 1], [g, i], 0.6, color=["#e63946", "#457b9d"],
+               yerr=[ge, ie], capsize=4, error_kw={"linewidth": 0.9})
         ax.set_xticks([0, 1]); ax.set_xticklabels(["Greedy", "ILP"])
         ax.set_title(title, fontsize=10)
         gap = (g - i) / i * 100 if i else 0.0
         ax.annotate(f"gap: {gap:+.1f}%", xy=(0.5, 0.92), xycoords="axes fraction",
                     ha="center", fontsize=9)
-        ax.set_ylim(0, max(g, i) * 1.25 if max(g, i) > 0 else 1)
+        ax.set_ylim(0, max(g + ge, i + ie) * 1.25 if max(g, i) > 0 else 1)
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E8_ilp_gap.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
