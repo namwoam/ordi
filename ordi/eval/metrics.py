@@ -14,10 +14,12 @@ Metrics (per the proposal's evaluation plan):
 
 from __future__ import annotations
 import math
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 from ordi.scheduler.ordi import SchedulerResult, TileAssignment
+from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask
 
 
@@ -36,6 +38,12 @@ class EpochMetrics:
     n_replicas_avg: float = 0.0
     n_tiles_total: int = 0
     n_tiles_feasible: int = 0
+    # Monte Carlo realized outcomes (sampled from the reliability model rather
+    # than scored on the modeled expectation z_kv). Populated by
+    # compute_realized_metrics; left at 0 when realized scoring is not run.
+    realized_miss_ratio: float = 0.0
+    realized_utility: float = 0.0
+    realized_coverage: float = 0.0
 
 
 def compute_metrics(
@@ -117,6 +125,151 @@ def compute_metrics(
     return m
 
 
+def _replica_components(replica, source: str) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...], str]:
+    """Decompose a replica into the (nodes, isl_links, downlink_node) whose
+    joint survival determines whether the replica delivers, mirroring the terms
+    of ReliabilityModel.replica_success_prob.
+
+    A replica succeeds iff the helper node, the source→helper ISL, the
+    helper→aggregator ISL, and the aggregator's downlink all survive. (The
+    source node is shared across all replicas of a tile and sampled once at the
+    tile level, so it is excluded here.) Self-processing replicas where the
+    helper is the source carry no source→helper hop; helper-as-aggregator
+    replicas carry no helper→aggregator hop.
+
+    The component set mirrors replica_success_prob exactly (helper node only,
+    not the aggregator node), so under independent draws the Monte Carlo miss
+    ratio converges to the modeled z_kv; the only divergence comes from draws
+    shared across replicas, which is the correlation effect this layer exists
+    to expose.
+    """
+    helper = replica.helper
+    agg = replica.aggregator
+    nodes = {helper}
+    isl_links: Set[Tuple[str, str]] = set()
+    if helper != source:
+        isl_links.add((min(source, helper), max(source, helper)))
+    if helper != agg:
+        isl_links.add((min(helper, agg), max(helper, agg)))
+    return tuple(sorted(nodes)), tuple(sorted(isl_links)), agg
+
+
+def compute_realized_metrics(
+    result: SchedulerResult,
+    tasks: List[EOTask],
+    reliability: ReliabilityModel,
+    alpha: float = 0.002,
+    n_trials: int = 200,
+    seed: int = 0,
+) -> EpochMetrics:
+    """Monte Carlo realized-outcome scoring.
+
+    Unlike compute_metrics (which scores the scheduler's *modeled* expectation
+    z_kv directly), this samples per-trial Bernoulli outcomes for every node,
+    ISL link, and downlink from the reliability model's π values, using the
+    SAME random draw for a component shared by multiple replicas of a tile.
+    A replica delivers iff all its components survive; a tile is delivered iff
+    any of its replicas delivers. The realized miss ratio, delivered utility,
+    and coverage are averaged over trials and written to the realized_* fields,
+    leaving the modeled deadline_miss_ratio/delivered_utility intact so the two
+    can be compared directly. Deterministic cost metrics (ISL, downlink,
+    energy, replicas) come from compute_metrics.
+
+    Shared draws across replicas make correlated structural failures (a plane
+    or a shared aggregator taking down several replicas at once) show up in the
+    realized numbers instead of being hidden by the independence assumption.
+    """
+    # Deterministic cost metrics + structure come from the modeled pass.
+    base = compute_metrics(result, tasks, 0.0, {}, alpha)
+
+    tile_lookup: Dict[tuple, tuple] = {}
+    for task in tasks:
+        for tile in task.tiles:
+            tile_lookup[(task.task_id, tile.tile_id)] = (task, tile)
+
+    n_tiles = base.n_tiles_total
+    if n_tiles == 0:
+        return base
+
+    scored = []  # (task_id, tile, utility_weight, [replica_component_tuples], source)
+    for a in result.assignments:
+        key = (a.task_id, a.tile_id)
+        if key not in tile_lookup:
+            continue
+        task_obj, tile = tile_lookup[key]
+        if not a.replicas or math.isinf(a.L_hat):
+            # B1-style no-replica assignments: fall back to a single synthetic
+            # downlink replica off the primary aggregator so they are still
+            # sampled rather than silently treated as always-delivered.
+            if a.z_kv > 0 and not math.isinf(a.L_hat) and a.primary_aggregator:
+                scored.append((task_obj.task_id, tile, a.L_hat,
+                               [(("__none__",), (), a.primary_aggregator)],
+                               task_obj.source_sat))
+            else:
+                scored.append((task_obj.task_id, tile, a.L_hat, [], task_obj.source_sat))
+            continue
+        comps = [_replica_components(r, task_obj.source_sat) for r in a.replicas]
+        scored.append((task_obj.task_id, tile, a.L_hat, comps, task_obj.source_sat))
+
+    rng = random.Random(seed)
+    miss_trials = []
+    util_trials = []
+    cvg_trials = []
+
+    for _ in range(n_trials):
+        node_alive: Dict[str, bool] = {}
+        link_alive: Dict[Tuple[str, str], bool] = {}
+        down_alive: Dict[str, bool] = {}
+
+        def node_ok(nid: str) -> bool:
+            if nid == "__none__":
+                return True
+            if nid not in node_alive:
+                node_alive[nid] = rng.random() < reliability.node_pi(nid)
+            return node_alive[nid]
+
+        def link_ok(pair: Tuple[str, str]) -> bool:
+            if pair not in link_alive:
+                link_alive[pair] = rng.random() < reliability.link_pi(pair[0], pair[1], "isl")
+            return link_alive[pair]
+
+        def down_ok(nid: str) -> bool:
+            if nid not in down_alive:
+                down_alive[nid] = rng.random() < reliability.default_downlink_pi
+            return down_alive[nid]
+
+        n_miss = 0
+        util = 0.0
+        task_delivered: Dict[int, int] = {}
+        task_total: Dict[int, int] = {}
+
+        for tid, tile, L_hat, comps, src in scored:
+            task_total[tid] = task_total.get(tid, 0) + 1
+            delivered = False
+            if comps and node_ok(src):
+                for nodes, isl_links, agg in comps:
+                    if (all(node_ok(n) for n in nodes)
+                            and all(link_ok(l) for l in isl_links)
+                            and down_ok(agg)):
+                        delivered = True
+                        break
+            if delivered:
+                util += tile.utility * math.exp(-alpha * L_hat)
+                task_delivered[tid] = task_delivered.get(tid, 0) + 1
+            else:
+                n_miss += 1
+
+        miss_trials.append(n_miss / n_tiles)
+        util_trials.append(util)
+        cov = [task_delivered.get(t, 0) / tot for t, tot in task_total.items() if tot]
+        cvg_trials.append(sum(cov) / len(cov) if cov else 0.0)
+
+    base.realized_miss_ratio = sum(miss_trials) / n_trials
+    base.realized_utility = sum(util_trials) / n_trials
+    base.realized_coverage = sum(cvg_trials) / n_trials
+    return base
+
+
 def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
     """Aggregate per-run metrics into mean plus sample std (<key>_std).
 
@@ -130,6 +283,7 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "deadline_miss_ratio", "delivered_utility", "partial_coverage",
         "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
         "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
+        "realized_miss_ratio", "realized_utility", "realized_coverage",
     ]
     out: Dict[str, float] = {}
     for k in keys:

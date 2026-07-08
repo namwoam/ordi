@@ -50,7 +50,9 @@ from ordi.baselines.baselines import (
     FullReplication, RandomReplication,
 )
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
-from ordi.eval.metrics import compute_metrics, aggregate_metrics, EpochMetrics
+from ordi.eval.metrics import (
+    compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
+)
 
 RESULTS_DIR = "results"
 SIM_DURATION_S = 17_280       # 3 complete orbits at 550 km (3 × 5760 s)
@@ -172,11 +174,19 @@ def _uncommitted_tasks(pending, committed):
     return out
 
 
-def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None):
+def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
+                       reliability=None, realized_trials=200, realized_seed=0):
     """Run one stateful rolling-horizon simulation and return a lifetime
     EpochMetrics.  schedule_fn(epoch, todo_tasks) -> SchedulerResult dispatches
     to ORDI / a baseline / the ILP.  A committed tile stays in-flight (not
-    re-scheduled, not re-charged) until a fault invalidates all its replicas."""
+    re-scheduled, not re-charged) until a fault invalidates all its replicas.
+
+    When a reliability model is supplied, the final lifetime assignment set is
+    also scored by Monte Carlo (compute_realized_metrics): links and nodes are
+    sampled from their π values with draws shared across a tile's replicas, so
+    the realized_* fields report delivery outcomes the modeled z_kv assumes
+    away.  Hard outages already pruned infeasible candidates during scheduling;
+    this layer adds the soft stochastic loss the reliability model specifies."""
     sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], TileAssignment] = {}
@@ -210,6 +220,14 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None):
     m.objective = (m.delivered_utility
                    - cfg.lambda_E * m.energy_joules
                    - cfg.lambda_R * r_total)
+    if reliability is not None and realized_trials > 0:
+        rm = compute_realized_metrics(
+            res, tasks, reliability, cfg.alpha,
+            n_trials=realized_trials, seed=realized_seed,
+        )
+        m.realized_miss_ratio = rm.realized_miss_ratio
+        m.realized_utility = rm.realized_utility
+        m.realized_coverage = rm.realized_coverage
     return m
 
 
@@ -261,7 +279,8 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
             return sched.schedule_epoch(ep, T_SIM_START, td)
         return sched.schedule(ep, T_SIM_START, td)
 
-    m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector)
+    m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector,
+                           reliability=local_rel, realized_seed=seed)
     return result_key, [m]
 
 
@@ -385,6 +404,7 @@ _CSV_METRIC_KEYS = [
     "deadline_miss_ratio", "delivered_utility", "partial_coverage",
     "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
     "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
+    "realized_miss_ratio", "realized_utility", "realized_coverage",
 ]
 _CSV_FIELDS = (["algorithm"] + _CSV_METRIC_KEYS
                + [f"{k}_std" for k in _CSV_METRIC_KEYS])
@@ -733,8 +753,10 @@ def run_E8(seed=0) -> Dict[str, List[EpochMetrics]]:
             epoch=ep, assignments=[], total_utility=0.0, energy_penalty=0.0,
             comm_penalty=0.0, rep_penalty=0.0, objective=0.0, link_utilization={})
 
-    m_greedy = _simulate_stateful(greedy_fn, tasks, sat_ids, greedy_states, cfg)
-    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, deepcopy(states), cfg)
+    m_greedy = _simulate_stateful(greedy_fn, tasks, sat_ids, greedy_states, cfg,
+                                  reliability=deepcopy(reliability), realized_seed=seed)
+    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, deepcopy(states), cfg,
+                               reliability=deepcopy(reliability), realized_seed=seed)
 
     results = {"ORDI_greedy": [m_greedy], "ORDI_ILP": [m_ilp]}
     _save_csv("E8_ilp_gap", results)

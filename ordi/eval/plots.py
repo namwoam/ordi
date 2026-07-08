@@ -73,9 +73,11 @@ def plot_E1():
     if not rows:
         print("No E1 data"); return
 
-    metrics = ["deadline_miss_ratio", "delivered_utility", "partial_coverage",
+    # Miss ratio and utility report Monte Carlo realized outcomes; the cost and
+    # coverage panels are deterministic.
+    metrics = ["realized_miss_ratio", "realized_utility", "partial_coverage",
                "energy_joules", "isl_traffic_bits"]
-    titles  = ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)",
+    titles  = ["Deadline Miss Ratio (realized, ↓)", "Delivered Utility (realized, ↑)",
                "Partial Coverage (↑)", "Energy (J) (↓)", "ISL Traffic (bits) (↓)"]
 
     algs = [r["algorithm"] for r in rows]
@@ -93,7 +95,7 @@ def plot_E1():
         ax.set_xticks(range(len(algs)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
         # Highlight ORDI bar
-        for i, (bar, alg) in enumerate(zip(bars, algs)):
+        for bar, alg in zip(bars, algs):
             if alg == "ORDI":
                 bar.set_edgecolor("black")
                 bar.set_linewidth(2)
@@ -159,10 +161,10 @@ def plot_E3():
         for rate in fault_rates:
             key = f"{alg}@fault={rate:.2f}"
             row = next((r for r in rows if r["algorithm"] == key), None)
-            miss_vals.append(_float(row, "deadline_miss_ratio") if row else 0)
-            miss_errs.append(_std(row, "deadline_miss_ratio") if row else 0)
-            util_vals.append(_float(row, "delivered_utility")   if row else 0)
-            util_errs.append(_std(row, "delivered_utility") if row else 0)
+            miss_vals.append(_float(row, "realized_miss_ratio") if row else 0)
+            miss_errs.append(_std(row, "realized_miss_ratio") if row else 0)
+            util_vals.append(_float(row, "realized_utility")   if row else 0)
+            util_errs.append(_std(row, "realized_utility") if row else 0)
         label = ALG_LABELS.get(alg, alg)
         color = ALG_COLORS.get(alg, "#888")
         lw = 2.5 if alg == "ORDI" else 1.5
@@ -171,11 +173,11 @@ def plot_E3():
         ax2.errorbar(fault_rates, util_vals, yerr=util_errs, label=label,
                      color=color, linewidth=lw, marker="o", capsize=3)
 
-    ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (↓)")
-    ax1.legend(fontsize=8); ax1.set_title("Deadline Miss Ratio")
+    ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (realized, ↓)")
+    ax1.legend(fontsize=8); ax1.set_title("Deadline Miss Ratio (realized)")
     ax1.set_ylim(bottom=0)
-    ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("Delivered Utility (↑)")
-    ax2.legend(fontsize=8); ax2.set_title("Delivered Utility")
+    ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("Delivered Utility (realized, ↑)")
+    ax2.legend(fontsize=8); ax2.set_title("Delivered Utility (realized)")
 
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E3_intensity.png")
@@ -309,15 +311,18 @@ def plot_E7():
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
+    labels = [r["algorithm"] for r in rows]
+    x = np.arange(len(labels))
+    colors = ["#e63946" if "ORDI" in l else "#f4a261" for l in labels]
+
     for ax, metric, title in zip(axes,
-                                  ["deadline_miss_ratio", "delivered_utility"],
-                                  ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)"]):
-        labels = [r["algorithm"] for r in rows]
-        vals   = [_float(r, metric) for r in rows]
-        errs   = [_std(r, metric) for r in rows]
-        colors = ["#e63946" if "ORDI" in l else "#f4a261" for l in labels]
-        ax.bar(range(len(labels)), vals, color=colors, yerr=errs, capsize=3)
-        ax.set_xticks(range(len(labels)))
+                                  ["realized_miss_ratio", "realized_utility"],
+                                  ["Deadline Miss Ratio (realized, ↓)",
+                                   "Delivered Utility (realized, ↑)"]):
+        vals = [_float(r, metric) for r in rows]
+        errs = [_std(r, metric) for r in rows]
+        ax.bar(x, vals, color=colors, yerr=errs, capsize=3)
+        ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
         ax.set_title(title)
         ax.set_ylim(bottom=0)
@@ -341,8 +346,8 @@ def plot_E8():
     if not greedy_row or not ilp_row:
         return
 
-    metrics = ["delivered_utility", "deadline_miss_ratio"]
-    titles  = ["Delivered Utility (↑)", "Deadline Miss Ratio (↓)"]
+    metrics = ["realized_utility", "realized_miss_ratio"]
+    titles  = ["Delivered Utility (realized, ↑)", "Deadline Miss Ratio (realized, ↓)"]
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4))
     for ax, metric, title in zip(axes, metrics, titles):
