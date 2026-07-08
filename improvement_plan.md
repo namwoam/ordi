@@ -19,23 +19,28 @@ now a genuine measurement (rerouting absorbs the fault) rather than a phantom.
 
 ---
 
-## 2. Two modeled failure modes are never exercised
+## 2. Two modeled failure modes are never exercised — **FIXED**
 
-**Adverse downlink (`π = 0.70`)** — defined at `reliability.py:20`
+**Adverse downlink (`π = 0.70`)** — was defined at `reliability.py:20`
 (`DEFAULT_DOWNLINK_ADV_PI`), cited in the System Model, but no experiment ever
-sets it. Dead config.
-- **Fix:** add a weather/adverse-downlink scenario (e.g. an E2 fault class or an
-  E3 sweep variant) that swaps `default_downlink_pi` to the adverse value for
-  targeted aggregators, and report it.
+set it.
+- **Fix applied:** `ReliabilityModel` now carries per-aggregator
+  `_downlink_overrides` behind a `downlink_pi(agg)` accessor; every downlink
+  read (feasibility, ORDI self-processing, realized-MC `down_ok`) routes through
+  it. A new `downlink_adverse` fault type sets the override to
+  `DEFAULT_DOWNLINK_ADV_PI` for the fault duration, and E2 gains a `downlink_adv`
+  scenario that reports it.
 
-**ISL disruption doesn't remove the graph edge** — `injector.py:80-86` zeroes
+**ISL disruption doesn't remove the graph edge** — `injector.py` zeroed
 `link_pi` (used only in `z_kv`), but `earliest_arrival` ignores reliability, so a
-"disrupted" ISL still carries the tile at full latency. It only loses
+"disrupted" ISL still carried the tile at full latency. It only lost
 probability mass.
-- **Fix:** make ISL disruption also drop the edge from `E(t)` for the fault
-  duration (mirror the plane-outage/helper-failure path that sets `A_i`).
-  With the realized-MC layer now in place, the sampled `p=0` will also drop the
-  replica in scoring — but feasibility should reflect the outage too.
+- **Fix applied:** `isl_disruption._apply` now also drops the ISL edge (both
+  directions) from the epoch graphs for `[start, end)` via a shared
+  `_remove_edges`/`_restore_edges` helper (also used by `ground_contact_miss`);
+  `_withdraw` replays them. The worker deepcopies `graphs` whenever any fault is
+  graph-mutating. E2 now shows a genuine `isl_disruption` miss ratio instead of
+  the prior phantom ≈0.
 
 ---
 

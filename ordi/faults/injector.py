@@ -1,7 +1,7 @@
 """
 Fault injection framework for ORDI evaluation (Phase 6 / E2, E3, E7).
 
-Supports seven fault types from the proposal:
+Supports eight fault types from the proposal:
   1. ISL disruption          - remove specific ISL edge for N epochs
   2. Orbital-plane outage    - disable all satellites in a plane for N epochs
   3. Helper failure          - flip A_i=0 for a specific satellite
@@ -9,6 +9,7 @@ Supports seven fault types from the proposal:
   5. Ground-contact miss     - remove downlink window for N epochs
   6. Battery shortage        - drain B_i below B_min
   7. Thermal throttling      - set Θ_i above Θ_max to force throttle
+  8. Adverse downlink        - reduce aggregator downlink π (weather)
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from ordi.sim.satellite import SatelliteState
-from ordi.sim.reliability import ReliabilityModel
+from ordi.sim.reliability import ReliabilityModel, DEFAULT_DOWNLINK_ADV_PI
 from ordi.orbit.contacts import ContactEvent
 from ordi.orbit.graph import EpochContactGraph
 
@@ -85,11 +86,18 @@ class FaultInjector:
         ft = fault.fault_type
 
         if ft == "isl_disruption":
-            # targets: list of "sat_a:sat_b" strings
+            # targets: list of "sat_a:sat_b" strings.
+            # Zero the reliability (used by z_kv) AND drop the ISL edge from the
+            # epoch graphs so earliest_arrival — which ignores reliability — can
+            # no longer route the tile over the disrupted link at full latency.
+            disrupted = set()
             for link_str in fault.targets:
                 a, b = link_str.split(":")
                 self.reliability.disable_link(a, b)
                 self.reliability.disable_link(b, a)
+                disrupted.add((a, b))
+                disrupted.add((b, a))
+            self._remove_edges(fault, lambda na, nb: (na, nb) in disrupted)
 
         elif ft == "plane_outage":
             # targets: list of satellite IDs in the affected plane
@@ -113,27 +121,19 @@ class FaultInjector:
         elif ft == "ground_contact_miss":
             # Remove sat→ground edges from epoch graphs for the fault duration
             # so both feasibility routing and the realized-MC layer see no downlink.
-            fault_id = id(fault)
-            self._removed_edges[fault_id] = {}
-            for ep_idx in range(fault.start_epoch, fault.end_epoch):
-                if ep_idx >= len(self.graphs):
-                    continue
-                g = self.graphs[ep_idx]
-                kept, removed = [], []
-                for edge in g.edges:
-                    a, b = edge[0], edge[1]
-                    if (a in fault.targets and b in self.gs_names) or \
-                       (b in fault.targets and a in self.gs_names):
-                        removed.append(edge)
-                    else:
-                        kept.append(edge)
-                if removed:
-                    self._removed_edges[fault_id][ep_idx] = removed
-                    g.edges = kept
-                    g.adj = {na: [(nb, r, c) for (nb, r, c) in neighbors
-                                  if not (na in fault.targets and nb in self.gs_names)
-                                  and not (nb in fault.targets and na in self.gs_names)]
-                             for na, neighbors in g.adj.items()}
+            gs = self.gs_names
+            tgt = set(fault.targets)
+            self._remove_edges(
+                fault,
+                lambda na, nb: (na in tgt and nb in gs) or (nb in tgt and na in gs),
+            )
+
+        elif ft == "downlink_adverse":
+            # Adverse weather / degraded ground contact: the aggregator can still
+            # route (edge stays up) but its downlink succeeds with reduced π.
+            adv_pi = fault.params.get("pi", DEFAULT_DOWNLINK_ADV_PI)
+            for sat_id in fault.targets:
+                self.reliability.set_downlink_pi(sat_id, adv_pi)
 
         elif ft == "battery_shortage":
             for sat_id in fault.targets:
@@ -161,6 +161,7 @@ class FaultInjector:
                     del self.reliability._link_overrides[(a, b)]
                 if (b, a) in self.reliability._link_overrides:
                     del self.reliability._link_overrides[(b, a)]
+            self._restore_edges(fault)
 
         elif ft in ("plane_outage", "helper_failure"):
             for sat_id in fault.targets:
@@ -177,17 +178,11 @@ class FaultInjector:
                     self.states[sat_id].C_i = self.states[sat_id]._throttled_compute_rate()
 
         elif ft == "ground_contact_miss":
-            fault_id = id(fault)
-            removed_by_ep = self._removed_edges.pop(fault_id, {})
-            for ep_idx, edges in removed_by_ep.items():
-                if ep_idx < len(self.graphs):
-                    g = self.graphs[ep_idx]
-                    g.edges.extend(edges)
-                    # Rebuild adj from scratch to restore removed entries cleanly.
-                    adj: Dict[str, list] = {}
-                    for (na, nb, rate, cap, _t) in g.edges:
-                        adj.setdefault(na, []).append((nb, rate, cap))
-                    g.adj = adj
+            self._restore_edges(fault)
+
+        elif ft == "downlink_adverse":
+            for sat_id in fault.targets:
+                self.reliability._downlink_overrides.pop(sat_id, None)
 
         elif ft == "battery_shortage":
             for sat_id in fault.targets:
@@ -205,6 +200,46 @@ class FaultInjector:
                     s.Theta_i = s.params.thermal_ambient_c
                     s.C_i = s._throttled_compute_rate()
                     s.recover()
+
+    # ── epoch-graph edge removal/restore (shared by graph-mutating faults) ─────
+
+    def _remove_edges(self, fault: FaultEvent, drop):
+        """Remove every edge (a→b) with drop(a, b) True from the epoch graphs in
+        [start_epoch, end_epoch), recording them so _restore_edges can replay.
+        `drop` is a predicate over ordered endpoints; pass a symmetric predicate
+        to remove both directions of a link."""
+        fault_id = id(fault)
+        self._removed_edges[fault_id] = {}
+        for ep_idx in range(fault.start_epoch, fault.end_epoch):
+            if ep_idx >= len(self.graphs):
+                continue
+            g = self.graphs[ep_idx]
+            kept, removed = [], []
+            for edge in g.edges:
+                if drop(edge[0], edge[1]):
+                    removed.append(edge)
+                else:
+                    kept.append(edge)
+            if removed:
+                self._removed_edges[fault_id][ep_idx] = removed
+                g.edges = kept
+                adj: Dict[str, list] = {}
+                for (na, nb, rate, cap, _t) in kept:
+                    adj.setdefault(na, []).append((nb, rate, cap))
+                g.adj = adj
+
+    def _restore_edges(self, fault: FaultEvent):
+        """Replay the edges removed by _remove_edges for this fault and rebuild
+        each affected graph's adjacency list."""
+        removed_by_ep = self._removed_edges.pop(id(fault), {})
+        for ep_idx, edges in removed_by_ep.items():
+            if ep_idx < len(self.graphs):
+                g = self.graphs[ep_idx]
+                g.edges.extend(edges)
+                adj: Dict[str, list] = {}
+                for (na, nb, rate, cap, _t) in g.edges:
+                    adj.setdefault(na, []).append((nb, rate, cap))
+                g.adj = adj
 
     # ── convenience factory methods ───────────────────────────────────────────
 
@@ -244,6 +279,12 @@ class FaultInjector:
     def thermal_throttle(sat_id: str, start_epoch: int,
                          duration: int = 2) -> FaultEvent:
         return FaultEvent("thermal_throttle", start_epoch, duration, [sat_id])
+
+    @staticmethod
+    def downlink_adverse(agg_sat: str, start_epoch: int, duration: int = 5,
+                         pi: float = DEFAULT_DOWNLINK_ADV_PI) -> FaultEvent:
+        return FaultEvent("downlink_adverse", start_epoch, duration, [agg_sat],
+                          {"pi": pi})
 
 
 def random_fault_schedule(

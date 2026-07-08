@@ -35,12 +35,17 @@ class ReliabilityModel:
     _link_overrides: Dict[Tuple[str, str], float] = None
     # Per-node overrides: node_id → probability
     _node_overrides: Dict[str, float] = None
+    # Per-aggregator downlink overrides: node_id → downlink probability
+    # (adverse weather / degraded ground contact for specific aggregators)
+    _downlink_overrides: Dict[str, float] = None
 
     def __post_init__(self):
         if self._link_overrides is None:
             self._link_overrides = {}
         if self._node_overrides is None:
             self._node_overrides = {}
+        if self._downlink_overrides is None:
+            self._downlink_overrides = {}
 
     def link_pi(self, node_a: str, node_b: str, link_type: str = "isl") -> float:
         """Probability that link (a→b) remains usable for a scheduled transfer."""
@@ -56,6 +61,14 @@ class ReliabilityModel:
         if node_id in self._node_overrides:
             return self._node_overrides[node_id]
         return self.default_node_pi
+
+    def downlink_pi(self, aggregator_id: str) -> float:
+        """Probability that the aggregator's downlink to ground succeeds.
+        Falls back to the clear-sky default; an adverse-weather fault sets a
+        per-aggregator override (e.g. DEFAULT_DOWNLINK_ADV_PI)."""
+        if aggregator_id in self._downlink_overrides:
+            return self._downlink_overrides[aggregator_id]
+        return self.default_downlink_pi
 
     def path_pi(self, path: list, link_type: str = "isl") -> float:
         """
@@ -100,7 +113,7 @@ class ReliabilityModel:
         if downlink_pi is not None:
             pi_down = downlink_pi
         else:
-            pi_down = self.default_downlink_pi
+            pi_down = self.downlink_pi(aggregator_id)
 
         return pi_node * pi_ski * pi_ia * pi_down
 
@@ -127,6 +140,9 @@ class ReliabilityModel:
     def set_node_pi(self, node_id: str, pi: float):
         self._node_overrides[node_id] = pi
 
+    def set_downlink_pi(self, aggregator_id: str, pi: float):
+        self._downlink_overrides[aggregator_id] = pi
+
     def disable_link(self, node_a: str, node_b: str):
         self._link_overrides[(node_a, node_b)] = 0.0
 
@@ -136,3 +152,4 @@ class ReliabilityModel:
     def reset_overrides(self):
         self._link_overrides.clear()
         self._node_overrides.clear()
+        self._downlink_overrides.clear()

@@ -262,9 +262,11 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     local_states = deepcopy(states)
     local_rel = deepcopy(reliability)
 
-    # ground_contact_miss mutates epoch graph edges; deepcopy graphs when needed.
-    has_gcm = any(f.fault_type == "ground_contact_miss" for f in faults)
-    local_graphs = deepcopy(graphs) if has_gcm else graphs
+    # ground_contact_miss and isl_disruption mutate epoch graph edges;
+    # deepcopy graphs when either is present to keep the shared object clean.
+    _GRAPH_MUTATING = {"ground_contact_miss", "isl_disruption"}
+    mutates_graph = any(f.fault_type in _GRAPH_MUTATING for f in faults)
+    local_graphs = deepcopy(graphs) if mutates_graph else graphs
 
     injector = None
     if faults:
@@ -508,6 +510,7 @@ def run_E2(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
         "helper_failure": [("helper_failure", S, D, "hot_sources")],
         "straggler":      [("straggler", S, D, "hot_sources", {"factor": 0.1})],
         "ground_miss":    [("ground_contact_miss", S, D, "hot_sources")],
+        "downlink_adv":   [("downlink_adverse", S, D, "hot_sources")],
         "battery":        [("battery_shortage", S, D, "hot_sources")],
         "thermal":        [("thermal_throttle", S, D, "hot_sources")],
     }

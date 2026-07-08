@@ -206,7 +206,7 @@ class ORDIScheduler(EpochRoutingCacheMixin):
             L_self = t_compute + ell_down
             if L_self <= tau_k:
                 p_self = (self.reliability.node_pi(task.source_sat)
-                          * self.reliability.default_downlink_pi)
+                          * self.reliability.downlink_pi(task.source_sat))
                 candidates.append(ReplicaCandidate(
                     task_id=task.task_id,
                     tile_id=tile.tile_id,

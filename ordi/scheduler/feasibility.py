@@ -112,7 +112,7 @@ def compute_candidates(
                 p_self = (reliability.node_pi(helper)
                           * reliability.node_pi(task.source_sat)
                           * reliability.link_pi(task.source_sat, helper, "isl")
-                          * reliability.default_downlink_pi)
+                          * reliability.downlink_pi(helper))
                 candidates.append(ReplicaCandidate(
                     task_id=task.task_id,
                     tile_id=tile.tile_id,
@@ -171,7 +171,7 @@ def compute_candidates(
                 helper_id=helper,
                 source_id=task.source_sat,
                 aggregator_id=aggregator,
-                downlink_pi=reliability.default_downlink_pi,
+                downlink_pi=reliability.downlink_pi(aggregator),
             )
 
             e_comp = h_state.energy_for_compute(tile.compute_ops)

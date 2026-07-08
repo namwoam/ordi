@@ -235,7 +235,7 @@ def compute_realized_metrics(
 
         def down_ok(nid: str) -> bool:
             if nid not in down_alive:
-                down_alive[nid] = rng.random() < reliability.default_downlink_pi
+                down_alive[nid] = rng.random() < reliability.downlink_pi(nid)
             return down_alive[nid]
 
         n_miss = 0
