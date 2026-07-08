@@ -113,17 +113,18 @@ old ~0.01 values; update from the regenerated `results/E1_core.csv`.
 
 ---
 
-## 6. Straggler restore is lossy (minor)
+## 6. Straggler restore is lossy (minor) — **FIXED**
 
-**Where:** `ordi/faults/injector.py:146-151`
+**Where:** `ordi/faults/injector.py` (`_apply`/`_withdraw`, straggler case).
 
-`_apply` does `C_i *= factor`; `_withdraw` does `C_i /= factor` then
-`_throttled_compute_rate()`. If throttle state changed during the fault window,
-the original `C_i` isn't recovered exactly.
+`_apply` did `C_i *= factor`; `_withdraw` did `C_i /= factor` then
+`_throttled_compute_rate()`. If throttle state changed during the fault window
+(or straggler windows overlapped), the original `C_i` wasn't recovered exactly.
 
-**Fix:** snapshot `C_i` at apply time and restore the snapshot on withdraw,
-rather than inverting the multiply. Matters for long sweeps with overlapping
-faults.
+**Fix applied:** a `_compute_snapshots` dict (fault id → {sat_id: C_i}) captures
+the exact pre-fault `C_i` at apply time; `_withdraw` restores it and pops the
+entry, rather than inverting the multiply. Verified apply→withdraw round-trips
+`C_i` exactly.
 
 ---
 

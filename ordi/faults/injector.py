@@ -61,6 +61,8 @@ class FaultInjector:
         self._scheduled: List[FaultEvent] = []
         # Maps fault id → {ep_idx: [(a, b, rate, cap, ltype), ...]} for ground_contact_miss
         self._removed_edges: Dict[int, Dict[int, list]] = {}
+        # Maps fault id → {sat_id: C_i} snapshot at apply time, for straggler restore
+        self._compute_snapshots: Dict[int, Dict[str, float]] = {}
 
     def schedule(self, fault: FaultEvent):
         """Register a fault to be applied at its start_epoch."""
@@ -114,8 +116,10 @@ class FaultInjector:
 
         elif ft == "straggler":
             factor = fault.params.get("factor", 0.1)
+            snapshot = self._compute_snapshots.setdefault(id(fault), {})
             for sat_id in fault.targets:
                 if sat_id in self.states:
+                    snapshot[sat_id] = self.states[sat_id].C_i
                     self.states[sat_id].C_i *= factor
 
         elif ft == "ground_contact_miss":
@@ -171,11 +175,13 @@ class FaultInjector:
                     del self.reliability._node_overrides[sat_id]
 
         elif ft == "straggler":
-            factor = fault.params.get("factor", 0.1)
+            # Restore the exact pre-fault C_i captured at apply time, rather than
+            # inverting the multiply (which loses state if throttling changed C_i
+            # during the fault window or if straggler windows overlapped).
+            snapshot = self._compute_snapshots.pop(id(fault), {})
             for sat_id in fault.targets:
-                if sat_id in self.states:
-                    self.states[sat_id].C_i /= factor  # restore
-                    self.states[sat_id].C_i = self.states[sat_id]._throttled_compute_rate()
+                if sat_id in self.states and sat_id in snapshot:
+                    self.states[sat_id].C_i = snapshot[sat_id]
 
         elif ft == "ground_contact_miss":
             self._restore_edges(fault)
