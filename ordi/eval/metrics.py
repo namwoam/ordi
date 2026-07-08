@@ -50,7 +50,7 @@ def compute_metrics(
     result: SchedulerResult,
     tasks: List[EOTask],
     epoch_start: float,
-    sat_compute_capacity: Dict[str, float],   # sat_id → C_i * epoch_length (cycles)
+    sat_compute_capacity: Dict[str, float],   # sat_id → compute-cycle budget (C_i·epoch_length, summed over the horizon for lifetime records)
     alpha: float = 0.002,
 ) -> EpochMetrics:
     m = EpochMetrics(epoch=result.epoch)
@@ -112,15 +112,20 @@ def compute_metrics(
     m.n_replicas_avg = (sum(len(a.replicas) for a in result.assignments) / n_tiles
                         if n_tiles > 0 else 0.0)
 
-    # Helper utilization: fraction of total constellation compute used
+    # Helper utilization: fraction of the constellation's compute budget the
+    # scheduled work consumes. Numerator is actual compute cycles (each replica
+    # runs its tile's compute_ops on the helper); denominator is the summed
+    # per-satellite capacity C_i·epoch_length passed by the caller (horizon-wide
+    # when the assignment set is a lifetime record). Both sides are in cycles,
+    # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
     compute_used = sum(
-        sum(r.e_compute for r in a.replicas)
+        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops * len(a.replicas)
         for a in result.assignments
+        if (a.task_id, a.tile_id) in tile_lookup
     )
-    # Convert energy back to compute cycles: e = P * t; t = cycles / C
-    # approximate: utilization = compute_used_energy / (total_capacity_cycles * P_per_cycle)
-    m.helper_utilization = min(1.0, compute_used / max(total_capacity * 1e-9, 1e-9))
+    m.helper_utilization = (min(1.0, compute_used / total_capacity)
+                            if total_capacity > 0 else 0.0)
 
     return m
 

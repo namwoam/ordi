@@ -187,7 +187,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     the realized_* fields report delivery outcomes the modeled z_kv assumes
     away.  Hard outages already pruned infeasible candidates during scheduling;
     this layer adds the soft stochastic loss the reliability model specifies."""
-    sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S for s in sat_ids}
+    # Compute budget over the full horizon (cycles): the final assignment set is
+    # a lifetime record spanning all epochs, so helper_utilization divides the
+    # cycles it consumes by each satellite's C_i·epoch_length summed over N_EPOCHS.
+    sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S * N_EPOCHS for s in sat_ids}
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], TileAssignment] = {}
 
@@ -265,7 +268,7 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     # ground_contact_miss and isl_disruption mutate epoch graph edges;
     # deepcopy graphs when either is present to keep the shared object clean.
     _GRAPH_MUTATING = {"ground_contact_miss", "isl_disruption"}
-    mutates_graph = any(f.fault_type in _GRAPH_MUTATING for f in faults)
+    mutates_graph = any(f.fault_type in _GRAPH_MUTATING for f in (faults or []))
     local_graphs = deepcopy(graphs) if mutates_graph else graphs
 
     injector = None

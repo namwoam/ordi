@@ -89,22 +89,27 @@ the config table (Seeds 1→12) updated accordingly.
 
 ---
 
-## 5. Helper-utilization metric is dimensionally broken
+## 5. Helper-utilization metric is dimensionally broken — **FIXED**
 
-**Where:** `ordi/eval/metrics.py:107-115`
+**Where:** `ordi/eval/metrics.py` (`compute_metrics`).
 
-```python
-# Convert energy back to compute cycles ... approximate
-m.helper_utilization = min(1.0, compute_used / max(total_capacity * 1e-9, 1e-9))
-```
+The old metric divided summed **energy (J)** by **capacity cycles × 1e-9** — a
+dimensional mismatch the comment admitted was "approximate".
 
-Divides summed **energy (J)** by **compute-capacity cycles × 1e-9**; the comment
-admits it's approximate. The `Util%` column in Table VIII is not a trustworthy
-quantity.
+**Fix applied:** the numerator now sums actual compute cycles
+(`tile.compute_ops × len(replicas)` per assignment); the denominator is the
+per-satellite compute budget `C_i·epoch_length` summed over the horizon
+(`_simulate_stateful` multiplies by `N_EPOCHS` since the final assignment set is
+a lifetime record). Both sides are in cycles, so the ratio is dimensionless.
+Recomputed Util% is ~5e-5 for ORDI — EO inference is compute-light against the
+full constellation budget — with the expected ordering preserved (full-
+replication B6–B8 highest, direct-downlink B1 zero). E1 regenerated. Also fixed
+a latent crash on the no-faults path (`_parallel_run_algorithm` iterated
+`faults` unconditionally, breaking E1/COTS after the graph-mutation change in
+`4d9bd6d`).
 
-**Fix:** track actual compute cycles (or compute-seconds) used per helper and
-divide by `C_i · epoch_length` summed over the horizon. Recompute the Util%
-column for Table VIII.
+**Paper follow-up (not yet done):** Table VIII's Util% column still shows the
+old ~0.01 values; update from the regenerated `results/E1_core.csv`.
 
 ---
 
