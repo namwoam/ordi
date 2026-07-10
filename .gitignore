@@ -224,3 +224,13 @@ __marimo__/
 # The small reduced real-pipeline caches under data/ (CelesTrak TLEs, Sentinel-2 STAC,
 # FIRMS fires, reduced telemetry) ARE tracked so the real pipeline is reproducible offline.
 data/MobiCom24-SatelliteCOTS/
+
+# LaTeX build artifacts (paper/main.pdf is the tracked deliverable, kept explicitly).
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
