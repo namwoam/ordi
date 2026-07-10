@@ -42,14 +42,14 @@ def build_synthetic_walker(n_planes: int = 6, sats_per_plane: int = 6,
     Returns EarthSatellite objects constructed directly via sgp4.
 
     epoch_str is accepted for API compatibility but ignored. The SGP4 epoch
-    is always fixed to 1970-01-01 (t_start_unix=0) so that both backends
-    place satellites at the same initial position. Pass a non-default value
-    only if you update the internal epoch logic accordingly.
+    is always fixed to 1970-01-01 (t_start_unix=0) so satellites are placed at a
+    deterministic initial position. Pass a non-default value only if you update
+    the internal epoch logic accordingly.
     """
     if epoch_str != "2024-01-01":
         raise ValueError(
-            f"epoch_str={epoch_str!r} is not supported by the skyfield backend; "
-            "the epoch is locked to 1970-01-01 to align with the brahe backend."
+            f"epoch_str={epoch_str!r} is not supported; "
+            "the epoch is locked to 1970-01-01."
         )
     from sgp4.api import Satrec, WGS84
 
@@ -74,7 +74,7 @@ def build_synthetic_walker(n_planes: int = 6, sats_per_plane: int = 6,
                 'i',          # opsmode
                 0,            # satnum
                 7306.0,       # epoch = 1970-01-01 (days from 1949-12-31), matches t_start_unix=0
-                0.0,          # bstar drag — zero to match brahe's Keplerian propagator
+                0.0,          # bstar drag — zero for an ideal Keplerian orbit
                 0.0,          # ndot
                 0.0,          # nddot
                 0.001,        # ecco (near-circular)
