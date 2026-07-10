@@ -94,12 +94,17 @@ def build_tiles(
     n_tiles_side: int,
     n_replicas_max: int,
     rng: random.Random,
+    utility_scale: float = 1.0,
 ) -> List[Tile]:
     """Build the n_tiles_side × n_tiles_side tile grid for one task.
 
     Center tiles get slightly higher utility; per-tile data sizes and compute
     demand are perturbed ±10–15% to model spatial variation.  Shared by the
     synthetic generator and the real-acquisition loader.
+
+    utility_scale multiplies every tile's base utility, letting a real-request
+    loader fold measured event importance (e.g. fire radiative power) into the
+    priority of the task.
     """
     tiles: List[Tile] = []
     center = (n_tiles_side - 1) / 2.0
@@ -108,7 +113,7 @@ def build_tiles(
             dist_from_center = math.sqrt((row - center) ** 2 + (col - center) ** 2)
             max_dist = math.sqrt(2) * center
             spatial_weight = 1.0 + 0.3 * (1.0 - dist_from_center / max(max_dist, 1e-6))
-            u = profile.base_utility * spatial_weight * rng.uniform(0.9, 1.1)
+            u = profile.base_utility * spatial_weight * utility_scale * rng.uniform(0.9, 1.1)
 
             tiles.append(Tile(
                 task_id=task_id,

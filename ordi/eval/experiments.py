@@ -854,26 +854,25 @@ _REAL_DEADLINE_SLACK = 600.0
 _REAL_STAC_LIMIT = 800
 
 
-def _build_sim_real():
+def _build_sim_real(task_source="fire"):
     """Build the REAL, seed-independent parts of the environment ONCE.
 
     Everything here is real measured data with no random component:
       - Orbits: real Planet (Flock/SkySat) TLEs from CelesTrak, RAAN-clustered
         into SAT_<plane>_<idx> planes; real contact windows over a current UTC
         window; real groundtracks.
-      - Acquisitions: real Sentinel-2 captures (timestamp+geolocation) from STAC.
+      - Requests: real NASA FIRMS active-fire detections (task_source="fire"),
+        real Sentinel-2 captures ("acquisition"), or both.
       - Telemetry: the real BUPT-1 60 s trace.
 
-    The per-seed random elements (task type→profile sampling, source-satellite
-    choice among the in-FOV set, per-tile jitter, telemetry phase offsets, and
-    Monte-Carlo reliability draws) are applied later in run_REAL — the real data
-    does not label task type or provide 24 distinct satellites, so those residual
-    choices are sampled and averaged over seeds. See run_REAL's docstring.
+    FIRMS fires carry full request semantics (type=wildfire, FRP urgency), so
+    only the source-satellite choice, tile jitter, telemetry phase offset, and
+    Monte-Carlo draws stay sampled. Sentinel-2 captures supply only when+where,
+    so their type is additionally sampled. See run_REAL's docstring.
 
     Returns the shared real inputs plus a provenance dict for the banner.
     """
     from ordi.orbit.real_tles import load_planet_constellation
-    from ordi.tasks.real_acquisitions import fetch_sentinel2_acquisitions
     from ordi.sim.telemetry_replay import load_bupt1_telemetry
 
     w0 = _REAL_WINDOW_START.timestamp()
@@ -903,48 +902,67 @@ def _build_sim_real():
 
     sat_groundtrack = compute_sat_groundtracks(sats, w0, w_end, dt_seconds=60.0)
 
-    # STAC datetime range covering the sim window.
-    dt_range = (f"{_REAL_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
-                f"{datetime.fromtimestamp(w_end, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
-    print(f"  Fetching Sentinel-2 acquisitions {dt_range} ...")
-    acqs = fetch_sentinel2_acquisitions(dt_range, limit=_REAL_STAC_LIMIT)
-    print(f"  {len(acqs)} Sentinel-2 acquisitions")
+    fires = []
+    acqs = []
+    if task_source in ("fire", "both"):
+        from ordi.tasks.real_requests import fetch_fire_requests
+        start_date = _REAL_WINDOW_START.strftime("%Y-%m-%d")
+        print(f"  Fetching FIRMS active-fire requests for {start_date} ...")
+        fires = fetch_fire_requests(start_date, days=1)
+        print(f"  {len(fires)} fire detections")
+    if task_source in ("acquisition", "both"):
+        from ordi.tasks.real_acquisitions import fetch_sentinel2_acquisitions
+        dt_range = (f"{_REAL_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
+                    f"{datetime.fromtimestamp(w_end, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        print(f"  Fetching Sentinel-2 acquisitions {dt_range} ...")
+        acqs = fetch_sentinel2_acquisitions(dt_range, limit=_REAL_STAC_LIMIT)
+        print(f"  {len(acqs)} Sentinel-2 acquisitions")
 
     trace = load_bupt1_telemetry()
     reliability = ReliabilityModel()
     cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
 
     provenance = {
+        "task_source": task_source,
         "n_sats": len(sats), "n_contacts": len(contacts),
-        "n_acqs": len(acqs),
+        "n_fires": len(fires), "n_acqs": len(acqs),
         "telemetry_span": f"{trace.span_start} → {trace.span_end}",
         "telemetry_samples": len(trace),
         "window": str(_REAL_WINDOW_START.date()),
     }
-    return (sat_ids, gs_names, graphs, sat_groundtrack, acqs, trace,
+    return (sat_ids, gs_names, graphs, sat_groundtrack, fires, acqs, trace,
             reliability, cfg, name_map, provenance)
 
 
-def run_REAL(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
-    """Full real-data pipeline: real Planet orbits + Sentinel-2 acquisitions +
+def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetrics]]:
+    """Full real-data pipeline: real Planet orbits + real tasking requests +
     BUPT-1 telemetry replay. Complements (does not replace) the synthetic
     E1–E8 experiments.
+
+    task_source:
+      "fire"        NASA FIRMS active-fire detections as tasking requests
+                    (default). A fire is a genuine "image here, now, urgently"
+                    event, so type (wildfire) and urgency (fire radiative power)
+                    are REAL, not sampled.
+      "acquisition" Sentinel-2 captures — real when+where only; type is sampled.
+      "both"        union of the two.
 
     ORDI + the E1 baseline set are compared on identical real inputs, so the
     numbers are directly comparable to the synthetic core comparison.
 
     What is REAL (measured, seed-independent):
       - orbital geometry / ISL + downlink contact windows (Planet TLEs, CelesTrak)
-      - task arrival timing and location (Sentinel-2 acquisitions, AWS STAC)
+      - task arrival timing and location (FIRMS fires and/or Sentinel-2, real)
+      - for fires: task type (wildfire) and urgency/priority (FRP) — real
       - battery-SOC and chip-temperature trajectories (BUPT-1 telemetry)
       - fixed payload hardware constants (Atlas 200DK measured params)
 
     What is still SAMPLED per seed (the real data cannot supply it), hence the
     seed loop and error bars:
-      1. task type -> compute/utility/deadline profile: Sentinel-2 metadata has
-         no wildfire/ship/cloud/change label, so type is drawn from PROFILES;
-      2. source satellite among those in FOV of each real acquisition;
-      3. per-tile size/compute jitter and the log-normal deadline draw;
+      1. task type -> profile: ONLY for Sentinel-2 acquisitions (no label);
+         FIRMS fires are always wildfire, so this vanishes under task_source="fire".
+      2. source satellite among those in FOV / the earliest covering pass;
+      3. per-tile size/compute jitter and the log-normal deadline spread;
       4. per-satellite telemetry phase offset (one real satellite stands in for
          the whole constellation);
       5. Monte-Carlo reliability draws for the realized-delivery metrics.
@@ -952,11 +970,12 @@ def run_REAL(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     """
     from ordi.sim.telemetry_replay import make_telemetry_state_driver
     from ordi.tasks.real_acquisitions import acquisitions_to_tasks
+    from ordi.tasks.real_requests import fire_requests_to_tasks
 
-    print(f"REAL: real orbits (Planet/CelesTrak) + tasks (Sentinel-2/STAC) + "
+    print(f"REAL: real orbits (Planet/CelesTrak) + tasks ({task_source}) + "
           f"telemetry (BUPT-1), {n_seeds} seeds")
-    (sat_ids, gs_names, graphs, sat_groundtrack, acqs, trace, reliability, cfg,
-     name_map, prov) = _build_sim_real()
+    (sat_ids, gs_names, graphs, sat_groundtrack, fires, acqs, trace, reliability,
+     cfg, name_map, prov) = _build_sim_real(task_source=task_source)
 
     print("  ── provenance ──")
     for k, v in prov.items():
@@ -966,14 +985,30 @@ def run_REAL(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
     results: Dict[str, List[EpochMetrics]] = {alg: [] for alg, _ in alg_classes}
 
+    def _build_tasks(sd):
+        # Rebuild tasks per seed so the sampled elements (source, jitter, and —
+        # for acquisitions — type) vary and the error bars are meaningful.
+        out = []
+        if fires:
+            out += fire_requests_to_tasks(
+                fires, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
+                deadline_slack_s=_REAL_DEADLINE_SLACK,
+                fov_range_km=_REAL_FOV_RANGE_KM, seed=sd)
+        if acqs:
+            base = len(out)
+            acq_tasks = acquisitions_to_tasks(
+                acqs, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
+                deadline_slack_s=_REAL_DEADLINE_SLACK,
+                fov_range_km=_REAL_FOV_RANGE_KM, seed=sd)
+            for i, t in enumerate(acq_tasks):  # keep task_ids unique across sources
+                t.task_id = base + i
+                for tile in t.tiles:
+                    tile.task_id = t.task_id
+            out += acq_tasks
+        return out
+
     for s in tqdm(range(n_seeds), desc="REAL seeds", unit="seed"):
-        # Rebuild tasks from the SAME real acquisitions per seed so the sampled
-        # elements (type, source, jitter) vary and the error bars are meaningful.
-        tasks = acquisitions_to_tasks(
-            acqs, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
-            deadline_slack_s=_REAL_DEADLINE_SLACK, fov_range_km=_REAL_FOV_RANGE_KM,
-            seed=seed + s,
-        )
+        tasks = _build_tasks(seed + s)
         states = make_constellation_states(
             sat_ids, seed=seed + s, params_factory=atlas_200dk_bupt1_params)
         driver = make_telemetry_state_driver(trace, sat_ids, seed=seed + s)
