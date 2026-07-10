@@ -220,8 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 .claude/
 
-# MobiCom24 SatelliteCOTS measurement dataset (cloned locally, not redistributed)
+# MobiCom24 SatelliteCOTS measurement dataset (cloned locally, ~1.5 GB, not redistributed).
+# The small reduced real-pipeline caches under data/ (CelesTrak TLEs, Sentinel-2 STAC,
+# FIRMS fires, reduced telemetry) ARE tracked so the real pipeline is reproducible offline.
 data/MobiCom24-SatelliteCOTS/
-
-# Real-pipeline caches (regenerable: CelesTrak TLEs, Sentinel-2 STAC, reduced telemetry)
-data/
