@@ -850,7 +850,14 @@ _REAL_N_PLANES = 6
 _REAL_MAX_SATS = 24            # cap constellation size for tractable contact calc
 _REAL_FOV_RANGE_KM = 600.0     # realistic EO swath half-width
 _REAL_MIN_ELEV_DEG = 25.0      # match the stressed E1 ground-segment
-_REAL_DEADLINE_SLACK = 600.0
+# Deadline scale for real wildfire delivery. The wildfire profile median is 300 s,
+# scaled by slack/600, so 3600 → a 30-min median for a calm fire; the FRP
+# tightening in real_requests.py pulls intense fires down to ~12 min. This brackets
+# operational wildfire-alert delivery latencies: OroraTech <10 min (dedicated,
+# onboard), India NRT 15–30 min, NASA EOSDIS "real-time" ≤60 min, practical alert
+# delivery 30 min–2 h. The original 600 (≈5 min, ≈2 min tightened) was tighter than
+# every fielded system and made the ground segment the sole binding constraint.
+_REAL_DEADLINE_SLACK = 3600.0
 _REAL_STAC_LIMIT = 800
 
 
