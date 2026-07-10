@@ -70,6 +70,94 @@ class EOTask:
 _DEADLINE_SCALE_BASE = 600.0  # reference scale for deadline_slack_s
 
 
+def draw_deadline(
+    profile: TileProfile,
+    release_time: float,
+    deadline_slack_s: float,
+    deadline_lognorm_sigma: float,
+    rng: random.Random,
+) -> float:
+    """Absolute deadline for a task: release + a log-normal draw around the
+    type-specific median scaled by deadline_slack_s.  Shared by the synthetic
+    Poisson generator and the real-acquisition loader so both use one model."""
+    type_median = profile.deadline_median_s * (deadline_slack_s / _DEADLINE_SCALE_BASE)
+    if deadline_lognorm_sigma > 0.0:
+        slack = max(type_median * math.exp(rng.gauss(0.0, deadline_lognorm_sigma)), 60.0)
+    else:
+        slack = type_median
+    return release_time + slack
+
+
+def build_tiles(
+    task_id: int,
+    profile: TileProfile,
+    n_tiles_side: int,
+    n_replicas_max: int,
+    rng: random.Random,
+) -> List[Tile]:
+    """Build the n_tiles_side × n_tiles_side tile grid for one task.
+
+    Center tiles get slightly higher utility; per-tile data sizes and compute
+    demand are perturbed ±10–15% to model spatial variation.  Shared by the
+    synthetic generator and the real-acquisition loader.
+    """
+    tiles: List[Tile] = []
+    center = (n_tiles_side - 1) / 2.0
+    for row in range(n_tiles_side):
+        for col in range(n_tiles_side):
+            dist_from_center = math.sqrt((row - center) ** 2 + (col - center) ** 2)
+            max_dist = math.sqrt(2) * center
+            spatial_weight = 1.0 + 0.3 * (1.0 - dist_from_center / max(max_dist, 1e-6))
+            u = profile.base_utility * spatial_weight * rng.uniform(0.9, 1.1)
+
+            tiles.append(Tile(
+                task_id=task_id,
+                tile_id=len(tiles),
+                profile=profile,
+                d_in_bits=profile.d_in_bits * rng.uniform(0.9, 1.1),
+                d_out_bits=profile.d_out_bits * rng.uniform(0.9, 1.1),
+                compute_ops=profile.compute_ops * rng.uniform(0.85, 1.15),
+                utility=u,
+                row=row,
+                col=col,
+                n_replicas_max=n_replicas_max,
+            ))
+    return tiles
+
+
+def sat_over_target(
+    sat_ids: List[str],
+    lat: float,
+    lon: float,
+    pos_at,
+    fov_range_km: float,
+) -> List[str]:
+    """Satellites whose sub-satellite point is within fov_range_km of (lat, lon).
+    pos_at(sat_id) -> (lat_deg, lon_deg) resolves the satellite's position at the
+    caller's time of interest.  Shared FOV gate for both task sources."""
+    visible = []
+    for sid in sat_ids:
+        s_lat, s_lon = pos_at(sid)
+        if _haversine_km(lat, lon, s_lat, s_lon) <= fov_range_km:
+            visible.append(sid)
+    return visible
+
+
+def groundtrack_lookup(sat_groundtrack: Dict[str, List[Tuple[float, float, float]]]):
+    """Return a nearest-sample position lookup pos_at(sat_id, t) -> (lat, lon)
+    over a {sat_id: [(t, lat, lon), ...]} groundtrack sampled at regular steps."""
+    sample_ts = next(iter(sat_groundtrack.values()))
+    gt_dt = sample_ts[1][0] - sample_ts[0][0] if len(sample_ts) >= 2 else 1.0
+    gt_n = len(sample_ts)
+
+    def pos_at(sat_id: str, t: float) -> Tuple[float, float]:
+        track = sat_groundtrack[sat_id]
+        idx = min(max(0, int(round(t / gt_dt))), gt_n - 1)
+        return track[idx][1], track[idx][2]
+
+    return pos_at
+
+
 def generate_tasks(
     sat_ids: List[str],
     sim_duration_s: float,
@@ -126,19 +214,7 @@ def generate_tasks(
     lam = arrival_rate_per_orbit / orbit_period_s  # tasks per second
 
     # Build a time→index lookup for the groundtrack (O(1) per event)
-    gt_dt: float = 0.0
-    gt_n: int = 0
-    if sat_groundtrack:
-        sample_ts = next(iter(sat_groundtrack.values()))
-        if len(sample_ts) >= 2:
-            gt_dt = sample_ts[1][0] - sample_ts[0][0]
-            gt_n = len(sample_ts)
-
-    def _sat_pos_at(sat_id: str, t: float) -> Tuple[float, float]:
-        """Nearest-sample lat/lon for sat at time t."""
-        track = sat_groundtrack[sat_id]
-        idx = min(max(0, int(round(t / gt_dt))), gt_n - 1)
-        return track[idx][1], track[idx][2]
+    pos_at = groundtrack_lookup(sat_groundtrack) if sat_groundtrack else None
 
     tasks: List[EOTask] = []
     t = 0.0
@@ -159,7 +235,7 @@ def generate_tasks(
             # that skips ~94% of events when per-target coverage is ~5%.
             visible = []
             for sid in sat_ids:
-                s_lat, s_lon = _sat_pos_at(sid, t)
+                s_lat, s_lon = pos_at(sid, t)
                 if any(_haversine_km(g_lat, g_lon, s_lat, s_lon) <= fov_range_km
                        for g_lat, g_lon in ground_targets):
                     visible.append(sid)
@@ -174,49 +250,16 @@ def generate_tasks(
         ttype = rng.choices(types, weights=weights, k=1)[0]
         profile = PROFILES[ttype]
 
-        # Per-task deadline from type-specific median scaled by deadline_slack_s.
-        # Log-normal with σ=deadline_lognorm_sigma produces a right-skewed
-        # distribution matching empirical cluster-job deadline patterns.
-        type_median = profile.deadline_median_s * (deadline_slack_s / _DEADLINE_SCALE_BASE)
-        if deadline_lognorm_sigma > 0.0:
-            slack = max(type_median * math.exp(rng.gauss(0.0, deadline_lognorm_sigma)), 60.0)
-        else:
-            slack = type_median
         task = EOTask(
             task_id=task_id,
             source_sat=src,
             release_time=t,
-            deadline=t + slack,
+            deadline=draw_deadline(profile, t, deadline_slack_s,
+                                   deadline_lognorm_sigma, rng),
             task_type=ttype,
             n_tiles_side=n_tiles_side,
         )
-
-        # Generate tiles with spatial utility variation
-        # Center tiles (closer to image center) get slightly higher utility
-        tiles = []
-        center = (n_tiles_side - 1) / 2.0
-        for row in range(n_tiles_side):
-            for col in range(n_tiles_side):
-                dist_from_center = math.sqrt((row - center) ** 2 + (col - center) ** 2)
-                max_dist = math.sqrt(2) * center
-                spatial_weight = 1.0 + 0.3 * (1.0 - dist_from_center / max(max_dist, 1e-6))
-                u = profile.base_utility * spatial_weight * rng.uniform(0.9, 1.1)
-
-                tile = Tile(
-                    task_id=task_id,
-                    tile_id=len(tiles),
-                    profile=profile,
-                    d_in_bits=profile.d_in_bits * rng.uniform(0.9, 1.1),
-                    d_out_bits=profile.d_out_bits * rng.uniform(0.9, 1.1),
-                    compute_ops=profile.compute_ops * rng.uniform(0.85, 1.15),
-                    utility=u,
-                    row=row,
-                    col=col,
-                    n_replicas_max=n_replicas_max,
-                )
-                tiles.append(tile)
-
-        task.tiles = tiles
+        task.tiles = build_tiles(task_id, profile, n_tiles_side, n_replicas_max, rng)
         tasks.append(task)
         task_id += 1
 
