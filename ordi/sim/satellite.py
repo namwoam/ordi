@@ -21,6 +21,7 @@ DEFAULT_SOLAR_POWER_W       = 8.0        # average harvested power (sunlit fract
 DEFAULT_IDLE_POWER_W        = 3.0        # platform power when not computing
 DEFAULT_COMPUTE_POWER_W     = 15.0       # incremental power during full compute
 DEFAULT_COMMS_POWER_W       = 5.0        # incremental ISL/downlink Tx power
+DEFAULT_DOWNLINK_RATE_BPS   = 100e6      # 100 Mbps RF ground downlink
 DEFAULT_THERMAL_RC          = 300.0      # thermal time constant (seconds)
 DEFAULT_THERMAL_AMBIENT_C   = 20.0       # effective ambient (radiative sink)
 
@@ -157,9 +158,18 @@ class SatelliteState:
         rx_power_w = self.params.comms_power_w * 0.4
         return rx_power_w * (bits / max(200e6, 1.0))
 
-    def energy_for_tx(self, bits: float) -> float:
-        """Joules to transmit `bits`."""
-        return self.params.comms_power_w * (bits / max(200e6, 1.0))
+    def energy_for_tx(self, bits: float, rate_bps: float = 200e6) -> float:
+        """Joules to transmit ``bits`` at ``rate_bps``.
+
+        ISLs use the historical 200 Mbps default.  Ground downlinks pass the
+        100 Mbps contact rate explicitly; keeping the rate in this calculation
+        avoids making a raw-image downlink look energetically free.
+        """
+        return self.params.comms_power_w * (bits / max(rate_bps, 1.0))
+
+    def energy_for_downlink(self, bits: float) -> float:
+        """Joules to transmit ``bits`` over the modeled ground downlink."""
+        return self.energy_for_tx(bits, DEFAULT_DOWNLINK_RATE_BPS)
 
     def thermal_increase(self, cycles: float, epoch_length_s: float) -> float:
         """Approximate chip temperature increase (°C) from compute load."""

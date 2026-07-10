@@ -218,7 +218,14 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
         objective=0.0, link_utilization={},
     )
-    m = compute_metrics(res, tasks, 0.0, sat_cap, cfg.alpha)
+    # Use the actual constellation radio profile (measurement-backed in COTS)
+    # rather than silently falling back to the synthetic 5 W default.
+    downlink_power_w = (sum(s.params.comms_power_w for s in states.values())
+                        / len(states) if states else 0.0)
+    m = compute_metrics(
+        res, tasks, 0.0, sat_cap, cfg.alpha,
+        downlink_power_w=downlink_power_w,
+    )
     r_total = sum(max(0, len(a.replicas) - 1) for a in final)
     m.objective = (m.delivered_utility
                    - cfg.lambda_E * m.energy_joules

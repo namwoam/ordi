@@ -131,6 +131,7 @@ class DirectDownlink:
                 a.primary_aggregator = src
                 a.z_kv = z_kv
                 a.L_hat = ell_down if feasible else math.inf
+                a.downlink_bits = tile.d_in_bits
                 assignments.append(a)
                 if feasible:
                     total_utility += tile.utility * z_kv * math.exp(-cfg.alpha * ell_down)
@@ -251,6 +252,7 @@ class CompressionOnly:
                 a.primary_aggregator = src
                 a.z_kv = z_kv
                 a.L_hat = ell_down if feasible else math.inf
+                a.downlink_bits = compressed_bits
                 if feasible:
                     # Compression compute is ~10% of full inference cost
                     a.replicas = [ReplicaCandidate(

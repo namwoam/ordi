@@ -151,7 +151,7 @@ Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at
 
 \textbf{Baselines.} B1 direct downlink (bent pipe, no inference); B2 onboard-only; B3 onboard with $0.15\times$ output compression; B4 Serval-like priority bifurcation, one satellite per task~\cite{tao2024serval}; B5 SECO-like multi-satellite placement without redundancy~\cite{seco}; B6 full replication to $r_{\max}$ helpers~\cite{dean2013tail}; B7 random-helper replication; B8 CoCoI-like MDS-coded redundancy adapted to contact windows~\cite{cocoi,lee2018codes}. All baselines share \ordi{}'s contact graphs, state model, and routing caches.
 
-\textbf{Metrics.} Deadline miss ratio (primary), delivered utility per \eqref{eq:objective}'s first term, partial task coverage, recovery latency, ISL traffic, energy, and mean replicas per tile.
+\textbf{Metrics.} Deadline miss ratio (primary), delivered utility per \eqref{eq:objective}'s first term, partial task coverage, recovery latency, ISL traffic, energy, and mean replicas per tile. Energy includes onboard compute, ISL communication, and spacecraft-to-ground transmission; the latter is charged as transmit power times airtime at the modeled 100\,Mbps downlink rate, consistent with demonstrated high-rate CubeSat links surveyed by NASA~\cite{nasa2026comms}. Thus B1 pays to transmit raw tile inputs, while inference methods transmit compact outputs.
 
 \subsection{Core Comparison}
 \label{sec:e1}
@@ -159,14 +159,14 @@ Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{E1_core.png}
-\caption{Core comparison over 30 seeds (no injected faults beyond baseline stochastic link/node loss). \ordi{} attains the best delivered utility and ties the best miss ratio at near-minimal redundancy.}
+\caption{Core comparison over 60 seeds (no injected faults beyond baseline stochastic link/node loss). \ordi{} attains the best delivered utility and ties the best miss ratio at near-minimal redundancy.}
 \label{fig:e1}
 \end{figure*}
 
-Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.5\% of deadlines, confirming that bent-pipe delivery is not viable at this ground-segment scale. Onboard-only (B2--B4 cluster) reaches 26.8\% misses, limited by source compute and source-local downlink geometry. Distributed schedulers (\ordi{}, B5--B8) cut misses to 21.7\%. Within that group the distinctions are cost and utility: \ordi{} delivers the highest utility ($156.7 \pm 37.2$) at 1.09 replicas/tile and 307\,J, whereas full replication needs 1.56 replicas and 450\,J (+47\% energy, $3.5\times$ ISL traffic) to deliver \emph{less} utility ($151.6$), the freshness discount penalizing its slower redundant paths. Selective redundancy is not merely cheaper; under \eqref{eq:objective} it is better.
+Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.1\% of deadlines, confirming that bent-pipe delivery is not viable at this ground-segment scale. Onboard-only (B2--B4 cluster) reaches 27.3\% misses, limited by source compute and source-local downlink geometry. Distributed schedulers (\ordi{}, B5--B8) cut misses to 21.7\%. Within that group the distinctions are cost and utility: \ordi{} delivers the highest utility ($160.1 \pm 35.0$) at 1.10 replicas/tile and 309\,J, whereas full replication needs 1.56 replicas and 452\,J (+46\% energy, $3.5\times$ ISL traffic) to deliver \emph{less} utility ($156.4$), the freshness discount penalizing its slower redundant paths. Selective redundancy is not merely cheaper; under \eqref{eq:objective} it is better.
 
 \begin{table}[t]
-\caption{Core comparison results, mean over 30 seeds.}
+\caption{Core comparison results, mean over 60 seeds.}
 \label{tab:e1}
 \centering
 \small
@@ -174,15 +174,15 @@ Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.5\
 \toprule
 Algorithm & Miss ratio & Utility & Replicas & Energy (J)\\
 \midrule
-B1 direct      & 0.955 & 6.5   & 0    & 0\\
-B2 onboard     & 0.268 & 135.4 & 0.73 & 212\\
-B3 compress    & 0.268 & 138.2 & 0.73 & 21\\
-B4 Serval-like & 0.268 & 135.3 & 0.73 & 212\\
-B5 SECO-like   & 0.217 & 142.7 & 0.78 & 226\\
-B6 full repl.  & 0.217 & 151.6 & 1.56 & 450\\
-B7 random repl.& 0.217 & 142.7 & 1.57 & 455\\
-B8 CoCoI-like  & 0.217 & 151.8 & 1.57 & 453\\
-\textbf{\ordi{}} & \textbf{0.217} & \textbf{156.7} & \textbf{1.09} & \textbf{307}\\
+B1 direct      & 0.951 & 8.0   & 0    & 0.41\\
+B2 onboard     & 0.273 & 137.2 & 0.73 & 211\\
+B3 compress    & 0.273 & 140.0 & 0.73 & 21.9\\
+B4 Serval-like & 0.273 & 137.1 & 0.73 & 211\\
+B5 SECO-like   & 0.217 & 145.9 & 0.78 & 228\\
+B6 full repl.  & 0.217 & 156.4 & 1.56 & 452\\
+B7 random repl.& 0.217 & 145.9 & 1.57 & 456\\
+B8 CoCoI-like  & 0.217 & 156.5 & 1.57 & 454\\
+\textbf{\ordi{}} & \textbf{0.217} & \textbf{160.1} & \textbf{1.10} & \textbf{309}\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -287,7 +287,7 @@ We see three immediate extensions. First, hardware-in-the-loop calibration: repl
 \appendices
 
 \begin{table*}[!t]
-\caption{Complete core-comparison results, mean over 30 seeds. Cvg.\ = partial coverage; Rec.\ = recovery latency; Util\% = helper utilization; Obj.\ = realized objective; Repl.\ = mean replicas per tile.}
+\caption{Complete core-comparison results, mean over 60 seeds. Cvg.\ = partial coverage; Rec.\ = recovery latency; Util\% = helper utilization; Obj.\ = realized objective; Repl.\ = mean replicas per tile.}
 \label{tab:e1full}
 \centering
 \small
@@ -295,15 +295,15 @@ We see three immediate extensions. First, hardware-in-the-loop calibration: repl
 \toprule
 Algorithm & Miss & Utility & Cvg. & Rec.\ (s) & ISL (Mb) & Downlink (Mb) & Energy (J) & Util\% & Obj. & Repl.\\
 \midrule
-B1 direct       & 0.955 & 6.5   & 0.045 & 346.8 & 0     & 0     & 0     & 0    & 6.5   & 0\\
-B2 onboard      & 0.268 & 135.4 & 0.732 & 228.6 & 0     & 0     & 211.6 & 0.73 & 135.4 & 0.73\\
-B3 compress     & 0.268 & 138.2 & 0.732 & 228.6 & 0     & 0     & 21.2  & 0.07 & 138.2 & 0.73\\
-B4 Serval-like  & 0.268 & 135.3 & 0.732 & 229.0 & 0     & 0     & 211.6 & 0.73 & 135.3 & 0.73\\
-B5 SECO-like    & 0.217 & 142.7 & 0.783 & 195.6 & 135.2 & 0.25  & 226.5 & 0.78 & 142.7 & 0.78\\
-B6 full repl.   & 0.217 & 151.6 & 0.783 & 240.6 & 268.5 & 0.22  & 450.0 & 1.55 & 138.1 & 1.56\\
-B7 random repl. & 0.217 & 142.7 & 0.783 & 271.9 & 348.4 & 39.25 & 454.9 & 1.56 & 129.1 & 1.57\\
-B8 CoCoI-like   & 0.217 & 151.8 & 0.783 & 240.5 & 270.7 & 0.22  & 453.0 & 1.56 & 138.2 & 1.57\\
-\textbf{\ordi{}} & \textbf{0.217} & \textbf{156.7} & \textbf{0.783} & \textbf{193.9} & \textbf{76.1} & \textbf{0} & \textbf{307.0} & \textbf{1.06} & \textbf{151.3} & \textbf{1.09}\\
+B1 direct       & 0.951 & 8.0   & 0.049 & 305.6 & 0     & 8.27  & 0.41  & 0    & 8.0   & 0\\
+B2 onboard      & 0.273 & 137.2 & 0.727 & 222.6 & 0     & 40.19 & 211.5 & 0.003 & 137.2 & 0.73\\
+B3 compress     & 0.273 & 140.0 & 0.727 & 222.6 & 0     & 18.74 & 21.9  & 0.003 & 140.0 & 0.73\\
+B4 Serval-like  & 0.273 & 137.1 & 0.727 & 223.0 & 0     & 40.19 & 211.5 & 0.003 & 137.1 & 0.73\\
+B5 SECO-like    & 0.217 & 145.9 & 0.783 & 192.7 & 135.3 & 41.74 & 228.0 & 0.004 & 145.9 & 0.78\\
+B6 full repl.   & 0.217 & 156.4 & 0.783 & 229.9 & 269.3 & 41.74 & 452.0 & 0.007 & 142.7 & 1.56\\
+B7 random repl. & 0.217 & 145.9 & 0.783 & 268.0 & 349.7 & 41.74 & 455.9 & 0.007 & 132.1 & 1.57\\
+B8 CoCoI-like   & 0.217 & 156.5 & 0.783 & 229.8 & 270.8 & 41.74 & 453.9 & 0.007 & 142.7 & 1.57\\
+\textbf{\ordi{}} & \textbf{0.217} & \textbf{160.1} & \textbf{0.783} & \textbf{191.7} & \textbf{77.6} & \textbf{41.74} & \textbf{309.4} & \textbf{0.005} & \textbf{154.5} & \textbf{1.10}\\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -385,7 +385,7 @@ Change & Siamese CNN & 96\,kB & 10\,kB & 1.8 & 0.9 & 480\\
 \section{Complete Core-Comparison Results}
 \label{app:full-e1}
 
-Table~\ref{tab:e1full} reports all ten metrics of the core comparison, mean over 30 seeds (Table~\ref{tab:e1} shows the headline columns). Note B6--B8 lose 9--14 objective points to the replication and congestion penalties of \eqref{eq:objective} that \ordi{} largely avoids.
+Table~\ref{tab:e1full} reports all ten metrics of the core comparison, mean over 60 seeds (Table~\ref{tab:e1} shows the headline columns). Note B6--B8 lose 9--14 objective points to the replication and congestion penalties of \eqref{eq:objective} that \ordi{} largely avoids.
 
 
 \section{Fault Injection Details}
@@ -417,7 +417,7 @@ Table~\ref{tab:configs} gives the exact configuration of every experiment. All s
 \toprule
 Exp. & Swept variable & Algorithms & Seeds\\
 \midrule
-Core (\ref{sec:e1}) & none ($25^\circ$ GS elev.) & all 9 & 30\\
+Core (\ref{sec:e1}) & none ($25^\circ$ GS elev.) & all 9 & 60\\
 Fault types & 7 fault classes & \ordi{} & 8\\
 Intensity (\ref{sec:e3}) & rate $\in\{0,.05,.1,.2,.35,.5\}$ & \ordi{}, B5, B6 & 24\\
 Scalability & $N \in \{12,24,36,60\}$ & \ordi{}, B5 & 8\\

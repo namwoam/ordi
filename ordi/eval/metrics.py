@@ -8,7 +8,7 @@ Metrics (per the proposal's evaluation plan):
   - recovery_latency         : mean L_hat of replanned tiles
   - isl_traffic_bits         : total ISL data transferred
   - downlink_volume_bits     : total downlink data
-  - energy_joules            : total helper energy consumed
+  - energy_joules            : onboard compute, ISL, and ground-downlink energy
   - helper_utilization       : fraction of helper compute capacity used
 """
 
@@ -21,6 +21,7 @@ from typing import Dict, List, Set, Tuple
 from ordi.scheduler.ordi import SchedulerResult, TileAssignment
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask
+from ordi.sim.satellite import DEFAULT_COMMS_POWER_W, DEFAULT_DOWNLINK_RATE_BPS
 
 
 @dataclass
@@ -52,6 +53,8 @@ def compute_metrics(
     epoch_start: float,
     sat_compute_capacity: Dict[str, float],   # sat_id → compute-cycle budget (C_i·epoch_length, summed over the horizon for lifetime records)
     alpha: float = 0.002,
+    downlink_power_w: float = DEFAULT_COMMS_POWER_W,
+    downlink_rate_bps: float = DEFAULT_DOWNLINK_RATE_BPS,
 ) -> EpochMetrics:
     m = EpochMetrics(epoch=result.epoch)
 
@@ -85,17 +88,19 @@ def compute_metrics(
             task_delivered[task_obj.task_id] = task_delivered.get(task_obj.task_id, 0) + 1
             recovery_lats.append(assignment.L_hat)
 
-        # ISL traffic from replicas
+        # Compute and ISL energy from replicas.
         for replica in assignment.replicas:
             m.isl_traffic_bits += replica.d_in_bits + replica.d_out_bits
             m.energy_joules += replica.e_compute + replica.e_rx + replica.e_tx
 
-    # Downlink volume: sum of output bits from all assignments with z_kv > 0
-    m.downlink_volume_bits = sum(
-        a.replicas[0].d_out_bits
-        for a in result.assignments
-        if a.replicas and a.z_kv > 0
-    )
+        # Every delivered tile incurs spacecraft-to-ground transmit energy.
+        # Normal inference schedulers downlink the compact result; direct and
+        # compression baselines record their raw/compressed size explicitly.
+        if assignment.z_kv > 0.0 and not math.isinf(assignment.L_hat):
+            downlink_bits = (tile.d_out_bits if assignment.downlink_bits is None
+                             else assignment.downlink_bits)
+            m.downlink_volume_bits += downlink_bits
+            m.energy_joules += downlink_power_w * downlink_bits / downlink_rate_bps
 
     # Partial coverage per task
     for tid, total in task_total.items():

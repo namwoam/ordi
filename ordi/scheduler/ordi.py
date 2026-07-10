@@ -52,6 +52,9 @@ class TileAssignment:
     backup_aggregator: Optional[str] = None
     z_kv: float = 0.0          # modeled delivery probability
     L_hat: float = math.inf    # min latency across replicas
+    # None means the normal inference-result size from the task's Tile record.
+    # Bent-pipe and compression baselines override this with raw/compressed bits.
+    downlink_bits: Optional[float] = None
 
 
 @dataclass
