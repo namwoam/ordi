@@ -8,6 +8,13 @@ Usage:
 """
 
 import sys
+
+from dotenv import load_dotenv
+
+# Load .env (repo root or CWD) so FIRMS_MAP_KEY, MOBICOM24_COTS_ROOT, and
+# ORDI_DATA_DIR need not be exported manually. Real env vars take precedence.
+load_dotenv()
+
 from ordi.eval.experiments import ALL_EXPERIMENTS, run_all
 from ordi.eval.plots import plot_all
 
