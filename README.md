@@ -89,15 +89,9 @@ uv run python -m ordi.main plot all
 
 Experiment CSV files are written to `results/`. Generated plots are written to `figure/`.
 
-## Orbit Backends
+## Orbit Propagation
 
-The Taskfile uses the `brahe` propagation backend by default. Select Skyfield with:
-
-```bash
-ORBIT_BACKEND=skyfield task e1
-```
-
-When invoking Python directly, the package defaults to `skyfield`; set `ORBIT_BACKEND=brahe` to use Brahe instead.
+Orbits and contact windows are computed with Skyfield + SGP4.
 
 ## Repository Layout
 

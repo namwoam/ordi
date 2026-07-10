@@ -218,7 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-results/
 .claude/
 
 # MobiCom24 SatelliteCOTS measurement dataset (cloned locally, not redistributed)
