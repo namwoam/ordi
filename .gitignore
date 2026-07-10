@@ -223,3 +223,6 @@ results/
 
 # MobiCom24 SatelliteCOTS measurement dataset (cloned locally, not redistributed)
 data/MobiCom24-SatelliteCOTS/
+
+# Real-pipeline caches (regenerable: CelesTrak TLEs, Sentinel-2 STAC, reduced telemetry)
+data/

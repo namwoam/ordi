@@ -1,10 +1,5 @@
 version: '3'
 
-vars:
-  # Orbit propagation backend. Override with: ORBIT_BACKEND=skyfield task e1
-  # Valid values: brahe (default), skyfield
-  ORBIT_BACKEND: '{{.ORBIT_BACKEND | default "brahe"}}'
-
 tasks:
   setup:
     desc: Install all dependencies from pyproject.toml
@@ -14,70 +9,52 @@ tasks:
   # ── individual experiments ─────────────────────────────────────────────────
   e1:
     desc: "E1 - Core performance: ORDI vs all 8 baselines (no faults)"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E1
 
   e2:
     desc: "E2 - Fault type profile: ORDI under each of 7 fault types"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E2
 
   e3:
     desc: "E3 - Fault intensity sweep: ORDI vs B5 vs B6 at 0-50% fault rates"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E3
 
   e4:
     desc: "E4 - Scalability: ORDI vs B5 across 12-60 satellites"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E4
 
   e5:
     desc: "E5 - Deadline tightness: ORDI vs B2 vs B4 at 60-600s slack"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E5
 
   e6:
     desc: "E6 - Lambda_R sweep: replication penalty effect on ORDI"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E6
 
   e7:
     desc: "E7 - Correlated failures: ORDI vs B6 under plane outage"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E7
 
   e8:
     desc: "E8 - ILP vs greedy optimality gap (small instances)"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
     cmds:
       - uv run python -m ordi.main run E8
 
-  cots:
-    desc: "COTS - ORDI effectiveness with MobiCom24/BUPT-1 Atlas 200DK measurements"
-    env:
-      ORBIT_BACKEND: '{{.ORBIT_BACKEND}}'
+  real:
+    desc: "REAL - full real-data pipeline: Planet orbits + Sentinel-2 tasks + BUPT-1 telemetry"
     cmds:
-      - uv run python -m ordi.main run COTS
+      - uv run python -m ordi.main run REAL
 
   # ── run all experiments ────────────────────────────────────────────────────
   run-all:
-    desc: Run all experiments E1-E8 and COTS sequentially
+    desc: Run all experiments E1-E8 and REAL sequentially
     cmds:
       - task: e1
       - task: e2
@@ -87,7 +64,7 @@ tasks:
       - task: e6
       - task: e7
       - task: e8
-      - task: cots
+      - task: real
 
   # ── plotting ───────────────────────────────────────────────────────────────
   plot:
@@ -100,10 +77,10 @@ tasks:
     cmds:
       - uv run python -m ordi.main plot E1
 
-  plot-cots:
-    desc: Plot COTS measurement-backed evaluation figure only
+  plot-real:
+    desc: Plot REAL real-data pipeline figure only
     cmds:
-      - uv run python -m ordi.main plot COTS
+      - uv run python -m ordi.main plot REAL
 
   # ── run all then plot ──────────────────────────────────────────────────────
   all:

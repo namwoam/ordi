@@ -368,25 +368,24 @@ def plot_E8():
     print(f"  Saved {path}")
 
 
-# ── COTS: MobiCom24/BUPT-1 measurement-backed evaluation ────────────────────
-
-def plot_COTS():
-    rows = _read_csv("COTS_mobicom24")
+def plot_REAL():
+    rows = _read_csv("REAL")
     if not rows:
-        print("No COTS data"); return
+        print("No REAL data"); return
 
     metrics = ["deadline_miss_ratio", "delivered_utility", "objective",
                "energy_joules", "isl_traffic_bits"]
     titles = ["Deadline Miss Ratio (↓)", "Delivered Utility (↑)",
               "Objective (↑)", "Energy (J) (↓)", "ISL Traffic (bits) (↓)"]
 
-    # CSV rows are already in submission order (ORDI, B1..B8), same as E1.
     ordered = rows
     algs = [r["algorithm"] for r in ordered]
     colors = [ALG_COLORS.get(a, "#888") for a in algs]
     labels = [ALG_LABELS.get(a, a) for a in algs]
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(18, 4))
+    fig.suptitle("Real-data pipeline: Planet orbits + Sentinel-2 tasks + "
+                 "BUPT-1 telemetry", fontsize=11)
 
     for ax, metric, title in zip(axes, metrics, titles):
         vals = [_float(r, metric) for r in ordered]
@@ -403,7 +402,7 @@ def plot_COTS():
                 bar.set_linewidth(2)
 
     plt.tight_layout()
-    path = os.path.join(FIGURES_DIR, "COTS_mobicom24.png")
+    path = os.path.join(FIGURES_DIR, "REAL.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
@@ -412,5 +411,5 @@ def plot_COTS():
 def plot_all():
     _ensure_figures()
     for fn in [plot_E1, plot_E2, plot_E3, plot_E4,
-               plot_E5, plot_E6, plot_E7, plot_E8, plot_COTS]:
+               plot_E5, plot_E6, plot_E7, plot_E8, plot_REAL]:
         fn()

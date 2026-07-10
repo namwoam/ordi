@@ -24,6 +24,7 @@ import csv
 import math
 import os
 import time
+from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import copy, deepcopy
@@ -37,9 +38,7 @@ from ordi.orbit.contacts import (
 )
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
-from ordi.sim.cots_measurements import (
-    atlas_200dk_bupt1_params, load_cots_measurement_profile,
-)
+from ordi.sim.cots_measurements import atlas_200dk_bupt1_params
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.scheduler.ordi import (
@@ -175,7 +174,8 @@ def _uncommitted_tasks(pending, committed):
 
 
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
-                       reliability=None, realized_trials=500, realized_seed=0):
+                       reliability=None, realized_trials=500, realized_seed=0,
+                       state_driver=None):
     """Run one stateful rolling-horizon simulation and return a lifetime
     EpochMetrics.  schedule_fn(epoch, todo_tasks) -> SchedulerResult dispatches
     to ORDI / a baseline / the ILP.  A committed tile stays in-flight (not
@@ -198,6 +198,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
         if injector:
             injector.apply_epoch(epoch)
+        # Overwrite satellite state from a real-telemetry trace (if driving the
+        # real pipeline) after fault injection so injected failures still win.
+        if state_driver is not None:
+            state_driver(epoch, ep_start, states)
         # Drop committed tiles whose every replica lost a node → re-planned.
         for key in list(committed.keys()):
             if not _assignment_viable(committed[key], states):
@@ -218,8 +222,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
         objective=0.0, link_utilization={},
     )
-    # Use the actual constellation radio profile (measurement-backed in COTS)
-    # rather than silently falling back to the synthetic 5 W default.
+    # Use the actual constellation radio profile (measurement-backed when the
+    # Atlas params factory is used) rather than the synthetic 5 W default.
     downlink_power_w = (sum(s.params.comms_power_w for s in states.values())
                         / len(states) if states else 0.0)
     m = compute_metrics(
@@ -837,39 +841,164 @@ def run_E8(seed=0, n_seeds=12) -> Dict[str, List[EpochMetrics]]:
     return results
 
 
-# ── COTS measurement-backed evaluation ────────────────────────────────────────
+# ── REAL: full real-data pipeline (real orbits + tasks + telemetry) ───────────
 
-def run_COTS(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
-    """Evaluate ORDI with BUPT-1 Atlas 200DK measurements from MobiCom24.
+# A recent UTC window mapped to sim t=0. Real TLEs propagate at real epochs, so
+# contact windows must be computed over a current window rather than unix t=0.
+_REAL_WINDOW_START = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+_REAL_N_PLANES = 6
+_REAL_MAX_SATS = 24            # cap constellation size for tractable contact calc
+_REAL_FOV_RANGE_KM = 600.0     # realistic EO swath half-width
+_REAL_MIN_ELEV_DEG = 25.0      # match the stressed E1 ground-segment
+_REAL_DEADLINE_SLACK = 600.0
+_REAL_STAC_LIMIT = 800
 
-    This keeps the E1 orbital/task setup (and its 30-seed protocol) fixed and
-    replaces the generic Jetson-class satellite parameters with
-    measurement-derived Atlas 200DK-B power, battery, solar, and effective
-    throughput values.
+
+def _build_sim_real():
+    """Build the REAL, seed-independent parts of the environment ONCE.
+
+    Everything here is real measured data with no random component:
+      - Orbits: real Planet (Flock/SkySat) TLEs from CelesTrak, RAAN-clustered
+        into SAT_<plane>_<idx> planes; real contact windows over a current UTC
+        window; real groundtracks.
+      - Acquisitions: real Sentinel-2 captures (timestamp+geolocation) from STAC.
+      - Telemetry: the real BUPT-1 60 s trace.
+
+    The per-seed random elements (task type→profile sampling, source-satellite
+    choice among the in-FOV set, per-tile jitter, telemetry phase offsets, and
+    Monte-Carlo reliability draws) are applied later in run_REAL — the real data
+    does not label task type or provide 24 distinct satellites, so those residual
+    choices are sampled and averaged over seeds. See run_REAL's docstring.
+
+    Returns the shared real inputs plus a provenance dict for the banner.
     """
-    print(f"COTS: MobiCom24/BUPT-1 Atlas 200DK payload model (E1 scenario, {n_seeds} seeds)")
-    profile = load_cots_measurement_profile()
-    print(f"  Loading SatelliteCOTS logs from {profile.source_root}")
-    print(f"  Atlas log: {profile.inference_log}")
-    print(f"  Measured payload: {profile.compute_rate_gflops:.2f} GFLOP/s, "
-          f"idle={profile.idle_power_w:.2f} W, active={profile.active_power_w:.2f} W, "
-          f"battery={profile.battery_wh:.1f} Wh")
-    build_kwargs = {**_E1_BUILD_KWARGS,
-                    "satellite_params_factory": atlas_200dk_bupt1_params}
+    from ordi.orbit.real_tles import load_planet_constellation
+    from ordi.tasks.real_acquisitions import fetch_sentinel2_acquisitions
+    from ordi.sim.telemetry_replay import load_bupt1_telemetry
+
+    w0 = _REAL_WINDOW_START.timestamp()
+    w_end = w0 + SIM_DURATION_S
+
+    sats, name_map = load_planet_constellation(
+        n_planes=_REAL_N_PLANES, max_sats=_REAL_MAX_SATS)
+    sat_ids = [s.name for s in sats]
+
+    print(f"  Computing real contact windows for {len(sats)} sats × "
+          f"{len(_NORTHERN_GS)} GS over {_REAL_WINDOW_START.date()} ...")
+    t0 = time.time()
+    contacts = compute_contact_windows(
+        sats, t_start_unix=w0, t_end_unix=w_end, dt_seconds=60.0,
+        ground_stations=_NORTHERN_GS, min_elevation_deg=_REAL_MIN_ELEV_DEG,
+    )
+    print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
+
+    # Real contacts carry absolute (2026) unix timestamps, so the epoch graphs
+    # must be bucketed from w0 (not T_SIM_START=0) or every contact falls outside
+    # the [0, horizon] buckets. Epoch INDEX e still maps to both absolute
+    # [w0+e·Δ, ...] and relative [e·Δ, ...] because w0 is defined as relative t=0,
+    # and routing uses only relative time differences, so this stays consistent
+    # with the scheduler's 0-based epoch_start / deadlines.
+    graphs = build_epoch_graphs(contacts, w0, EPOCH_LENGTH_S, N_EPOCHS)
+    gs_names = {gs[0] for gs in _NORTHERN_GS}
+
+    sat_groundtrack = compute_sat_groundtracks(sats, w0, w_end, dt_seconds=60.0)
+
+    # STAC datetime range covering the sim window.
+    dt_range = (f"{_REAL_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
+                f"{datetime.fromtimestamp(w_end, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    print(f"  Fetching Sentinel-2 acquisitions {dt_range} ...")
+    acqs = fetch_sentinel2_acquisitions(dt_range, limit=_REAL_STAC_LIMIT)
+    print(f"  {len(acqs)} Sentinel-2 acquisitions")
+
+    trace = load_bupt1_telemetry()
+    reliability = ReliabilityModel()
+    cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
+
+    provenance = {
+        "n_sats": len(sats), "n_contacts": len(contacts),
+        "n_acqs": len(acqs),
+        "telemetry_span": f"{trace.span_start} → {trace.span_end}",
+        "telemetry_samples": len(trace),
+        "window": str(_REAL_WINDOW_START.date()),
+    }
+    return (sat_ids, gs_names, graphs, sat_groundtrack, acqs, trace,
+            reliability, cfg, name_map, provenance)
+
+
+def run_REAL(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    """Full real-data pipeline: real Planet orbits + Sentinel-2 acquisitions +
+    BUPT-1 telemetry replay. Complements (does not replace) the synthetic
+    E1–E8 experiments.
+
+    ORDI + the E1 baseline set are compared on identical real inputs, so the
+    numbers are directly comparable to the synthetic core comparison.
+
+    What is REAL (measured, seed-independent):
+      - orbital geometry / ISL + downlink contact windows (Planet TLEs, CelesTrak)
+      - task arrival timing and location (Sentinel-2 acquisitions, AWS STAC)
+      - battery-SOC and chip-temperature trajectories (BUPT-1 telemetry)
+      - fixed payload hardware constants (Atlas 200DK measured params)
+
+    What is still SAMPLED per seed (the real data cannot supply it), hence the
+    seed loop and error bars:
+      1. task type -> compute/utility/deadline profile: Sentinel-2 metadata has
+         no wildfire/ship/cloud/change label, so type is drawn from PROFILES;
+      2. source satellite among those in FOV of each real acquisition;
+      3. per-tile size/compute jitter and the log-normal deadline draw;
+      4. per-satellite telemetry phase offset (one real satellite stands in for
+         the whole constellation);
+      5. Monte-Carlo reliability draws for the realized-delivery metrics.
+    Tasks are rebuilt per seed so items 1-3 actually vary across seeds.
+    """
+    from ordi.sim.telemetry_replay import make_telemetry_state_driver
+    from ordi.tasks.real_acquisitions import acquisitions_to_tasks
+
+    print(f"REAL: real orbits (Planet/CelesTrak) + tasks (Sentinel-2/STAC) + "
+          f"telemetry (BUPT-1), {n_seeds} seeds")
+    (sat_ids, gs_names, graphs, sat_groundtrack, acqs, trace, reliability, cfg,
+     name_map, prov) = _build_sim_real()
+
+    print("  ── provenance ──")
+    for k, v in prov.items():
+        print(f"    {k}: {v}")
+
+    w0 = _REAL_WINDOW_START.timestamp()
     alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
+    results: Dict[str, List[EpochMetrics]] = {alg: [] for alg, _ in alg_classes}
 
-    config_args = []
-    for s in range(n_seeds):
-        jobs = [(f"{alg}#s{s}", alg, cls) for alg, cls in alg_classes]
-        config_args.append((build_kwargs, jobs, seed + s))
+    for s in tqdm(range(n_seeds), desc="REAL seeds", unit="seed"):
+        # Rebuild tasks from the SAME real acquisitions per seed so the sampled
+        # elements (type, source, jitter) vary and the error bars are meaningful.
+        tasks = acquisitions_to_tasks(
+            acqs, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
+            deadline_slack_s=_REAL_DEADLINE_SLACK, fov_range_km=_REAL_FOV_RANGE_KM,
+            seed=seed + s,
+        )
+        states = make_constellation_states(
+            sat_ids, seed=seed + s, params_factory=atlas_200dk_bupt1_params)
+        driver = make_telemetry_state_driver(trace, sat_ids, seed=seed + s)
+        for alg_name, cls in alg_classes:
+            local_states = deepcopy(states)
+            local_rel = deepcopy(reliability)
+            is_ordi = issubclass(cls, ORDIScheduler)
+            if is_ordi:
+                sched = cls(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
+            else:
+                sched = cls(graphs, local_states, gs_names, local_rel, cfg)
 
-    raw = _run_configs_parallel(config_args, desc="COTS seeds")
+            def schedule_fn(ep, td, _sched=sched, _is_ordi=is_ordi):
+                if _is_ordi:
+                    return _sched.schedule_epoch(ep, T_SIM_START, td)
+                return _sched.schedule(ep, T_SIM_START, td)
 
-    results: Dict[str, List[EpochMetrics]] = {}
-    for alg, _cls in alg_classes:
-        results[alg] = [m for s in range(n_seeds) for m in raw[f"{alg}#s{s}"]]
+            m = _simulate_stateful(
+                schedule_fn, tasks, sat_ids, local_states, cfg,
+                reliability=local_rel, realized_seed=seed + s,
+                state_driver=driver,
+            )
+            results[alg_name].append(m)
 
-    _save_csv("COTS_mobicom24", results)
+    _save_csv("REAL", results)
     return results
 
 
@@ -878,7 +1007,7 @@ def run_COTS(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
 ALL_EXPERIMENTS = {
     "E1": run_E1, "E2": run_E2, "E3": run_E3, "E4": run_E4,
     "E5": run_E5, "E6": run_E6, "E7": run_E7, "E8": run_E8,
-    "COTS": run_COTS,
+    "REAL": run_REAL,
 }
 
 
