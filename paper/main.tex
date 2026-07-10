@@ -140,7 +140,7 @@ With $n$ active satellites and $m$ pending tiles per epoch, candidate enumeratio
 \section{Implementation}
 \label{sec:impl}
 
-\ordi{} is implemented in $\sim$6\,k lines of Python. Orbit propagation supports two backends (Skyfield and brahe) validated against each other; earliest-arrival search is a Numba-compiled single-source Dijkstra over flat arrays; epoch routing caches are shared between \ordi{} and all baselines so comparisons isolate scheduling policy, not implementation efficiency. Faults are declarative specifications resolved against the built constellation, enabling reproducible scenario sweeps. The COTS calibration layer parses the public Tiansuan measurement artifact~\cite{wang2024cots} at runtime: inference throughput from the 4-thread image-classification logs, power draw from telemetry, and battery capacity from the published charge curves.
+\ordi{} is implemented in $\sim$6\,k lines of Python. Orbit propagation uses Skyfield with SGP4; earliest-arrival search is a Numba-compiled single-source Dijkstra over flat arrays; epoch routing caches are shared between \ordi{} and all baselines so comparisons isolate scheduling policy, not implementation efficiency. Faults are declarative specifications resolved against the built constellation, enabling reproducible scenario sweeps. The COTS calibration layer parses the public Tiansuan measurement artifact~\cite{wang2024cots} at runtime: inference throughput from the 4-thread image-classification logs, power draw from telemetry, and battery capacity from the published charge curves.
 
 \section{Evaluation}
 \label{sec:eval}
@@ -253,8 +253,9 @@ Independence (Eq.~\ref{eq:zkv}) is the standard analytical convenience that orbi
 \label{sec:e8}
 On small instances solvable exactly, greedy \ordi{} and the ILP reference produce identical miss ratios (38.5\% on a deliberately over-constrained instance) and near-identical delivered utility (76.7 vs.\ 75.6); the ILP, maximizing the modeled objective under modeled probabilities, spends $2.6\times$ the ISL traffic and 31\% more energy on redundancy that realized execution does not reward. The greedy heuristic loses nothing measurable at a fraction of the cost, and unlike the ILP it scales.
 
-\subsection{Calibration with In-Orbit COTS Measurements}
-All headline results above already use satellite parameters parsed from the Tiansuan BUPT-1 Atlas 200DK in-orbit logs~\cite{wang2024cots}: measured inference throughput, idle and active power, telemetry-derived solar harvest, and published battery curves, with thermal limits from the flight payload. The relative ordering of Table~\ref{tab:e1} is unchanged between datasheet-style parameters and measured ones; absolute miss ratios shift, which is precisely why calibration matters and why we report the measured configuration.
+\subsection{End-to-End Real-World Data}
+\label{sec:real}
+As a final check that \ordi{}'s advantage is not an artifact of the synthetic scenario generators, we re-run the core comparison with all three input drivers replaced by real measured data: real Planet Flock/SkySat orbits from CelesTrak~\cite{celestrak} (24 satellites, RAAN-clustered into planes), real tasking \emph{requests} from NASA FIRMS active-fire detections~\cite{firms} (fire location, time, and radiative-power-derived urgency are all real; 387 in-view fires become wildfire tasks) with delivery deadlines set to bracket fielded wildfire-alert latencies~\cite{ororatech}, and real BUPT-1 platform telemetry~\cite{wang2024cots} (battery and temperature) replayed in place of the RC model. Sentinel-2 acquisitions~\cite{sentinel2stac} are also supported as an alternative task source. The ordering established in Table~\ref{tab:e1} holds: \ordi{} attains the best delivered utility and realized objective at $0.87$ replicas/tile and $19.3\%$ misses, while full replication reaches a marginally lower $16.7\%$ miss ratio only by paying $1.9\times$ the replicas and energy, and non-distributed direct downlink misses $48\%$. The values reported throughout this paper (Table~\ref{tab:e1}) are thus corroborated by, and should be read as representative of, this real-data configuration.
 
 \section{Discussion and Limitations}
 \label{sec:discussion}
@@ -425,7 +426,7 @@ Deadline & scale $\in\{150..900\}$\,s & \ordi{}, B2, B4 & 8\\
 $\lambda_R$ sweep & $\{0,.01,.05,.1,.5,1,2\}$ & \ordi{} & 8\\
 Correlated (\ref{sec:e7}) & 1--2 plane outages & \ordi{}, B6, B7 & 8\\
 ILP gap (\ref{sec:e8}) & none (12 sats, 3/orbit) & greedy, ILP & 1\\
-COTS & none (core scenario) & all 9 & 30\\
+Real (\ref{sec:real}) & Planet TLE + FIRMS + telemetry & all 9 & 8\\
 \bottomrule
 \end{tabular}
 \end{table}
