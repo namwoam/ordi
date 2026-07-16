@@ -21,6 +21,7 @@
 \newcommand{\ordi}{ORDI}
 \newcommand{\eg}{e.g.,}
 \newcommand{\ie}{i.e.,}
+\renewcommand{\IEEEkeywordsname}{Keywords}
 
 \begin{document}
 
@@ -34,11 +35,11 @@
 \maketitle
 
 \begin{abstract}
-Low-Earth-orbit (LEO) Earth observation (EO) constellations capture far more imagery than their downlink budgets can deliver, motivating onboard inference that distills raw images into compact results. Distributing inference across neighboring satellites can meet tight deadlines, but the orbital environment is hostile to distributed computing: inter-satellite links appear and disappear with orbital geometry, commercial off-the-shelf (COTS) payloads throttle under thermal and battery stress, and failures are frequently correlated across an orbital plane. We present \ordi{}, an orbit-aware scheduler that assigns image tiles to helper satellites with \emph{selective} redundancy: a backup replica is placed only when its marginal reliability gain, priced through a time-decaying utility model, exceeds its energy and bandwidth cost, and backups are constrained to fault-disjoint helpers and aggregators. \ordi{} couples a time-expanded contact graph with per-satellite compute, battery, and thermal state, and replans within an epoch upon helper failure or straggling. We evaluate \ordi{} in a simulator calibrated with in-orbit measurements of a COTS payload from the Tiansuan constellation, against eight baselines spanning bent-pipe downlink, onboard-only, single-helper offloading, and full replication. Across fault intensities up to 50\%, \ordi{} holds the deadline miss ratio to 16.6\% while a non-redundant scheduler degrades to 52.9\%; relative to full replication it delivers a comparable miss ratio with 30\% fewer replicas and 32\% less energy. Under correlated plane-wide outages, plane-disjoint backup placement matches full replication's resilience at a fraction of its redundancy, and the greedy scheduler matches an ILP reference on delivered utility while using $3.6\times$ less inter-satellite traffic.
+Low-Earth-orbit (LEO) Earth observation constellations collect more imagery than limited ground contacts can downlink, making onboard inference essential for timely alerts. Distributing tiled inference across neighboring satellites improves latency, but intermittent links, thermal and battery throttling, and correlated plane failures make fixed placements unreliable. We present \ordi{}, an orbit-aware rolling-horizon scheduler that jointly considers predicted contact windows and each satellite's compute, battery, thermal, queue, and availability state. \ordi{} ranks tiles by urgency-weighted utility, selects a feasible primary helper and aggregator, and adds at most one fault-disjoint backup only when its marginal reliability gain exceeds its energy, communication, and replication costs. Failures, missed contacts, and stragglers trigger local rescheduling within the current epoch. We evaluate \ordi{} in a discrete-epoch simulator calibrated with in-orbit measurements from a Tiansuan commercial off-the-shelf payload and compare it with eight downlink, onboard, offloading, replication, and coding baselines. At fault intensities up to 50\%, \ordi{} limits deadline misses to 16.6\%, compared with 52.9\% for non-redundant scheduling. It provides resilience comparable to full replication while using 30\% fewer replicas and 32\% less energy. Under correlated plane outages, plane-disjoint backups preserve reliability, while the greedy scheduler matches an ILP reference with $3.6\times$ less inter-satellite traffic.
 \end{abstract}
 
 \begin{IEEEkeywords}
-LEO constellations, satellite edge computing, distributed inference, fault tolerance, scheduling
+LEO constellations, Earth observation, distributed inference, fault-tolerant scheduling
 \end{IEEEkeywords}
 
 \section{Introduction}
@@ -161,11 +162,6 @@ where $\Delta z_{kv}$ is the reliability increase from Eq.~\eqref{eq:zkv}. Thus 
 \end{algorithm}
 
 In Algorithm~\ref{alg:ordi}, $\phi(h)$ returns helper $h$'s orbital plane. \textsc{PlaneDisjoint} is enabled only for the correlated plane-outage model in Section~\ref{sec:e7}; otherwise backups need only use a different helper and aggregator. $\Delta(r\mid R)$ is the marginal gain in Eq.~\eqref{eq:backup}, and at most one backup is selected. Routing costs $O(n\cdot\mathrm{SSSP})$ per epoch and enumeration costs $O(mn^2)$ cached lookups, whereas the ILP is limited to small instances.
-
-\section{Implementation}
-\label{sec:impl}
-
-\ordi{} is implemented in $\sim$6\,k lines of Python. Orbit propagation uses Skyfield with SGP4; earliest-arrival search is a Numba-compiled single-source Dijkstra over flat arrays; epoch routing caches are shared between \ordi{} and all baselines so comparisons isolate scheduling policy, not implementation efficiency. Faults are declarative specifications resolved against the built constellation, enabling reproducible scenario sweeps. The COTS calibration layer parses the public Tiansuan measurement artifact~\cite{wang2024cots} at runtime: inference throughput from the 4-thread image-classification logs, power draw from telemetry, and battery capacity from the published charge curves.
 
 \section{Evaluation}
 \label{sec:eval}
