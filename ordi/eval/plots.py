@@ -368,6 +368,49 @@ def plot_E8():
     print(f"  Saved {path}")
 
 
+# ── E9: backup-cap ablation ──────────────────────────────────────────────────
+
+def plot_E9():
+    rows = _read_csv("E9_backup_cap")
+    if not rows:
+        print("No E9 data"); return
+
+    caps = sorted(
+        int(r["algorithm"].split("backups=")[1])
+        for r in rows if "backups=" in r["algorithm"]
+    )
+
+    def _series(metric):
+        vals, errs = [], []
+        for cap in caps:
+            row = next((r for r in rows
+                        if r["algorithm"] == f"ORDI@backups={cap}"), {})
+            vals.append(_float(row, metric))
+            errs.append(_std(row, metric))
+        return vals, errs
+
+    panels = [
+        ("realized_miss_ratio", "Realized Deadline Miss Ratio (↓)"),
+        ("n_replicas_avg", "Mean Replicas per Tile"),
+        ("energy_joules", "Energy (J) (↓)"),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(11, 3.5))
+    for ax, (metric, title) in zip(axes, panels):
+        vals, errs = _series(metric)
+        ax.errorbar(caps, vals, yerr=errs, color="#e63946", linewidth=2,
+                    marker="o", capsize=3)
+        ax.set_xlabel("Maximum Backups per Tile")
+        ax.set_title(title, fontsize=9)
+        ax.set_xticks(caps)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(FIGURES_DIR, "E9_backup_cap.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved {path}")
+
+
 def plot_REAL():
     rows = _read_csv("REAL")
     if not rows:
@@ -411,5 +454,5 @@ def plot_REAL():
 def plot_all():
     _ensure_figures()
     for fn in [plot_E1, plot_E2, plot_E3, plot_E4,
-               plot_E5, plot_E6, plot_E7, plot_E8, plot_REAL]:
+               plot_E5, plot_E6, plot_E7, plot_E8, plot_E9, plot_REAL]:
         fn()

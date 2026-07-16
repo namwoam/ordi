@@ -4,7 +4,7 @@
 
 ORDI is a simulator and scheduling research prototype for distributing tiled Earth-observation inference workloads across low-Earth-orbit satellites. It uses orbit-aware contact graphs, satellite resource state, and selective fault-disjoint replication to improve deadline performance without the cost of replicating every task.
 
-The repository includes the ORDI scheduler, eight comparison baselines, fault injection, an ILP reference solver, nine evaluation workloads, plotting utilities, and the accompanying paper.
+The repository includes the ORDI scheduler, eight comparison baselines, fault injection, an ILP reference solver, ten evaluations, plotting utilities, and the accompanying paper.
 
 ![ORDI core evaluation](figure/E1_core.png)
 
@@ -15,7 +15,7 @@ ORDI schedules each image tile over a rolling horizon. For every epoch it:
 1. Builds feasible source-helper-aggregator routes from a time-expanded orbital contact graph.
 2. Accounts for compute rate, battery, temperature, queue state, availability, latency, and link reliability.
 3. Selects a primary assignment by marginal utility after energy and communication costs.
-4. Adds a backup only when its reliability gain exceeds its replication cost, while keeping replicas fault-disjoint.
+4. Adds backups up to a configurable cap only while their marginal reliability gain exceeds their replication cost, while keeping replicas fault-disjoint. The default cap is one.
 5. Replans work affected by helper failures, missed contacts, or stragglers.
 
 The simulator models Walker constellations, field-of-view-constrained task arrivals, ground contacts, inter-satellite links, workload-specific compute and data profiles, and seven classes of injected faults.
@@ -72,7 +72,8 @@ Available evaluations are:
 | E6 | Replication-penalty sweep |
 | E7 | Correlated orbital-plane failures |
 | E8 | Greedy scheduler versus ILP reference |
-| COTS | Measurement-backed Atlas 200DK evaluation |
+| E9 | Maximum-backup cap ablation |
+| REAL | Planet/FIRMS/BUPT-1 real-data case study |
 
 Run the full evaluation suite and generate every plot:
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-GS_MIN_ELEVATION_DEG = 5.0
-ISL_MAX_RANGE_KM = 5000.0
+GS_MIN_ELEVATION_DEG = 25.0
+# Starlink mini optical terminals specify links up to 4,000 km.  At the
+# simulated 550 km shell this also leaves about 255 km Earth-limb clearance.
+ISL_MAX_RANGE_KM = 4000.0
 DOWNLINK_RATE_BPS = 100e6
 ISL_RATE_BPS = 200e6
 UPLINK_RATE_BPS = 10e6

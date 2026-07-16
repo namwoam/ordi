@@ -35,7 +35,7 @@
 \maketitle
 
 \begin{abstract}
-Low-Earth-orbit (LEO) Earth observation constellations collect more imagery than limited ground contacts can downlink, making onboard inference essential for timely alerts. Distributing tiled inference across neighboring satellites improves latency, but intermittent links, thermal and battery throttling, and correlated plane failures make fixed placements unreliable. We present \ordi{}, an orbit-aware rolling-horizon scheduler that jointly considers predicted contact windows and each satellite's compute, battery, thermal, queue, and availability state. \ordi{} ranks tiles by urgency-weighted utility, selects a feasible primary helper and aggregator, and adds at most one fault-disjoint backup only when its marginal reliability gain exceeds its energy, communication, and replication costs. Failures, missed contacts, and stragglers trigger local rescheduling within the current epoch. We evaluate \ordi{} in a discrete-epoch simulator calibrated with in-orbit measurements from a Tiansuan commercial off-the-shelf payload and compare it with eight downlink, onboard, offloading, replication, and coding baselines. At fault intensities up to 50\%, \ordi{} limits deadline misses to 16.6\%, compared with 52.9\% for non-redundant scheduling. It provides resilience comparable to full replication while using 30\% fewer replicas and 32\% less energy. Under correlated plane outages, plane-disjoint backups preserve reliability, while the greedy scheduler matches an ILP reference with $3.6\times$ less inter-satellite traffic.
+Low-Earth-orbit Earth-observation constellations collect more imagery than intermittent ground contacts can promptly downlink, motivating distributed onboard inference for time-critical alerts. Yet changing contact geometry, thermal and battery throttling, and correlated orbital-plane failures make static task placement unreliable. We present \ordi{}, an orbit-aware rolling-horizon scheduler that jointly considers predicted contacts and each satellite's compute, energy, temperature, queue, and availability state. \ordi{} ranks image tiles by urgency-weighted utility, selects feasible primary helper--aggregator pairs, and adds fault-disjoint backups only when their marginal reliability gain exceeds energy, communication, and replication costs. Detected failures, missed contacts, and stragglers trigger local replanning. We compare \ordi{} with eight baselines across fault type and intensity, deadline, constellation scale, correlated outage, and backup-cap studies, using a uniform conservative $25^\circ$ ground-link elevation mask. Under nominal stochastic loss, \ordi{} achieves the highest utility while using 40\% fewer replicas and 40\% less energy than full replication. Under one-plane outages it remains within 3.5 percentage points of full replication's realized miss ratio with 44\% less energy. Its greedy solution attains slightly higher utility than an ILP reference with $5.8\times$ less inter-satellite traffic. Tests on real-world NASA FIRMS wildfire requests further preserve the synthetic study's utility ordering, supporting selective redundancy under operational demand conditions.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -59,7 +59,7 @@ This paper asks: \emph{how much redundancy does distributed orbital inference ac
 
 \textbf{(3) Reactive replanning.} Detected helper failures, missed contacts, and stragglers trigger re-scheduling of affected tiles within the epoch, using the same feasibility machinery.
 
-We implement \ordi{} and eight baselines in a discrete-epoch simulator with a realistic LEO-EO configuration: a Walker constellation at 550\,km, field-of-view-constrained task arrivals, per-workload log-normal deadlines reflecting EO service tiers~\cite{lemaitre2002}, and satellite power, thermal, and compute parameters loaded directly from the public in-orbit measurement logs of a Tiansuan COTS payload~\cite{wang2024cots}. Experiments over up to 60 random seeds show that \ordi{} (i) dominates non-distributed baselines on deadline miss ratio and delivered utility, (ii) degrades gracefully under fault intensities up to 50\% where a non-redundant scheduler collapses, (iii) matches full replication under correlated plane outages with 30\% fewer replicas and 32\% less energy, and (iv) tracks an ILP reference on delivered utility while using $3.6\times$ less ISL traffic.
+We implement \ordi{} and eight baselines in a discrete-epoch simulator with a realistic LEO-EO configuration: a Walker constellation at 550\,km, field-of-view-constrained task arrivals, per-workload log-normal deadlines reflecting EO service tiers~\cite{lemaitre2002}, and satellite power, thermal, and compute parameters loaded directly from the public in-orbit measurement logs of a Tiansuan COTS payload~\cite{wang2024cots}. Experiments over up to 60 random seeds show that \ordi{} (i) outperforms non-distributed baselines on deadline miss ratio and delivered utility, (ii) retains 77\% more delivered utility than non-redundant placement at 50\% fault intensity, (iii) stays within 3.5 percentage points of full replication's realized miss ratio under a one-plane outage with 44\% less energy, and (iv) slightly exceeds the ILP reference's utility while using $5.8\times$ less ISL traffic.
 
 \section{Background and Related Work}
 \label{sec:motivation}
@@ -78,7 +78,7 @@ Tiling makes inference embarrassingly parallel: a $4{\times}4$ grid yields 16 in
 \label{sec:model}
 
 \subsection{Network and Contact Model}
-We consider a constellation $\mathcal{S}$ of $N$ satellites and a set $\mathcal{G}$ of ground stations. Time is divided into epochs of length $\Delta$ (60\,s). From orbital propagation we compute contact windows: for each satellite pair, an ISL contact when their range is below a threshold, and for each (satellite, station) pair, a downlink contact when elevation exceeds a mask. Contacts are compiled into per-epoch graphs $E(t)$; multi-epoch transfers are evaluated on the time-expanded graph by an earliest-arrival Dijkstra search, yielding $\ell_{ab}(t, d)$, the earliest time data of size $d$ originating at node $a$ at epoch $t$ reaches node $b$, including store-and-forward waiting across epochs.
+We consider $N$ satellites $\mathcal{S}$ and ground stations $\mathcal{G}$ over 60\,s epochs. We set $h{=}550$\,km, within PlanetScope's 450--580\,km Earth-observation orbit range~\cite{planet2026spec}. An optical ISL exists at slant range $d\leq4{,}000$\,km, the limit specified for Starlink mini lasers~\cite{starlinktechnology}. At this altitude, the threshold is 26\% below the 5,408\,km geometric line-of-sight limit and gives 255\,km minimum limb clearance. All benchmarks use a conservative $25^\circ$ RF elevation mask, matching an authorized minimum for LEO user and gateway links at comparable 540--570\,km altitudes~\cite{fcc2021spacex}. Contacts form per-epoch graphs $E(t)$, and earliest-arrival Dijkstra search over the time-expanded graph yields $\ell_{ab}(t,d)$, including store-and-forward waits.
 
 \subsection{Satellite State}
 Each satellite $i$ carries state $\sigma_i(t) = (C_i, B_i, \Theta_i, Q_i, A_i)$: compute rate (GFLOP/s), battery energy (J), temperature, queued work, and availability. Battery follows an energy balance of solar harvest against idle, compute, and communication draw; temperature follows a first-order RC model driven by compute-power dissipation. Availability $A_i = 0$ when battery falls below a floor, temperature exceeds a ceiling, or a failure is injected; thermal stress throttles $C_i$ before forcing unavailability. Rather than assuming datasheet values, we instantiate $\sigma_i$ parameters (compute rate, idle and active power, battery capacity, solar harvest, thermal limits) from public in-orbit measurement logs of an Atlas 200DK payload on the Tiansuan BUPT-1 satellite~\cite{wang2024cots}.
@@ -136,22 +136,23 @@ where $\Delta z_{kv}$ is the reliability increase from Eq.~\eqref{eq:zkv}. Thus 
 \caption{ORDI rolling-horizon scheduler}
 \label{alg:ordi}
 \begin{algorithmic}[1]
-\REQUIRE epoch $t$, pending tiles $\mathcal P$, states $\sigma(t)$, contacts $E(t)$, \textsc{PlaneDisjoint}
+\REQUIRE epoch $t$, pending tiles $\mathcal P$, states $\sigma(t)$, contacts $E(t)$, backup cap $b_{\max}$, \textsc{PlaneDisjoint}
 \STATE Build earliest-arrival cache $\Lambda(t)$ from $E(t)$
 \STATE Sort $\mathcal P$ by decreasing $u_{kv}/\tau_k(t)$
 \FOR{$(k,v)\in\mathcal P$}
   \STATE $\mathcal F_{kv}\leftarrow$ feasible replicas satisfying Eq.~\eqref{eq:latency}, availability, and energy constraints
   \IF{$\mathcal F_{kv}=\emptyset$} \STATE \textbf{continue} \ENDIF
   \STATE $r_1\leftarrow\arg\max_{r\in\mathcal F_{kv}}\Delta_r$; $R\leftarrow\{r_1\}$
-  \STATE $\mathcal D\leftarrow\{r\in\mathcal F_{kv}\setminus R:h_r\ne h_{r_1},\ a_r\ne a_{r_1}\}$
-  \IF{\textsc{PlaneDisjoint}}
-    \STATE $\mathcal D\leftarrow\{r\in\mathcal D:\phi(h_r)\ne\phi(h_{r_1})\}$
-  \ENDIF
-  \STATE Sort $\mathcal D$ by decreasing $\Delta_r$
-  \IF{$\mathcal D\ne\emptyset$}
-    \STATE $r_2\leftarrow$ first $r\in\mathcal D$ with $\Delta(r\mid R)>0$
-    \IF{$r_2$ exists} \STATE $R\leftarrow R\cup\{r_2\}$ \ENDIF
-  \ENDIF
+  \STATE $\mathcal D\leftarrow\mathcal F_{kv}\setminus R$; sort $\mathcal D$ by decreasing $\Delta_r$
+  \WHILE{$\mathcal D\ne\emptyset$ and $|R|-1<b_{\max}$}
+    \STATE Remove candidates sharing a helper or aggregator with $R$
+    \IF{\textsc{PlaneDisjoint}}
+      \STATE $\mathcal D\leftarrow\{r\in\mathcal D:\phi(h_r)\notin\phi(H_R)\}$
+    \ENDIF
+    \STATE $r_b\leftarrow$ first $r\in\mathcal D$ with $\Delta(r\mid R)>0$
+    \IF{$r_b$ does not exist} \STATE \textbf{break} \ENDIF
+    \STATE $R\leftarrow R\cup\{r_b\}$; $\mathcal D\leftarrow\mathcal D\setminus\{r_b\}$
+  \ENDWHILE
   \STATE Commit $R$; update energy and link usage
 \ENDFOR
 \IF{failure, missed contact, or $1.5\times$ straggler}
@@ -161,14 +162,14 @@ where $\Delta z_{kv}$ is the reliability increase from Eq.~\eqref{eq:zkv}. Thus 
 \end{algorithmic}
 \end{algorithm}
 
-In Algorithm~\ref{alg:ordi}, $\phi(h)$ returns helper $h$'s orbital plane. \textsc{PlaneDisjoint} is enabled only for the correlated plane-outage model in Section~\ref{sec:e7}; otherwise backups need only use a different helper and aggregator. $\Delta(r\mid R)$ is the marginal gain in Eq.~\eqref{eq:backup}, and at most one backup is selected. Routing costs $O(n\cdot\mathrm{SSSP})$ per epoch and enumeration costs $O(mn^2)$ cached lookups, whereas the ILP is limited to small instances.
+In Algorithm~\ref{alg:ordi}, $H_R$ is the set of selected helpers and $\phi(h)$ returns helper $h$'s orbital plane. \textsc{PlaneDisjoint} is enabled only for the correlated plane-outage model in Section~\ref{sec:e7}. $\Delta(r\mid R)$ is the marginal gain in Eq.~\eqref{eq:backup}. The default $b_{\max}{=}1$ implements selective single-backup redundancy; Section~\ref{sec:e9} ablates larger caps. Routing costs $O(n\cdot\mathrm{SSSP})$ per epoch and enumeration costs $O(mn^2)$ cached lookups, whereas the ILP is limited to small instances.
 
 \section{Evaluation}
 \label{sec:eval}
 
 \subsection{Setup}
 \label{sec:setup}
-Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at 550\,km (96\,min period); horizon of 3 orbits (17{,}280\,s, 288 epochs); two northern ground stations (Fairbanks, Greenwich), a deliberately constrained ground segment typical of high-latitude EO operations that creates genuine routing pressure for southern-hemisphere sources; field-of-view-gated Poisson arrivals at 6 tasks/orbit over 100 ground targets; $5^\circ$ ground-station elevation mask; ISL rate 200\,Mb/s. Satellite parameters are the Tiansuan-calibrated COTS profile. The core comparison uses a deliberately stressed variant of this setup, a sparser 6\,$\times$\,4 Walker (24 satellites) with 8 tasks/orbit and a $25^\circ$ elevation mask, so that deadlines actually bind and routing pressure is real; it aggregates 60 random seeds. Fault and sweep experiments use matched seeds across algorithms; error bars are one standard deviation. Table~\ref{tab:configs} in the appendix gives every per-experiment configuration.
+Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at 550\,km (96\,min period); horizon of 3 orbits (17{,}280\,s, 288 epochs); two northern ground stations (Fairbanks, Greenwich), a deliberately constrained ground segment typical of high-latitude EO operations that creates genuine routing pressure for southern-hemisphere sources; field-of-view-gated Poisson arrivals at 6 tasks/orbit over 100 ground targets; $25^\circ$ ground-station elevation mask; ISL rate 200\,Mb/s. Satellite parameters are the Tiansuan-calibrated COTS profile. The core comparison further stresses this setup with a sparser 6\,$\times$\,4 Walker (24 satellites) and 8 tasks/orbit, so that deadlines bind and routing pressure is real; it aggregates 60 random seeds. Fault and sweep experiments use matched seeds across algorithms; error bars are one standard deviation. Table~\ref{tab:configs} in the appendix gives every per-experiment configuration.
 
 \textbf{Baselines.} B1 direct downlink (bent pipe, no inference); B2 onboard-only; B3 onboard with $0.15\times$ output compression; B4 Serval-like priority bifurcation, one satellite per task~\cite{tao2024serval}; B5 SECO-like multi-satellite placement without redundancy~\cite{seco}; B6 full replication to $r_{\max}$ helpers~\cite{dean2013tail}; B7 random-helper replication; B8 CoCoI-like MDS-coded redundancy adapted to contact windows~\cite{cocoi,lee2018codes}. All baselines share \ordi{}'s contact graphs, state model, and routing caches.
 
@@ -184,7 +185,7 @@ Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at
 \label{fig:e1}
 \end{figure*}
 
-Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.1\% of deadlines, confirming that bent-pipe delivery is not viable at this ground-segment scale. Onboard-only (B2--B4 cluster) reaches 27.3\% misses, limited by source compute and source-local downlink geometry. Distributed schedulers (\ordi{}, B5--B8) cut misses to 21.7\%. Within that group the distinctions are cost and utility: \ordi{} delivers the highest utility ($160.1 \pm 35.0$) at 1.10 replicas/tile and 309\,J, whereas full replication needs 1.56 replicas and 452\,J (+46\% energy, $3.5\times$ ISL traffic) to deliver \emph{less} utility ($156.4$), the freshness discount penalizing its slower redundant paths. Selective redundancy is not merely cheaper; under \eqref{eq:objective} it is better.
+Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.1\% of deadlines, confirming that bent-pipe delivery is not viable with this constrained ground segment. Onboard-only methods (B2--B4) miss 85.3\%, limited by source compute and source-local downlink geometry. Distributed schedulers reduce misses to about 70.5\%. Within that group, \ordi{} achieves the highest utility ($26.0 \pm 14.7$) at 0.32 replicas/tile and 103\,J. Full replication uses 0.54 replicas and 172\,J---about 67\% more energy and $2.5\times$ the ISL traffic---yet delivers less utility (24.4). The sub-unit replica averages include infeasible tiles for which no placement can meet the deadline.
 
 \begin{table}[t]
 \caption{Core comparison results, mean over 60 seeds.}
@@ -196,20 +197,20 @@ Table~\ref{tab:e1} and Fig.~\ref{fig:e1} summarize. Direct downlink misses 95.1\
 Algorithm & Miss ratio & Utility & Replicas & Energy (J)\\
 \midrule
 B1 direct      & 0.951 & 8.0   & 0    & 0.41\\
-B2 onboard     & 0.273 & 137.2 & 0.73 & 211\\
-B3 compress    & 0.273 & 140.0 & 0.73 & 21.9\\
-B4 Serval-like & 0.273 & 137.1 & 0.73 & 211\\
-B5 SECO-like   & 0.217 & 145.9 & 0.78 & 228\\
-B6 full repl.  & 0.217 & 156.4 & 1.56 & 452\\
-B7 random repl.& 0.217 & 145.9 & 1.57 & 456\\
-B8 CoCoI-like  & 0.217 & 156.5 & 1.57 & 454\\
-\textbf{\ordi{}} & \textbf{0.217} & \textbf{160.1} & \textbf{1.10} & \textbf{309}\\
+B2 onboard     & 0.853 & 17.2 & 0.15 & 45.6\\
+B3 compress    & 0.853 & 17.6 & 0.15 & 4.7\\
+B4 Serval-like & 0.853 & 17.2 & 0.15 & 45.6\\
+B5 SECO-like   & 0.705 & 22.8 & 0.30 & 94.8\\
+B6 full repl.  & 0.705 & 24.4 & 0.54 & 171.9\\
+B7 random repl.& 0.705 & 23.6 & 0.55 & 175.4\\
+B8 CoCoI-like  & 0.705 & 24.5 & 0.55 & 174.9\\
+\textbf{\ordi{}} & \textbf{0.702} & \textbf{26.0} & \textbf{0.32} & \textbf{103.0}\\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Robustness Across Fault Types}
-Injecting each of eight fault classes against \ordi{} (Fig.~\ref{fig:e2}): ground-contact misses, adverse downlink, battery shortage, thermal throttling, and stragglers leave the miss ratio statistically unchanged from the no-fault 0.4\%, absorbed by rerouting, replanning, and backups; ISL disruption raises it only modestly, to 5.1\%. The damaging classes are those that remove compute en masse: plane outage and helper failure raise misses to 10.8\%. Stragglers, while not raising misses, cost $1.6\times$ energy as replanned duplicates complete alongside slow originals.
+Injecting each of eight fault classes against \ordi{} (Fig.~\ref{fig:e2}), ground-contact misses, adverse downlink, battery shortage, thermal throttling, and stragglers leave the planned miss ratio at the no-fault value of 53.3\%. ISL disruption raises it to 59.1\%; plane outage and helper failure are most damaging at 61.7\%. Stragglers do not change feasibility but increase energy from 119 to 218\,J as replanned duplicates complete alongside slow originals.
 
 \begin{figure}[t]
 \centering
@@ -220,7 +221,7 @@ Injecting each of eight fault classes against \ordi{} (Fig.~\ref{fig:e2}): groun
 
 \subsection{Graceful Degradation Under Fault Intensity}
 \label{sec:e3}
-Sweeping random-fault intensity from 0 to 50\% (Fig.~\ref{fig:e3}): the non-redundant B5 degrades from 0.3\% to 52.9\% misses, essentially linearly in faults. \ordi{} degrades to 16.6\%, a $3.2\times$ improvement, while its replica count \emph{falls} slightly (1.73 to 1.58) because fewer feasible backups exist under heavy faulting; the protection comes from placing the right backups, not more of them. B6 stays nearly flat (0.3\%, rising to 2.2\% only at the highest intensity) by paying 2.0 replicas everywhere, including the nominal epochs where redundancy buys nothing.
+Sweeping random-fault intensity from 0 to 50\% (Fig.~\ref{fig:e3}), B5's miss ratio rises from 51.2\% to 81.2\%, while \ordi{} reaches 77.5\%. The miss-ratio gap is modest under the restrictive contact mask, but \ordi{} retains substantially more value: at 50\% faults it delivers 28.5 utility versus B5's 16.1. Its replica count falls from 0.56 to 0.31 because heavy faulting removes feasible backups. Full replication holds misses near 53\% by consuming roughly three times \ordi{}'s energy at 50\% intensity.
 
 \begin{figure}[t]
 \centering
@@ -230,7 +231,7 @@ Sweeping random-fault intensity from 0 to 50\% (Fig.~\ref{fig:e3}): the non-redu
 \end{figure}
 
 \subsection{Scalability}
-From 12 to 60 satellites (Fig.~\ref{fig:e4}), misses fall from 55\% (a 12-satellite constellation simply lacks contact density toward two northern stations) to 0.4\% at 60 satellites. \ordi{} and B5 see identical feasibility, so their miss ratios coincide; \ordi{} delivers 11--12\% more utility at every scale through latency-aware placement and selective backups, and per-epoch runtime stays sub-second at 60 satellites.
+From 12 to 60 satellites (Fig.~\ref{fig:e4}), misses fall from 89.8\% to 4.0\% as contact and helper density improve. \ordi{} and B5 see the same planned feasibility, so their miss ratios coincide; \ordi{} delivers 7--16\% more utility across the sweep through latency-aware placement and selective backups.
 
 \begin{figure}[t]
 \centering
@@ -240,7 +241,7 @@ From 12 to 60 satellites (Fig.~\ref{fig:e4}), misses fall from 55\% (a 12-satell
 \end{figure}
 
 \subsection{Deadline Sensitivity}
-Sweeping the global deadline scale from 150 to 900\,s (Fig.~\ref{fig:e5}), \ordi{} beats single-satellite schedulers (B2, B4) at every point, missing 63.6\% vs.\ 68.5\% at a punishing 150\,s and 12.2\% vs.\ 18.1\% at 900\,s, with 17--22\% more delivered utility. The replica column explains the mechanism: at 150\,s \ordi{} averages just 0.57 replicas/tile, redundancy is rarely affordable and \ordi{} correctly declines it, spending its advantage on better primary placement; as slack grows, backups re-enter ($1.24$ at 900\,s).
+Sweeping the global deadline scale from 150 to 900\,s (Fig.~\ref{fig:e5}), \ordi{} beats the single-satellite schedulers at every point. It misses 94.2\% versus 95.5\% at 150\,s and 55.4\% versus 77.1\% at 900\,s; its utility advantage grows from 17\% to 60\%. Mean replicas rise from 0.09 to 0.48 as longer deadlines make distributed placements and backups feasible.
 
 \begin{figure}[t]
 \centering
@@ -250,7 +251,7 @@ Sweeping the global deadline scale from 150 to 900\,s (Fig.~\ref{fig:e5}), \ordi
 \end{figure}
 
 \subsection{Pricing Redundancy with \texorpdfstring{$\lambda_R$}{lambda\_R}}
-Sweeping $\lambda_R$ from 0 to 2 (Fig.~\ref{fig:e6}) moves mean replicas from 1.54 to 0.77 while the miss ratio is flat, confirming that in this regime backups protect utility (delivered utility falls from 160.9 to 148.8 as backups vanish) rather than feasibility, and giving operators a single dial trading energy for delivery confidence. We use $\lambda_R{=}0.05$ throughout, the knee of the curve.
+Sweeping $\lambda_R$ from 0 to 2 (Fig.~\ref{fig:e6}) moves mean replicas from 0.48 to 0.30 while the planned miss ratio remains 69.9\%. Delivered utility falls from 28.4 to 26.8 and energy from 144 to 91\,J, showing that $\lambda_R$ provides a direct confidence--energy trade-off. We use $\lambda_R{=}0.05$ throughout, near the transition before the curve saturates at 0.1.
 
 \begin{figure}[t]
 \centering
@@ -259,24 +260,55 @@ Sweeping $\lambda_R$ from 0 to 2 (Fig.~\ref{fig:e6}) moves mean replicas from 1.
 \label{fig:e6}
 \end{figure}
 
+\subsection{Backup-Cap Ablation}
+\label{sec:e9}
+To isolate whether the one-backup cap leaves useful reliability on the table, we set $\lambda_R{=}0$, permit up to four total replicas, and sweep $b_{\max}$ from 0 to 3 (Fig.~\ref{fig:e9}). The first backup cuts realized misses from 73.9\% to 72.3\% and raises utility from 26.8 to 28.4. A second reaches 72.2\% misses and 28.44 utility; a third adds no measurable reliability and only 0.003 utility. Energy grows from 91\,J with no backup to 144, 169, and 179\,J. Thus one backup captures 93\% of the maximum observed miss reduction, supporting $b_{\max}{=}1$ as the default.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{E9_backup_cap.png}
+\caption{Backup-cap ablation over 16 seeds with $\lambda_R{=}0$.}
+\label{fig:e9}
+\end{figure}
+
 \subsection{Correlated Failures}
 \label{sec:e7}
-Independence (Eq.~\ref{eq:zkv}) is the standard analytical convenience that orbital geometry breaks. We disable one or two entire orbital planes mid-horizon (Fig.~\ref{fig:e7}). With plane-disjoint backup placement, \ordi{} misses 2.4\% (one plane) and 4.6\% (two planes), statistically indistinguishable from full replication (2.3\%, 4.4\%) while using 1.71 vs.\ 1.95 replicas per tile. Structured redundancy, one backup placed against the actual failure correlation, substitutes for volume.
+Independence (Eq.~\ref{eq:zkv}) is the standard analytical convenience that orbital geometry breaks. We disable one or two entire orbital planes mid-horizon (Fig.~\ref{fig:e7}). With plane-disjoint backups, \ordi{} realizes 59.8\% misses for one plane and 61.3\% for two, versus 56.3\% and 57.7\% for full replication. That 3.5--3.6-point gap comes with 44--45\% fewer replicas and 44--45\% less energy, quantifying the price of the final reliability increment.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{E7_correlated.png}
-\caption{Correlated plane-wide outages: plane-disjoint backups match full replication at lower redundancy.}
+\caption{Correlated plane-wide outages: plane-disjoint backups approach full-replication reliability at lower redundancy.}
 \label{fig:e7}
 \end{figure}
 
 \subsection{Greedy vs.\ ILP Optimality}
 \label{sec:e8}
-On small instances solvable exactly, greedy \ordi{} and the ILP reference produce identical miss ratios (59.2\% on a deliberately over-constrained instance) and near-identical delivered utility (22.7 vs.\ 23.0); the ILP, maximizing the modeled objective under modeled probabilities, spends $3.6\times$ the ISL traffic and 61\% more energy on redundancy that realized execution does not reward. The greedy heuristic loses nothing measurable at a fraction of the cost, and unlike the ILP it scales.
+On small instances solvable exactly, greedy \ordi{} and the ILP reference produce identical planned miss ratios (88.9\%). Greedy delivers slightly higher utility (4.49 vs.\ 4.40) while using $5.8\times$ less ISL traffic and 32\% less energy. The ILP optimizes modeled expected reliability, but its additional redundancy does not improve realized execution in these contact-constrained instances.
 
-\subsection{End-to-End Real-World Data}
+\subsection{Real-World Wildfire Case Study}
 \label{sec:real}
-As a final check that \ordi{}'s advantage is not an artifact of the synthetic scenario generators, we re-run the core comparison with all three input drivers replaced by real measured data: real Planet Flock/SkySat orbits from CelesTrak~\cite{celestrak} (24 satellites, RAAN-clustered into planes), real tasking \emph{requests} from NASA FIRMS active-fire detections~\cite{firms} (fire location, time, and radiative-power-derived urgency are all real; 387 in-view fires become wildfire tasks) with delivery deadlines set to bracket fielded wildfire-alert latencies~\cite{ororatech}, and real BUPT-1 platform telemetry~\cite{wang2024cots} (battery and temperature) replayed in place of the RC model. Sentinel-2 acquisitions~\cite{sentinel2stac} are also supported as an alternative task source. The ordering established in Table~\ref{tab:e1} holds: \ordi{} attains the best delivered utility and realized objective at $0.87$ replicas/tile and $19.3\%$ misses, while full replication reaches a marginally lower $16.7\%$ miss ratio only by paying $1.9\times$ the replicas and energy, and non-distributed direct downlink misses $48\%$. The values reported throughout this paper (Table~\ref{tab:e1}) are thus corroborated by, and should be read as representative of, this real-data configuration.
+
+\textbf{Scenario.} We replace the synthetic input drivers with three measured datasets: CelesTrak TLEs for 24 Planet Flock/SkySat spacecraft~\cite{celestrak}, 387 in-view NASA FIRMS active-fire detections~\cite{firms}, and BUPT-1 battery and temperature telemetry~\cite{wang2024cots}. Each detection supplies a real time, location, and fire-radiative-power-derived urgency; deadlines bracket operational wildfire-alert latency~\cite{ororatech}. TLEs determine the contact graph, while telemetry replay replaces the RC state model. Eight seeds vary only quantities absent from these datasets: the covering source satellite, tile-level compute jitter, telemetry phase, and reliability outcomes.
+
+\begin{table}[t]
+\caption{Real-world wildfire case study, mean over eight seeds.}
+\label{tab:real}
+\centering
+\footnotesize
+\begin{tabular}{lrrrr}
+\toprule
+Algorithm & Miss & Utility & Energy (J) & Repl.\\
+\midrule
+B1 direct    & 0.484 & 1242.0 & 31  & 0\\
+B5 SECO-like & 0.466 & 614.7  & 254 & 0.53\\
+B6 full repl.& 0.426 & 781.3  & 545 & 1.15\\
+\textbf{\ordi{}} & \textbf{0.413} & \textbf{1311.0} & \textbf{279} & \textbf{0.60}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Outcome.} Table~\ref{tab:real} preserves \ordi{}'s utility advantage and gives it the lowest planned miss ratio among the reported methods. Full replication lowers the realized miss ratio from 47.2\% to 44.9\%, but uses $1.9\times$ the replicas, $2.0\times$ the energy, and $13.8\times$ the ISL traffic (2.79 vs. 0.20\,Gb). Direct downlink has a 48.4\% planned miss ratio. Thus selective redundancy remains effective when orbital geometry, urgent request locations, and platform state all come from operational data rather than synthetic generators.
 
 \section{Discussion and Limitations}
 \label{sec:discussion}
@@ -288,7 +320,7 @@ As a final check that \ordi{}'s advantage is not an artifact of the synthetic sc
 \section{Conclusion}
 \label{sec:conclusion}
 
-\ordi{} treats redundancy as a priced, orbit-aware resource rather than a blanket policy. One well-placed, fault-disjoint backup, admitted only when its marginal reliability gain justifies its energy and bandwidth cost, recovers nearly all of full replication's fault tolerance, including against correlated plane-wide outages, at 30\% fewer replicas and 32\% less energy, while a greedy rolling-horizon scheduler matches an ILP reference at scale-friendly cost. Calibration with public in-orbit COTS measurements grounds these conclusions in flight-measured power, compute, and battery behavior.
+\ordi{} treats redundancy as a priced, orbit-aware resource rather than a blanket policy. One fault-disjoint backup captures 93\% of the maximum observed miss reduction in the backup-cap ablation. Under a one-plane outage, selective placement stays within 3.5 percentage points of full replication's realized miss ratio with 44\% less energy, while the greedy scheduler uses $5.8\times$ less ISL traffic than the ILP reference. Calibration with public in-orbit COTS measurements grounds these conclusions in flight-measured power, compute, and battery behavior.
 
 We see three immediate extensions. First, hardware-in-the-loop calibration: replacing benchmark-derived workload profiles with per-power-mode latency and energy measurements on Jetson-class flight-representative accelerators, validating the thermal-throttling model against observed frequency scaling. Second, coded partial redundancy: fractional parity tiles between one replica and two may dominate both on the energy-reliability frontier for large tile grids. Third, decentralization: bounding how stale a satellite's view of constellation state can be before selective redundancy loses its advantage, and gossiping only the state that the marginal-gain test actually consumes. Code, declarative fault specifications, and all experiment configurations are available for reproduction.
 
@@ -298,7 +330,7 @@ We see three immediate extensions. First, hardware-in-the-loop calibration: repl
 \appendices
 
 \begin{table*}[!t]
-\caption{Complete core-comparison results, mean over 60 seeds. Cvg.\ = partial coverage; Rec.\ = recovery latency; Util\% = helper utilization; Obj.\ = realized objective; Repl.\ = mean replicas per tile.}
+\caption{Complete core-comparison results, mean over 60 seeds. Cvg.\ = partial coverage; Rec.\ = recovery latency; Util\% = helper utilization; Obj.\ = modeled objective; Repl.\ = mean replicas per tile.}
 \label{tab:e1full}
 \centering
 \small
@@ -307,14 +339,14 @@ We see three immediate extensions. First, hardware-in-the-loop calibration: repl
 Algorithm & Miss & Utility & Cvg. & Rec.\ (s) & ISL (Mb) & Downlink (Mb) & Energy (J) & Util\% & Obj. & Repl.\\
 \midrule
 B1 direct       & 0.951 & 8.0   & 0.049 & 305.6 & 0     & 8.27  & 0.41  & 0    & 8.0   & 0\\
-B2 onboard      & 0.273 & 137.2 & 0.727 & 222.6 & 0     & 40.19 & 211.5 & 0.003 & 137.2 & 0.73\\
-B3 compress     & 0.273 & 140.0 & 0.727 & 222.6 & 0     & 18.74 & 21.9  & 0.003 & 140.0 & 0.73\\
-B4 Serval-like  & 0.273 & 137.1 & 0.727 & 223.0 & 0     & 40.19 & 211.5 & 0.003 & 137.1 & 0.73\\
-B5 SECO-like    & 0.217 & 145.9 & 0.783 & 192.7 & 135.3 & 41.74 & 228.0 & 0.004 & 145.9 & 0.78\\
-B6 full repl.   & 0.217 & 156.4 & 0.783 & 229.9 & 269.3 & 41.74 & 452.0 & 0.007 & 142.7 & 1.56\\
-B7 random repl. & 0.217 & 145.9 & 0.783 & 268.0 & 349.7 & 41.74 & 455.9 & 0.007 & 132.1 & 1.57\\
-B8 CoCoI-like   & 0.217 & 156.5 & 0.783 & 229.8 & 270.8 & 41.74 & 453.9 & 0.007 & 142.7 & 1.57\\
-\textbf{\ordi{}} & \textbf{0.217} & \textbf{160.1} & \textbf{0.783} & \textbf{191.7} & \textbf{77.6} & \textbf{41.74} & \textbf{309.4} & \textbf{0.005} & \textbf{154.5} & \textbf{1.10}\\
+B2 onboard      & 0.853 & 17.2 & 0.147 & 682.6 & 0     & 11.91 & 45.6  & 0.001 & 17.2 & 0.15\\
+B3 compress     & 0.853 & 17.6 & 0.147 & 682.6 & 0     & 3.58  & 4.7   & 0.001 & 17.6 & 0.15\\
+B4 Serval-like  & 0.853 & 17.2 & 0.147 & 683.0 & 0     & 11.91 & 45.6  & 0.001 & 17.2 & 0.15\\
+B5 SECO-like    & 0.705 & 22.8 & 0.295 & 721.6 & 60.4  & 25.10 & 94.8  & 0.001 & 22.8 & 0.30\\
+B6 full repl.   & 0.705 & 24.4 & 0.295 & 833.9 & 102.4 & 25.10 & 171.9 & 0.003 & 20.1 & 0.54\\
+B7 random repl. & 0.705 & 23.6 & 0.295 & 878.5 & 124.8 & 25.10 & 175.4 & 0.003 & 19.2 & 0.55\\
+B8 CoCoI-like   & 0.705 & 24.5 & 0.295 & 836.5 & 104.6 & 25.10 & 174.9 & 0.003 & 20.0 & 0.55\\
+\textbf{\ordi{}} & \textbf{0.702} & \textbf{26.0} & \textbf{0.298} & \textbf{700.3} & \textbf{41.0} & \textbf{25.17} & \textbf{103.0} & \textbf{0.002} & \textbf{25.6} & \textbf{0.32}\\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -334,12 +366,13 @@ Table~\ref{tab:params} lists every parameter of the simulator, grouped by subsys
 \toprule
 Group & Parameter & Value\\
 \midrule
-\multirow{6}{*}{Constellation}
+\multirow{7}{*}{Constellation}
  & Pattern & Walker, 6 planes $\times$ 6 sats\\
  & Altitude / period & 550\,km / 5760\,s\\
  & Horizon & 17{,}280\,s (288 epochs of 60\,s)\\
  & Ground stations & Fairbanks, Greenwich\\
- & GS min.\ elevation & $5^\circ$ ($25^\circ$ in core comp.)\\
+ & GS min.\ elevation & $25^\circ$ (all benchmarks)\\
+ & ISL maximum range & 4{,}000\,km\\
  & ISL rate & 200\,Mb/s\\
 \midrule
 \multirow{4}{*}{Tasks}
@@ -396,7 +429,7 @@ Change & Siamese CNN & 96\,kB & 10\,kB & 1.8 & 0.9 & 480\\
 \section{Complete Core-Comparison Results}
 \label{app:full-e1}
 
-Table~\ref{tab:e1full} reports all ten metrics of the core comparison, mean over 60 seeds (Table~\ref{tab:e1} shows the headline columns). Note B6--B8 lose 9--14 objective points to the replication and congestion penalties of \eqref{eq:objective} that \ordi{} largely avoids.
+Table~\ref{tab:e1full} reports all ten metrics of the core comparison, mean over 60 seeds (Table~\ref{tab:e1} shows the headline columns). B6--B8 lose 4--5 objective points to the replication and congestion penalties of \eqref{eq:objective}, which \ordi{} largely avoids.
 
 
 \section{Fault Injection Details}
@@ -429,14 +462,15 @@ Table~\ref{tab:configs} gives the exact configuration of every experiment. All s
 \toprule
 Exp. & Swept variable & Algorithms & Seeds\\
 \midrule
-Core (\ref{sec:e1}) & none ($25^\circ$ GS elev.) & all 9 & 60\\
-Fault types & 7 fault classes & \ordi{} & 8\\
-Intensity (\ref{sec:e3}) & rate $\in\{0,.05,.1,.2,.35,.5\}$ & \ordi{}, B5, B6 & 24\\
-Scalability & $N \in \{12,24,36,60\}$ & \ordi{}, B5 & 8\\
-Deadline & scale $\in\{150..900\}$\,s & \ordi{}, B2, B4 & 8\\
-$\lambda_R$ sweep & $\{0,.01,.05,.1,.5,1,2\}$ & \ordi{} & 8\\
-Correlated (\ref{sec:e7}) & 1--2 plane outages & \ordi{}, B6, B7 & 8\\
-ILP gap (\ref{sec:e8}) & none (12 sats, 3/orbit) & greedy, ILP & 1\\
+Core (\ref{sec:e1}) & none & all 9 & 60\\
+Fault types & 8 fault classes & \ordi{} & 16\\
+Intensity (\ref{sec:e3}) & rate $\in\{0,.05,.1,.2,.35,.5\}$ & \ordi{}, B5, B6 & 48\\
+Scalability & $N \in \{12,24,36,60\}$ & \ordi{}, B5 & 16\\
+Deadline & scale $\in\{150..900\}$\,s & \ordi{}, B2, B4 & 16\\
+$\lambda_R$ sweep & $\{0,.01,.05,.1,.5,1,2\}$ & \ordi{} & 16\\
+Backup cap (\ref{sec:e9}) & $b_{\max}{\in}\{0,1,2,3\}$, $\lambda_R{=}0$ & \ordi{} & 16\\
+Correlated (\ref{sec:e7}) & 1--2 plane outages & \ordi{}, B6, B7 & 16\\
+ILP gap (\ref{sec:e8}) & 9/12 sats, 3/orbit & greedy, ILP & 12 each\\
 Real (\ref{sec:real}) & Planet TLE + FIRMS + telemetry & all 9 & 8\\
 \bottomrule
 \end{tabular}

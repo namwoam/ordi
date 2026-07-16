@@ -47,14 +47,19 @@ tasks:
     cmds:
       - uv run python -m ordi.main run E8
 
+  e9:
+    desc: "E9 - Maximum-backup cap ablation"
+    cmds:
+      - uv run python -m ordi.main run E9
+
   real:
-    desc: "REAL - full real-data pipeline: Planet orbits + Sentinel-2 tasks + BUPT-1 telemetry"
+    desc: "REAL - full real-data pipeline: Planet orbits + NASA FIRMS tasks + BUPT-1 telemetry"
     cmds:
       - uv run python -m ordi.main run REAL
 
   # ── run all experiments ────────────────────────────────────────────────────
   run-all:
-    desc: Run all experiments E1-E8 and REAL sequentially
+    desc: Run all experiments E1-E9 and REAL sequentially
     cmds:
       - task: e1
       - task: e2
@@ -64,6 +69,7 @@ tasks:
       - task: e6
       - task: e7
       - task: e8
+      - task: e9
       - task: real
 
   # ── plotting ───────────────────────────────────────────────────────────────
@@ -76,6 +82,11 @@ tasks:
     desc: Plot E1 figure only
     cmds:
       - uv run python -m ordi.main plot E1
+
+  plot-e9:
+    desc: Plot E9 backup-cap ablation only
+    cmds:
+      - uv run python -m ordi.main plot E9
 
   plot-real:
     desc: Plot REAL real-data pipeline figure only

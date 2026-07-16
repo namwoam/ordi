@@ -8,7 +8,7 @@ Per epoch:
        a. Enumerate feasible (helper, aggregator) candidates
        b. Score by marginal objective: ΔU - λ_E·ΔE - λ_C·ΔC - λ_R·ΔR
        c. Assign primary replica (best score)
-       d. Add backup if marginal gain > 0 and budget allows
+       d. Add backups up to the configured cap while marginal gain > 0
   4. Commit assignments; update Q_i, B_i, link utilization
 """
 
@@ -36,6 +36,10 @@ class ORDIConfig:
     alpha: float = 0.002      # freshness decay rate (1/s)
     epoch_length: float = 60.0  # seconds
     isl_rate_bps: float = 200e6
+    # Maximum number of selectively admitted backups per tile. The paper's
+    # default policy uses one; E9 sweeps larger caps as an ablation. The task's
+    # n_replicas_max remains the hard upper bound on total replicas.
+    max_backups: int = 1
     # Under a correlated-failure threat model (E7), require the backup's helper
     # to occupy a different orbital plane than the primary's helper. Off by
     # default so nominal experiments keep the emergent-placement framing.
@@ -273,19 +277,29 @@ class ORDIScheduler(EpochRoutingCacheMixin):
         replica_probs = [primary.p_success]
         assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
 
-        # ── backup replica ────────────────────────────────────────────────────
-        if tile.n_replicas_max >= 2:
+        # ── backup replicas ───────────────────────────────────────────────────
+        # Existing experiments retain the paper's one-backup policy through
+        # cfg.max_backups=1. The cap ablation raises this value and the task's
+        # hard replica limit, admitting each additional backup only while its
+        # reliability gain remains positive.
+        replica_cap = min(tile.n_replicas_max, 1 + max(0, cfg.max_backups))
+        if replica_cap >= 2:
+            selected_helpers = {primary.helper}
+            selected_aggregators = {primary.aggregator}
+            selected_planes = {_plane_of(primary.helper)}
             for _, backup in scored[1:]:
-                # Must use a different aggregator than primary
-                if backup.aggregator == primary.aggregator:
+                if len(assignment.replicas) >= replica_cap:
+                    break
+                # Replicas must use mutually distinct helpers and aggregators.
+                if backup.aggregator in selected_aggregators:
                     continue
-                if backup.helper == primary.helper:
+                if backup.helper in selected_helpers:
                     continue
                 # Under a correlated-failure threat model, reject backups whose
-                # helper shares an orbital plane with the primary's helper.
+                # helper shares a plane with any already-selected replica.
                 if cfg.plane_disjoint_backup:
-                    bp, pp = _plane_of(backup.helper), _plane_of(primary.helper)
-                    if bp is not None and bp == pp:
+                    bp = _plane_of(backup.helper)
+                    if bp is not None and bp in selected_planes:
                         continue
 
                 h_state = self.states[backup.helper]
@@ -305,12 +319,15 @@ class ORDIScheduler(EpochRoutingCacheMixin):
 
                 if delta_utility - delta_energy - delta_rep > 0:
                     assignment.replicas.append(backup)
-                    assignment.backup_aggregator = backup.aggregator
+                    if assignment.backup_aggregator is None:
+                        assignment.backup_aggregator = backup.aggregator
                     replica_probs.append(backup.p_success)
                     assignment.z_kv = self.reliability.tile_delivery_prob(replica_probs, source_pi)
                     assignment.L_hat = min(assignment.L_hat, backup.latency)
                     _charge_resources(backup, energy_used, link_used, task.source_sat)
-                    break  # one backup is sufficient per proposal
+                    selected_helpers.add(backup.helper)
+                    selected_aggregators.add(backup.aggregator)
+                    selected_planes.add(_plane_of(backup.helper))
 
         return assignment
 

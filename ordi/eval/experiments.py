@@ -1,5 +1,5 @@
 """
-Experiment runner for E1–E8.
+Experiment runner for E1–E9.
 
 Each experiment returns a dict: {algorithm_name: List[EpochMetrics]}.
 Results are saved to results/<experiment_id>.csv.
@@ -74,7 +74,8 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                arrival_rate=6.0, ground_stations=None,
                orbit_period_s=5760.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
-               min_elevation_deg=5.0, satellite_params_factory=None):
+               min_elevation_deg=25.0, satellite_params_factory=None,
+               n_replicas_max=2):
     """Build all shared simulation objects.
 
     orbit_period_s        : realistic LEO period at 550 km altitude (~5760 s / 96 min).
@@ -87,6 +88,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     fov_range_km          : camera footprint radius (600 km ≈ ±42° off-nadir at 550 km
                             altitude; realistic for a wide-field EO imager).
     n_targets             : number of random ground targets (uniformly in ±60° lat).
+    n_replicas_max        : hard per-tile cap on total replicas.
     """
     import random as _rng_mod
     if ground_stations is None:
@@ -139,6 +141,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         sat_groundtrack=sat_groundtrack,
         ground_targets=ground_targets,
         fov_range_km=fov_range_km,
+        n_replicas_max=n_replicas_max,
     )
     cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
 
@@ -452,7 +455,7 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
 # The stressed reference scenario (shared by E1, E5, E6): a sparser Walker and
-# realistic 25° Ka-band GS elevation so deadlines actually bind.
+# higher task load. All benchmarks use the same 25° GS elevation mask.
 _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         arrival_rate=8.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
@@ -464,10 +467,9 @@ def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
     with arrival_rate=8 so the FOV filter still yields ~13 tasks.
 
-    25° minimum elevation angle for ground-station contacts, realistic for
-    Ka-band dishes (Starlink's original 25° threshold; industry range 10–25°).
-    At 550 km altitude this cuts each GS pass from ~10 min (at 5°) to ~4.5 min,
-    so a given source satellite is in direct view only ~9 % of the time.
+    All experiments use a 25° minimum elevation angle for ground-station
+    contacts. At 550 km altitude, a pass lasts about 4.5 min, so a given source
+    satellite is in direct view only about 9% of the time.
 
     B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
     satellite itself to enter a GS contact window — no ISL relay.  With narrow
@@ -635,9 +637,8 @@ def run_E5(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
     # are wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s.
     # Smaller scales compress all medians proportionally, increasing miss rate.
-    # Uses the E1 stressed setup (6×4 Walker, 25° GS elevation) — under the
-    # default 5° regime downlink windows are so plentiful that deadline
-    # tightness never bites and the sweep is flat.
+    # Uses the E1 stressed setup (6×4 Walker, 25° GS elevation) so downlink
+    # windows remain constrained enough for deadline tightness to matter.
     # Sim is rebuilt per (scale, seed) → one config worker each, all concurrent.
     alg_classes = [("ORDI", ORDIScheduler),
                    ("B2_onboard_only", OnboardOnly),
@@ -841,6 +842,42 @@ def run_E8(seed=0, n_seeds=12) -> Dict[str, List[EpochMetrics]]:
     return results
 
 
+# ── E9: maximum-backup cap ablation ─────────────────────────────────────────
+
+def run_E9(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
+    """Ablate ORDI's structural backup cap from zero to three.
+
+    The replication price is set to zero in every arm so the cap, rather than
+    lambda_R, is the binding control. Candidates still need positive marginal
+    reliability utility after their energy cost. Tasks permit four total
+    replicas (one primary plus three backups); existing experiments retain the
+    default hard cap of two and max_backups=1.
+    """
+    backup_caps = [0, 1, 2, 3]
+    print(f"E9: backup-cap ablation {backup_caps} (lambda_R=0, {n_seeds} seeds)")
+
+    config_args = []
+    build_kwargs = {**_E1_BUILD_KWARGS, "n_replicas_max": 4}
+    for s in range(n_seeds):
+        jobs = [
+            (f"ORDI@backups={cap}#s{s}", "ORDI", ORDIScheduler, None,
+             {"max_backups": cap, "lambda_R": 0.0})
+            for cap in backup_caps
+        ]
+        config_args.append((build_kwargs, jobs, seed + s))
+
+    raw = _run_configs_parallel(config_args, desc="E9 seeds")
+    results: Dict[str, List[EpochMetrics]] = {}
+    for cap in backup_caps:
+        results[f"ORDI@backups={cap}"] = [
+            m for s in range(n_seeds)
+            for m in raw[f"ORDI@backups={cap}#s{s}"]
+        ]
+
+    _save_csv("E9_backup_cap", results)
+    return results
+
+
 # ── REAL: full real-data pipeline (real orbits + tasks + telemetry) ───────────
 
 # A recent UTC window mapped to sim t=0. Real TLEs propagate at real epochs, so
@@ -944,7 +981,7 @@ def _build_sim_real(task_source="fire"):
 def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetrics]]:
     """Full real-data pipeline: real Planet orbits + real tasking requests +
     BUPT-1 telemetry replay. Complements (does not replace) the synthetic
-    E1–E8 experiments.
+    E1–E9 experiments.
 
     task_source:
       "fire"        NASA FIRMS active-fire detections as tasking requests
@@ -1049,6 +1086,7 @@ def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetri
 ALL_EXPERIMENTS = {
     "E1": run_E1, "E2": run_E2, "E3": run_E3, "E4": run_E4,
     "E5": run_E5, "E6": run_E6, "E7": run_E7, "E8": run_E8,
+    "E9": run_E9,
     "REAL": run_REAL,
 }
 

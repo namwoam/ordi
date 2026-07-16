@@ -2,8 +2,8 @@
 ORDI CLI entry point.
 
 Usage:
-  python -m ordi.main run [E1|E2|...|E8|REAL|all]
-  python -m ordi.main plot [E1|E2|...|E8|REAL|all]
+  python -m ordi.main run [E1|E2|...|E9|REAL|all]
+  python -m ordi.main plot [E1|E2|...|E9|REAL|all]
   python -m ordi.main run all && python -m ordi.main plot all
 """
 
@@ -21,6 +21,7 @@ from ordi.eval.plots import plot_all
 PLOT_FNS = {
     "E1": "plot_E1", "E2": "plot_E2", "E3": "plot_E3", "E4": "plot_E4",
     "E5": "plot_E5", "E6": "plot_E6", "E7": "plot_E7", "E8": "plot_E8",
+    "E9": "plot_E9",
     "REAL": "plot_REAL",
 }
 

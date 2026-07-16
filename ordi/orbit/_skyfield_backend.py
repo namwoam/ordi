@@ -105,12 +105,9 @@ def compute_contact_windows(
     Uses a coarse sampling pass to detect contacts, then refines boundaries
     via bisection. Returns sorted ContactEvent list.
 
-    min_elevation_deg : minimum satellite elevation above horizon for a ground
-        contact to be valid.  5° (current default) is the absolute geometric
-        minimum; 10–25° is the operational range for real ground-station dishes
-        (10–15° for large parabolic GS antennas, 20–25° for Ka-band/user
-        terminals such as Starlink's original 25° threshold).  Higher values
-        produce shorter contact windows and model more realistic antenna limits.
+    min_elevation_deg : minimum satellite elevation above the local horizon.
+        The 25° default is applied uniformly across benchmarks as a conservative
+        operational mask; higher masks shorten contact windows.
     """
     if ground_stations is None:
         ground_stations = DEFAULT_GROUND_STATIONS

@@ -81,15 +81,17 @@ def fetch_fire_requests(
     start_date : 'YYYY-MM-DD' (UTC); days : 1..10 window from start_date.
     Returns detections sorted by time.
     """
-    key = map_key or os.environ.get("FIRMS_MAP_KEY", "")
-    if not key:
-        raise RuntimeError("FIRMS map key required: set FIRMS_MAP_KEY or pass map_key=.")
-
     cache = (Path(cache_path) if cache_path
              else _data_dir() / f"firms_{source}_{start_date}_{days}d.csv")
     if cache.exists() and not refresh:
         text = cache.read_text()
     else:
+        key = map_key or os.environ.get("FIRMS_MAP_KEY", "")
+        if not key:
+            raise RuntimeError(
+                "FIRMS map key required when no cache is available: "
+                "set FIRMS_MAP_KEY or pass map_key=."
+            )
         url = FIRMS_AREA_URL.format(key=key, src=source, bbox=bbox, days=days, start=start_date)
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             text = resp.read().decode("utf-8", errors="replace")
