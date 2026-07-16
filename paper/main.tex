@@ -6,10 +6,15 @@
 \usepackage{booktabs}
 \usepackage{multirow}
 \usepackage{cite}
+\usepackage{algorithm}
+\usepackage{algorithmic}
 \usepackage{url}
 \usepackage{xcolor}
 \usepackage{float}
 \usepackage[hidelinks]{hyperref}
+
+\floatstyle{ruled}
+\restylefloat{algorithm}
 
 \graphicspath{{../figure/}}
 
@@ -106,36 +111,56 @@ subject to per-replica deadline feasibility $L_{kvia} \le \tau_k(t)$, helper ene
 \label{sec:design}
 
 Our code is available at https://github.com/namwoam/ordi.
-\subsection{Rolling-Horizon Scheduling}
-Each epoch, \ordi{} operates on the current satellite states and the contact graph for that epoch, both provided by the simulation loop (states advanced by the energy/thermal or telemetry-replay model, contact graphs precomputed from orbital propagation). It then (i) computes the shared per-epoch routing caches described below, (ii) sorts pending tiles by urgency-weighted utility $u_{kv}/\tau_k$, so scarce routing resources go to high-value, tight-deadline tiles first, and (iii) assigns replicas greedily per tile.
+\ordi{} is a rolling-horizon greedy scheduler (Algorithm~\ref{alg:ordi}). At each epoch it reads the current compute, battery, thermal, queue, and availability state, builds earliest-arrival routing caches from the time-expanded contact graph, and orders pending tiles by urgency-weighted utility $u_{kv}/\tau_k$. This ordering gives scarce compute and contact capacity to valuable tiles with little remaining slack.
 
-\subsection{Feasibility and Candidate Enumeration}
-For tile $(k,v)$, every available (helper $i$, aggregator $a$) pair defines a candidate with latency
+For tile $(k,v)$, an available helper--aggregator pair $(i,a)$ is a candidate with latency
 \begin{equation}
 L_{kvia} = \ell_{s_k i}(d^{\mathrm{in}}_{kv}) + \frac{c_{kv}}{C_i(t)} + \ell_{ia}(d^{\mathrm{out}}_{kv}) + \ell^{\mathrm{down}}_{a}(d^{\mathrm{out}}_{kv}),
 \label{eq:latency}
 \end{equation}
-feasible iff $L_{kvia} \le \tau_k(t)$ and $A_i = A_a = 1$. Two degenerate forms are always included: helper-as-aggregator (the helper downlinks its own result, no relay hop) and source self-processing, which guarantees \ordi{} never performs worse than onboard-only execution. Latencies in \eqref{eq:latency} reduce to three routing primitives per epoch, source-to-all, all-pairs, and all-to-ground earliest arrival, which \ordi{} computes once per epoch as shared single-source Dijkstra sweeps and caches as dense arrays, eliminating per-candidate graph searches.
+and is feasible iff $L_{kvia}\le\tau_k(t)$, $A_i=A_a=1$, and its committed energy leaves the helper above $B_{\min}$. The set also includes helper-as-aggregator and source self-processing cases. The four latency terms reduce to source-to-all, all-pairs, and all-to-ground earliest-arrival lookups; shared Dijkstra sweeps compute these dense caches once per epoch rather than once per candidate.
 
-\subsection{Marginal-Gain Replica Selection}
-Each feasible candidate is scored by its marginal contribution to \eqref{eq:objective}:
+Each feasible candidate is scored by its primary-placement gain
 \begin{equation}
 \Delta_{kvia} = u_{kv}\, p_{kvia}\, e^{-\alpha L_{kvia}} - \lambda_E \Delta E_{kvia} - \lambda_C \Delta C_{kvia},
 \end{equation}
-where $\Delta E$ sums receive, compute, and transmit energy on the helper and $\Delta C$ prices ISL bits by inverse link capacity. Candidates whose energy draw would push the helper below its battery floor, including energy already committed this epoch, are discarded. The best candidate becomes the primary replica.
-
-A backup is then considered among remaining candidates with a \emph{different helper and different aggregator}, and is admitted only if
+where $\Delta E$ includes receive, compute, and transmit energy and $\Delta C$ prices ISL bits by inverse link capacity. The highest-scoring candidate becomes the primary. The remaining candidates are scanned in score order; a candidate with a different helper and aggregator (and, under a correlated-failure model, a different orbital plane) is admitted as the backup only if
 \begin{equation}
 u_{kv}\,\Delta z_{kv}\, e^{-\alpha L} - \lambda_E \Delta E - \lambda_R > 0,
 \label{eq:backup}
 \end{equation}
-where $\Delta z_{kv}$ is the increase in \eqref{eq:zkv} from adding the backup. Because $\Delta z_{kv}$ shrinks as the primary's $p$ grows, redundancy concentrates automatically on tiles whose primaries are unreliable, distant helpers, congested paths, marginal downlinks, rather than being spent uniformly. Under correlated-failure threat models, the backup is further required to reside in a different orbital plane than the primary (Section~\ref{sec:e7}).
+where $\Delta z_{kv}$ is the reliability increase from Eq.~\eqref{eq:zkv}. Thus reliable primaries remain unreplicated, while uncertain paths receive one fault-disjoint backup when its freshness-discounted benefit covers its cost. Committing a replica updates the epoch's energy and link budgets before the next tile is considered.
 
-\subsection{Replanning}
-Helper failure, missed contacts, and stragglers (a tile not returned within $1.5\times$ its expected latency) trigger replanning: failed helpers are marked unavailable and affected tiles re-enter scheduling within the current epoch. Recovery thus costs one scheduling pass, not a full horizon recomputation.
+\begin{algorithm}[t]
+\caption{ORDI rolling-horizon scheduler}
+\label{alg:ordi}
+\begin{algorithmic}[1]
+\REQUIRE epoch $t$, pending tiles $\mathcal P$, states $\sigma(t)$, contacts $E(t)$, \textsc{PlaneDisjoint}
+\STATE Build earliest-arrival cache $\Lambda(t)$ from $E(t)$
+\STATE Sort $\mathcal P$ by decreasing $u_{kv}/\tau_k(t)$
+\FOR{$(k,v)\in\mathcal P$}
+  \STATE $\mathcal F_{kv}\leftarrow$ feasible replicas satisfying Eq.~\eqref{eq:latency}, availability, and energy constraints
+  \IF{$\mathcal F_{kv}=\emptyset$} \STATE \textbf{continue} \ENDIF
+  \STATE $r_1\leftarrow\arg\max_{r\in\mathcal F_{kv}}\Delta_r$; $R\leftarrow\{r_1\}$
+  \STATE $\mathcal D\leftarrow\{r\in\mathcal F_{kv}\setminus R:h_r\ne h_{r_1},\ a_r\ne a_{r_1}\}$
+  \IF{\textsc{PlaneDisjoint}}
+    \STATE $\mathcal D\leftarrow\{r\in\mathcal D:\phi(h_r)\ne\phi(h_{r_1})\}$
+  \ENDIF
+  \STATE Sort $\mathcal D$ by decreasing $\Delta_r$
+  \IF{$\mathcal D\ne\emptyset$}
+    \STATE $r_2\leftarrow$ first $r\in\mathcal D$ with $\Delta(r\mid R)>0$
+    \IF{$r_2$ exists} \STATE $R\leftarrow R\cup\{r_2\}$ \ENDIF
+  \ENDIF
+  \STATE Commit $R$; update energy and link usage
+\ENDFOR
+\IF{failure, missed contact, or $1.5\times$ straggler}
+  \STATE Mark failed helpers unavailable
+  \STATE Reschedule only affected tiles within epoch $t$
+\ENDIF
+\end{algorithmic}
+\end{algorithm}
 
-\subsection{Complexity}
-With $n$ active satellites and $m$ pending tiles per epoch, candidate enumeration is $O(m n^2)$ array lookups after the per-epoch routing sweeps, which cost $O(n \cdot \mathrm{SSSP})$. The ILP in contrast couples all tiles through shared capacities and is practical only at toy scale.
+In Algorithm~\ref{alg:ordi}, $\phi(h)$ returns helper $h$'s orbital plane. \textsc{PlaneDisjoint} is enabled only for the correlated plane-outage model in Section~\ref{sec:e7}; otherwise backups need only use a different helper and aggregator. $\Delta(r\mid R)$ is the marginal gain in Eq.~\eqref{eq:backup}, and at most one backup is selected. Routing costs $O(n\cdot\mathrm{SSSP})$ per epoch and enumeration costs $O(mn^2)$ cached lookups, whereas the ILP is limited to small instances.
 
 \section{Implementation}
 \label{sec:impl}
