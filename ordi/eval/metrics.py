@@ -1,5 +1,5 @@
 """
-Metric computation from SchedulerResult lists.
+Metric computation from algorithm ``Decision`` objects.
 
 Metrics (per the proposal's evaluation plan):
   - deadline_miss_ratio      : fraction of tiles not delivered before D_k
@@ -18,7 +18,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
-from ordi.scheduler.ordi import SchedulerResult, TileAssignment
+from ordi.algorithms import Decision
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask
 from ordi.sim.satellite import DEFAULT_COMMS_POWER_W, DEFAULT_DOWNLINK_RATE_BPS
@@ -48,7 +48,7 @@ class EpochMetrics:
 
 
 def compute_metrics(
-    result: SchedulerResult,
+    result: Decision,
     tasks: List[EOTask],
     epoch_start: float,
     sat_compute_capacity: Dict[str, float],   # sat_id → FLOP budget (C_i·epoch length, summed over the horizon for lifetime records)
@@ -79,26 +79,43 @@ def compute_metrics(
         task_obj, tile = tile_lookup[key]
         task_total[task_obj.task_id] = task_total.get(task_obj.task_id, 0) + 1
 
-        if assignment.z_kv == 0.0 or math.isinf(assignment.L_hat):
+        reliability = float(assignment.metadata.get(
+            "reliability", assignment.metadata.get("reconstruction_probability", 0.0)
+        ))
+        latency = float(assignment.metadata.get("latency", math.inf))
+        if reliability <= 0.0 or math.isinf(latency):
             n_miss += 1
         else:
-            utility_sum += tile.utility * assignment.z_kv * math.exp(
-                -alpha * assignment.L_hat
+            utility_sum += tile.utility * reliability * math.exp(
+                -alpha * latency
             )
             task_delivered[task_obj.task_id] = task_delivered.get(task_obj.task_id, 0) + 1
-            recovery_lats.append(assignment.L_hat)
+            recovery_lats.append(latency)
 
-        # Compute and ISL energy from replicas.
-        for replica in assignment.replicas:
-            m.isl_traffic_bits += replica.d_in_bits + replica.d_out_bits
-            m.energy_joules += replica.e_compute + replica.e_rx + replica.e_tx
+        # The policy schema records placement, while Basilisk owns physical
+        # energy evolution. Traffic is derived from the selected paths and the
+        # optional energy estimate is useful only as an objective diagnostic.
+        for index, (helper, aggregator) in enumerate(
+                zip(assignment.helpers, assignment.aggregators)):
+            if index < len(assignment.routes):
+                route_in, route_out, route_down = assignment.routes[index]
+                m.isl_traffic_bits += tile.d_in_bits * max(0, len(route_in) - 1)
+                m.isl_traffic_bits += tile.d_out_bits * max(0, len(route_out) - 1)
+                m.isl_traffic_bits += tile.d_out_bits * max(0, len(route_down) - 2)
+            else:
+                if helper != assignment.source:
+                    m.isl_traffic_bits += tile.d_in_bits
+                if helper != aggregator:
+                    m.isl_traffic_bits += tile.d_out_bits
+        m.energy_joules += float(assignment.metadata.get("energy_j", 0.0))
 
         # Every delivered tile incurs spacecraft-to-ground transmit energy.
         # Normal inference schedulers downlink the compact result; direct and
         # compression baselines record their raw/compressed size explicitly.
-        if assignment.z_kv > 0.0 and not math.isinf(assignment.L_hat):
-            downlink_bits = (tile.d_out_bits if assignment.downlink_bits is None
-                             else assignment.downlink_bits)
+        if reliability > 0.0 and not math.isinf(latency):
+            downlink_bits = float(assignment.metadata.get(
+                "downlink_bits", tile.d_in_bits if assignment.downlink_only else tile.d_out_bits
+            ))
             m.downlink_volume_bits += downlink_bits
             m.energy_joules += downlink_power_w * downlink_bits / downlink_rate_bps
 
@@ -113,8 +130,9 @@ def compute_metrics(
     m.delivered_utility = utility_sum
     m.partial_coverage = sum(partial_coverages) / len(partial_coverages) if partial_coverages else 0.0
     m.recovery_latency = sum(recovery_lats) / len(recovery_lats) if recovery_lats else 0.0
-    m.objective = result.objective
-    m.n_replicas_avg = (sum(len(a.replicas) for a in result.assignments) / n_tiles
+    m.objective = sum(float(a.metadata.get("objective", 0.0))
+                      for a in result.assignments)
+    m.n_replicas_avg = (sum(len(a.helpers) for a in result.assignments) / n_tiles
                         if n_tiles > 0 else 0.0)
 
     # Helper utilization: fraction of the constellation's compute budget the
@@ -125,7 +143,7 @@ def compute_metrics(
     # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
     compute_used = sum(
-        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops * len(a.replicas)
+        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops * len(a.helpers)
         for a in result.assignments
         if (a.task_id, a.tile_id) in tile_lookup
     )
@@ -135,37 +153,48 @@ def compute_metrics(
     return m
 
 
-def _replica_components(replica, source: str) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...], str]:
+def _replica_components(helper: str, agg: str, source: str, routes=None
+                        ) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...], str]:
     """Decompose a replica into the (nodes, isl_links, downlink_node) whose
     joint survival determines whether the replica delivers, mirroring the terms
     of ReliabilityModel.replica_success_prob.
 
-    A replica succeeds iff the helper node, the source→helper ISL, the
+    A replica succeeds iff the helper and aggregator nodes, source→helper ISL,
     helper→aggregator ISL, and the aggregator's downlink all survive. (The
     source node is shared across all replicas of a tile and sampled once at the
     tile level, so it is excluded here.) Self-processing replicas where the
     helper is the source carry no source→helper hop; helper-as-aggregator
     replicas carry no helper→aggregator hop.
 
-    The component set mirrors replica_success_prob exactly (helper node only,
-    not the aggregator node), so under independent draws the Monte Carlo miss
-    ratio converges to the modeled z_kv; the only divergence comes from draws
+    The component set mirrors the policy placement probability, so under
+    independent draws the Monte Carlo miss ratio converges to the modeled
+    expectation; the only divergence comes from draws
     shared across replicas, which is the correlation effect this layer exists
     to expose.
     """
-    helper = replica.helper
-    agg = replica.aggregator
-    nodes = {helper}
+    nodes = {helper, agg}
+    nodes.discard(source)
     isl_links: Set[Tuple[str, str]] = set()
-    if helper != source:
-        isl_links.add((min(source, helper), max(source, helper)))
-    if helper != agg:
-        isl_links.add((min(helper, agg), max(helper, agg)))
-    return tuple(sorted(nodes)), tuple(sorted(isl_links)), agg
+    downlink_node = agg
+    if routes:
+        route_in, route_out, route_down = routes
+        for path in (route_in, route_out):
+            isl_links.update((min(a, b), max(a, b))
+                             for a, b in zip(path, path[1:]))
+        if len(route_down) >= 2:
+            isl_links.update((min(a, b), max(a, b))
+                             for a, b in zip(route_down[:-2], route_down[1:-1]))
+            downlink_node = route_down[-2]
+    else:
+        if helper != source:
+            isl_links.add((min(source, helper), max(source, helper)))
+        if helper != agg:
+            isl_links.add((min(helper, agg), max(helper, agg)))
+    return tuple(sorted(nodes)), tuple(sorted(isl_links)), downlink_node
 
 
 def compute_realized_metrics(
-    result: SchedulerResult,
+    result: Decision,
     tasks: List[EOTask],
     reliability: ReliabilityModel,
     alpha: float = 0.002,
@@ -201,25 +230,36 @@ def compute_realized_metrics(
     if n_tiles == 0:
         return base
 
-    scored = []  # (task_id, tile, utility_weight, [replica_component_tuples], source)
+    scored = []  # (task_id, tile, latency, components, source, required successes)
     for a in result.assignments:
         key = (a.task_id, a.tile_id)
         if key not in tile_lookup:
             continue
         task_obj, tile = tile_lookup[key]
-        if not a.replicas or math.isinf(a.L_hat):
+        latency = float(a.metadata.get("latency", math.inf))
+        reliability_estimate = float(a.metadata.get(
+            "reliability", a.metadata.get("reconstruction_probability", 0.0)
+        ))
+        if not a.helpers or math.isinf(latency):
             # B1-style no-replica assignments: fall back to a single synthetic
             # downlink replica off the primary aggregator so they are still
             # sampled rather than silently treated as always-delivered.
-            if a.z_kv > 0 and not math.isinf(a.L_hat) and a.primary_aggregator:
-                scored.append((task_obj.task_id, tile, a.L_hat,
-                               [(("__none__",), (), a.primary_aggregator)],
-                               task_obj.source_sat))
+            if reliability_estimate > 0 and not math.isinf(latency):
+                aggregator = a.aggregators[0] if a.aggregators else a.source
+                scored.append((task_obj.task_id, tile, latency,
+                               [(("__none__",), (), aggregator)],
+                               task_obj.source_sat, 1))
             else:
-                scored.append((task_obj.task_id, tile, a.L_hat, [], task_obj.source_sat))
+                scored.append((task_obj.task_id, tile, latency, [],
+                               task_obj.source_sat, 1))
             continue
-        comps = [_replica_components(r, task_obj.source_sat) for r in a.replicas]
-        scored.append((task_obj.task_id, tile, a.L_hat, comps, task_obj.source_sat))
+        comps = [_replica_components(
+            h, g, task_obj.source_sat,
+            a.routes[index] if index < len(a.routes) else None,
+        ) for index, (h, g) in enumerate(zip(a.helpers, a.aggregators))]
+        required = int(a.metadata.get("data_shards", 1))
+        scored.append((task_obj.task_id, tile, latency, comps,
+                       task_obj.source_sat, required))
 
     rng = random.Random(seed)
     miss_trials = []
@@ -253,16 +293,16 @@ def compute_realized_metrics(
         task_delivered: Dict[int, int] = {}
         task_total: Dict[int, int] = {}
 
-        for tid, tile, L_hat, comps, src in scored:
+        for tid, tile, L_hat, comps, src, required in scored:
             task_total[tid] = task_total.get(tid, 0) + 1
-            delivered = False
+            successes = 0
             if comps and node_ok(src):
                 for nodes, isl_links, agg in comps:
                     if (all(node_ok(n) for n in nodes)
                             and all(link_ok(l) for l in isl_links)
                             and down_ok(agg)):
-                        delivered = True
-                        break
+                        successes += 1
+            delivered = successes >= required
             if delivered:
                 util += tile.utility * math.exp(-alpha * L_hat)
                 task_delivered[tid] = task_delivered.get(tid, 0) + 1

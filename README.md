@@ -2,9 +2,9 @@
 
 **Orbit-Aware Redundant Distributed Inference for LEO Earth Observation Constellations**
 
-ORDI is a simulator and scheduling research prototype for distributing tiled Earth-observation inference workloads across low-Earth-orbit satellites. It uses orbit-aware contact graphs, satellite resource state, and selective fault-disjoint replication to improve deadline performance without the cost of replicating every task.
+ORDI is a scheduling research prototype for distributing tiled Earth-observation inference workloads across low-Earth-orbit satellites. It runs as a policy on Basilisk/BSK-RL, using orbit-aware contact graphs, satellite resource state, and selective fault-disjoint replication to improve deadline performance without the cost of replicating every task.
 
-The repository includes the ORDI scheduler, eight comparison baselines, fault injection, an ILP reference solver, ten evaluations, plotting utilities, and the accompanying paper.
+The repository includes ORDI, eight self-contained comparison policies, fault injection, an ILP reference policy, ten evaluations, plotting utilities, and the accompanying paper.
 
 ![ORDI core evaluation](figure/E1_core.png)
 
@@ -18,7 +18,7 @@ ORDI schedules each image tile over a rolling horizon. For every epoch it:
 4. Adds backups up to a configurable cap only while their marginal reliability gain exceeds their replication cost, while keeping replicas fault-disjoint. The default cap is one.
 5. Replans work affected by helper failures, missed contacts, or stragglers.
 
-The simulator models Walker constellations, field-of-view-constrained task arrivals, ground contacts, inter-satellite links, workload-specific compute and data profiles, and seven classes of injected faults.
+Basilisk/BSK-RL models the spacecraft environment. ORDI retains workload generation, contact-graph construction, bandwidth allocation, store-and-forward routing, and seven classes of injected faults.
 
 ## Requirements
 
@@ -107,11 +107,10 @@ directory in CI or on a cluster.
 
 ```text
 ordi/
-├── orbit/       # Orbit propagation, contacts, and time-expanded graphs
-├── sim/         # Satellite state, reliability, and COTS measurements
+├── algorithms/  # Basilisk-facing policies with one shared schema
+├── orbit/       # Contact-window construction and time-expanded graphs
+├── sim/         # Basilisk adapter, projected state, reliability, measurements
 ├── tasks/       # EO task generation and workload profiles
-├── scheduler/   # ORDI, feasibility checks, replanning, routing, and ILP
-├── baselines/   # Eight comparison schedulers
 ├── faults/      # Fault models and injection
 └── eval/        # Experiments, metrics, CSV output, and plotting
 figure/          # Generated evaluation figures

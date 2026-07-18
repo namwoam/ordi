@@ -41,13 +41,15 @@ from ordi.sim.satellite import make_constellation_states
 from ordi.sim.cots_measurements import atlas_200dk_bupt1_params
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
-from ordi.scheduler.ordi import (
-    ORDIScheduler, ORDIConfig, SchedulerResult, TileAssignment,
+from ordi.algorithms import (
+    ORDI, DirectDownlink, OnboardOnly, CompressionOnly, ServalLike, SECOLike,
+    FullReplication, RandomReplication, CoCoILike, EpochInput, SatelliteView,
+    ContactWindow, PolicyWeights, ExperimentConfig, Assignment, Decision,
+    ILPReference,
 )
-from ordi.baselines.baselines import (
-    build_all_baselines, ALL_BASELINES, OnboardOnly, SECOLike, ServalLike,
-    FullReplication, RandomReplication,
-)
+ORDIConfig = ExperimentConfig
+ALL_BASELINES = [DirectDownlink, OnboardOnly, CompressionOnly, ServalLike,
+                 SECOLike, FullReplication, RandomReplication, CoCoILike]
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import (
     compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
@@ -156,14 +158,14 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
 
 # ── stateful rolling-horizon helpers ──────────────────────────────────────────
 
-def _assignment_viable(a: TileAssignment, states) -> bool:
+def _assignment_viable(a: Assignment, states) -> bool:
     """In-flight tile survives if any replica's helper+aggregator are both alive
     (a surviving backup avoids re-transmission). No-helper assignments never replan."""
-    if not a.replicas:
+    if not a.helpers:
         return True
-    for r in a.replicas:
-        h = states.get(r.helper)
-        g = states.get(r.aggregator)
+    for helper, aggregator in zip(a.helpers, a.aggregators):
+        h = states.get(helper)
+        g = states.get(aggregator)
         if h is not None and g is not None and h.A_i and g.A_i:
             return True
     return False
@@ -211,39 +213,50 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
         source, tile = source_and_tile
 
         # Direct-downlink assignments have no compute replica.
-        if not assignment.replicas:
-            bits = assignment.downlink_bits
+        if not assignment.helpers:
+            bits = assignment.metadata.get("downlink_bits")
             if bits is not None and source in downlink_bits:
-                downlink_bits[source] += bits
+                downlink_bits[source] += float(bits)
             continue
 
-        for replica in assignment.replicas:
-            helper = replica.helper
-            aggregator = replica.aggregator
+        for index, (helper, aggregator) in enumerate(
+                zip(assignment.helpers, assignment.aggregators)):
             helper_state = states.get(helper)
             if helper_state is None:
                 continue
 
-            # e_compute = P_compute * work / C at placement time.  Recovering
-            # work this way preserves reduced-work baselines such as compression.
-            power = helper_state.params.compute_power_w
-            if power > 0.0:
-                compute_work[helper] += (
-                    replica.e_compute * helper_state.C_i / power
-                )
+            per_helper_work = float(assignment.metadata.get(
+                "compute_flops", tile.compute_ops
+            ))
+            compute_work[helper] += per_helper_work
 
-            if source != helper and source in isl_tx_bits:
-                isl_tx_bits[source] += replica.d_in_bits
-                rx_bits[helper] += replica.d_in_bits
-            if helper != aggregator and aggregator in states:
-                isl_tx_bits[helper] += replica.d_out_bits
-                rx_bits[aggregator] += replica.d_out_bits
-
-            bits = assignment.downlink_bits
-            if bits is None:
-                bits = tile.d_out_bits
-            if aggregator in downlink_bits:
-                downlink_bits[aggregator] += bits
+            bits = float(assignment.metadata.get("downlink_bits", tile.d_out_bits))
+            if index < len(assignment.routes):
+                route_in, route_out, route_down = assignment.routes[index]
+                for path, path_bits in ((route_in, tile.d_in_bits),
+                                        (route_out, tile.d_out_bits)):
+                    for sender, receiver in zip(path, path[1:]):
+                        if sender in isl_tx_bits:
+                            isl_tx_bits[sender] += path_bits
+                        if receiver in rx_bits:
+                            rx_bits[receiver] += path_bits
+                for sender, receiver in zip(route_down, route_down[1:]):
+                    if receiver not in states:
+                        if sender in downlink_bits:
+                            downlink_bits[sender] += bits
+                    else:
+                        if sender in isl_tx_bits:
+                            isl_tx_bits[sender] += bits
+                        rx_bits[receiver] += bits
+            else:
+                if source != helper and source in isl_tx_bits:
+                    isl_tx_bits[source] += tile.d_in_bits
+                    rx_bits[helper] += tile.d_in_bits
+                if helper != aggregator and aggregator in states:
+                    isl_tx_bits[helper] += tile.d_out_bits
+                    rx_bits[aggregator] += tile.d_out_bits
+                if aggregator in downlink_bits:
+                    downlink_bits[aggregator] += bits
 
     # Physical evolution is deliberately delegated to Basilisk/BSK-RL.  Keep
     # this function as a workload translator for callers that own a backend.
@@ -259,8 +272,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                        reliability=None, realized_trials=500, realized_seed=0,
                        state_driver=None):
     """Run one stateful rolling-horizon simulation and return a lifetime
-    EpochMetrics.  schedule_fn(epoch, todo_tasks) -> SchedulerResult dispatches
-    to ORDI / a baseline / the ILP.  A committed tile stays in-flight (not
+    EpochMetrics.  schedule_fn(epoch, todo_tasks) -> Decision dispatches to an
+    algorithm policy. A committed tile stays in-flight (not
     re-scheduled, not re-charged) until a fault invalidates all its replicas.
 
     When a reliability model is supplied, the final lifetime assignment set is
@@ -282,7 +295,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             sat_ids, states, cfg.epoch_length, seed=realized_seed
         )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
-    committed: Dict[Tuple[int, int], TileAssignment] = {}
+    committed: Dict[Tuple[int, int], Assignment] = {}
 
     for epoch in range(N_EPOCHS):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
@@ -307,7 +320,11 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         result = schedule_fn(epoch, todo)
         newly_committed = []
         for a in result.assignments:
-            if a.z_kv > 0 and not math.isinf(a.L_hat):
+            reliability_estimate = float(a.metadata.get(
+                "reliability", a.metadata.get("reconstruction_probability", 0.0)
+            ))
+            latency = float(a.metadata.get("latency", math.inf))
+            if reliability_estimate > 0 and not math.isinf(latency):
                 committed[(a.task_id, a.tile_id)] = a
                 newly_committed.append(a)
         if state_driver is None:
@@ -317,13 +334,11 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         if injector:
             injector.withdraw_epoch(epoch + 1)
 
-    final = [committed.get(k) or TileAssignment(task_id=k[0], tile_id=k[1])
+    source_by_key = {(task.task_id, tile.tile_id): task.source_sat
+                     for task in tasks for tile in task.tiles}
+    final = [committed.get(k) or Assignment(k[0], k[1], source_by_key[k])
              for k in all_tiles]
-    res = SchedulerResult(
-        epoch=N_EPOCHS - 1, assignments=final, total_utility=0.0,
-        energy_penalty=0.0, comm_penalty=0.0, rep_penalty=0.0,
-        objective=0.0, link_utilization={},
-    )
+    res = Decision(N_EPOCHS - 1, tuple(final))
     # Use the actual constellation radio profile (measurement-backed when the
     # Atlas params factory is used) rather than the synthetic 5 W default.
     downlink_power_w = (sum(s.params.comms_power_w for s in states.values())
@@ -332,7 +347,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         res, tasks, 0.0, sat_cap, cfg.alpha,
         downlink_power_w=downlink_power_w,
     )
-    r_total = sum(max(0, len(a.replicas) - 1) for a in final)
+    r_total = sum(max(0, len(a.helpers) - 1) for a in final)
     m.objective = (m.delivered_utility
                    - cfg.lambda_E * m.energy_joules
                    - cfg.lambda_R * r_total)
@@ -357,6 +372,33 @@ _WORKER_SHARED: Optional[Tuple] = None
 def _init_worker_shared(shared: Tuple) -> None:
     global _WORKER_SHARED
     _WORKER_SHARED = shared
+
+
+def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg):
+    """Translate Basilisk state and contact graphs into the common policy API."""
+    adjacency = {sid: [] for sid in sat_ids}
+    for a, b, _rate, _cap, _kind in graphs[ep].edges:
+        if a in adjacency:
+            adjacency[a].append(b)
+    views = {sid: SatelliteView(
+        sid, bool(state.A_i), state.C_i, state.B_i,
+        state.params.battery_j, state.Theta_i, state.Q_i,
+        state.params.compute_power_w, state.params.comms_power_w,
+        reliability.node_pi(sid),
+    ) for sid, state in states.items()}
+    contacts = []
+    for future in graphs[ep:]:
+        for a, b, rate, capacity, kind in future.edges:
+            duration = capacity / max(rate, 1.0)
+            contacts.append(ContactWindow(
+                a, b, future.t_start, future.t_start + duration,
+                rate, kind, reliability.link_pi(a, b, kind),
+            ))
+    return EpochInput(
+        ep, T_SIM_START + ep * cfg.epoch_length, tasks, views,
+        adjacency, frozenset(gs_names), contacts, cfg.epoch_length,
+        PolicyWeights(cfg.alpha, cfg.lambda_E, cfg.lambda_C, cfg.lambda_R),
+    )
 
 
 def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
@@ -391,16 +433,18 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         for f in faults:
             injector.schedule(f)
 
-    is_ordi = isinstance(scheduler_class, type) and issubclass(scheduler_class, ORDIScheduler)
-    if is_ordi:
-        sched = scheduler_class(cfg, sat_ids, gs_names, local_graphs, local_states, local_rel)
+    if scheduler_class is ORDI:
+        sched = scheduler_class(max_replicas=cfg.max_backups + 1)
     else:
-        sched = scheduler_class(local_graphs, local_states, gs_names, local_rel, cfg)
+        try:
+            sched = scheduler_class(seed=seed)
+        except TypeError:
+            sched = scheduler_class()
 
     def schedule_fn(ep, td):
-        if is_ordi:
-            return sched.schedule_epoch(ep, T_SIM_START, td)
-        return sched.schedule(ep, T_SIM_START, td)
+        return sched.schedule(_epoch_input(
+            ep, td, sat_ids, local_states, local_rel, local_graphs, gs_names, cfg
+        ))
 
     m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector,
                            reliability=local_rel, realized_seed=seed)
@@ -592,7 +636,7 @@ def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     print(f"E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, "
           f"25° GS elevation, {n_seeds} seeds)")
     build_kwargs = dict(_E1_BUILD_KWARGS)
-    alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
+    alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in ALL_BASELINES]
 
     config_args = []
     for s in range(n_seeds):
@@ -637,7 +681,7 @@ def run_E2(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
 
     config_args = []
     for s in range(n_seeds):
-        jobs = [(f"{name}#s{s}", "ORDI", ORDIScheduler, specs)
+        jobs = [(f"{name}#s{s}", "ORDI", ORDI, specs)
                 for name, specs in fault_scenarios.items()]
         config_args.append(({}, jobs, seed + s))
 
@@ -662,7 +706,7 @@ def run_E3(seed=0, n_seeds=48) -> Dict[str, List[EpochMetrics]]:
     """
     print(f"E3: Fault intensity sweep ({n_seeds} seeds)")
     fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
-    alg_classes = [("ORDI", ORDIScheduler),
+    alg_classes = [("ORDI", ORDI),
                    ("B5_seco_like", SECOLike),
                    ("B6_full_replication", FullReplication)]
 
@@ -708,7 +752,7 @@ def run_E4(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     # Sim is rebuilt per (constellation size, seed); each config worker chains
     # the 2 algorithms behind one build. With 32 configs the cores stay
     # saturated, so chaining (which halves the builds) beats per-alg splitting.
-    alg_classes = [("ORDI", ORDIScheduler), ("B5_seco_like", SECOLike)]
+    alg_classes = [("ORDI", ORDI), ("B5_seco_like", SECOLike)]
     sizes = [12, 24, 36, 60]
     config_args = []
     for n_sats in sizes:
@@ -744,7 +788,7 @@ def run_E5(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     # Uses the E1 stressed setup (6×4 Walker, 25° GS elevation) so downlink
     # windows remain constrained enough for deadline tightness to matter.
     # Sim is rebuilt per (scale, seed) → one config worker each, all concurrent.
-    alg_classes = [("ORDI", ORDIScheduler),
+    alg_classes = [("ORDI", ORDI),
                    ("B2_onboard_only", OnboardOnly),
                    ("B4_serval_like", ServalLike)]
     slacks = [150, 300, 450, 600, 900]
@@ -782,7 +826,7 @@ def run_E6(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     lambda_Rs = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
     config_args = []
     for s in range(n_seeds):
-        jobs = [(f"ORDI@lambda_R={l}#s{s}", "ORDI", ORDIScheduler,
+        jobs = [(f"ORDI@lambda_R={l}#s{s}", "ORDI", ORDI,
                  None, {"lambda_R": l})
                 for l in lambda_Rs]
         config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
@@ -818,7 +862,7 @@ def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     """
     N_PLANES = 6  # default _build_sim constellation is a 6-plane Walker
     print(f"E7: Correlated plane outages (placement quality, {n_seeds} seeds)")
-    alg_classes = [("ORDI", ORDIScheduler),
+    alg_classes = [("ORDI", ORDI),
                    ("B6_full_replication", FullReplication),
                    ("B7_random_replication", RandomReplication)]
 
@@ -875,30 +919,31 @@ def _run_E8_instance(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
     """Worker: build one small (size, seed) instance and score greedy + ILP on
     it with identical stateful lifetime accounting, so the pair is directly
     comparable and the realized-MC layer sees the same reliability draws."""
-    from ordi.scheduler.ilp import solve_ilp
     n_planes, sats_per_plane, seed = args
     sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
         _build_sim(n_planes=n_planes, sats_per_plane=sats_per_plane,
                    arrival_rate=_E8_ARRIVAL_RATE, seed=seed)
 
     greedy_states = deepcopy(states)
-    greedy_sched = ORDIScheduler(cfg, sat_ids, gs_names, graphs,
-                                 greedy_states, deepcopy(reliability))
+    greedy_rel = deepcopy(reliability)
+    greedy_sched = ORDI(max_replicas=cfg.max_backups + 1)
     def greedy_fn(ep, td):
-        return greedy_sched.schedule_epoch(ep, T_SIM_START, td)
+        return greedy_sched.schedule(_epoch_input(
+            ep, td, sat_ids, greedy_states, greedy_rel, graphs, gs_names, cfg
+        ))
 
+    ilp_states = deepcopy(states)
+    ilp_rel = deepcopy(reliability)
+    ilp_sched = ILPReference(_E8_ILP_TIME_LIMIT_S, _E8_ILP_THREADS)
     def ilp_fn(ep, td):
-        r = solve_ilp(ep, T_SIM_START, td, graphs, deepcopy(states),
-                      deepcopy(reliability), gs_names, cfg,
-                      time_limit_s=_E8_ILP_TIME_LIMIT_S, threads=_E8_ILP_THREADS)
-        return r if r else SchedulerResult(
-            epoch=ep, assignments=[], total_utility=0.0, energy_penalty=0.0,
-            comm_penalty=0.0, rep_penalty=0.0, objective=0.0, link_utilization={})
+        return ilp_sched.schedule(_epoch_input(
+            ep, td, sat_ids, ilp_states, ilp_rel, graphs, gs_names, cfg
+        ))
 
     m_greedy = _simulate_stateful(greedy_fn, tasks, sat_ids, greedy_states, cfg,
                                   reliability=deepcopy(reliability), realized_seed=seed)
-    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, deepcopy(states), cfg,
-                               reliability=deepcopy(reliability), realized_seed=seed)
+    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, ilp_states, cfg,
+                               reliability=ilp_rel, realized_seed=seed)
     n_sats = n_planes * sats_per_plane
     return [(f"ORDI_greedy#n{n_sats}s{seed}", [m_greedy]),
             (f"ORDI_ILP#n{n_sats}s{seed}", [m_ilp])]
@@ -964,7 +1009,7 @@ def run_E9(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
     build_kwargs = {**_E1_BUILD_KWARGS, "n_replicas_max": 4}
     for s in range(n_seeds):
         jobs = [
-            (f"ORDI@backups={cap}#s{s}", "ORDI", ORDIScheduler, None,
+            (f"ORDI@backups={cap}#s{s}", "ORDI", ORDI, None,
              {"max_backups": cap, "lambda_R": 0.0})
             for cap in backup_caps
         ]
@@ -1133,7 +1178,7 @@ def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetri
         print(f"    {k}: {v}")
 
     w0 = _REAL_WINDOW_START.timestamp()
-    alg_classes = [("ORDI", ORDIScheduler)] + [(c.name, c) for c in ALL_BASELINES]
+    alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in ALL_BASELINES]
     results: Dict[str, List[EpochMetrics]] = {alg: [] for alg, _ in alg_classes}
 
     def _build_tasks(sd):
@@ -1166,16 +1211,19 @@ def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetri
         for alg_name, cls in alg_classes:
             local_states = deepcopy(states)
             local_rel = deepcopy(reliability)
-            is_ordi = issubclass(cls, ORDIScheduler)
-            if is_ordi:
-                sched = cls(cfg, sat_ids, gs_names, graphs, local_states, local_rel)
+            if cls is ORDI:
+                sched = cls(max_replicas=cfg.max_backups + 1)
             else:
-                sched = cls(graphs, local_states, gs_names, local_rel, cfg)
+                try:
+                    sched = cls(seed=seed + s)
+                except TypeError:
+                    sched = cls()
 
-            def schedule_fn(ep, td, _sched=sched, _is_ordi=is_ordi):
-                if _is_ordi:
-                    return _sched.schedule_epoch(ep, T_SIM_START, td)
-                return _sched.schedule(ep, T_SIM_START, td)
+            def schedule_fn(ep, td, _sched=sched):
+                return _sched.schedule(_epoch_input(
+                    ep, td, sat_ids, local_states, local_rel,
+                    graphs, gs_names, cfg,
+                ))
 
             m = _simulate_stateful(
                 schedule_fn, tasks, sat_ids, local_states, cfg,
