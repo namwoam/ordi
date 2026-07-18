@@ -162,6 +162,5 @@ def atlas_200dk_bupt1_params(sat_id: str) -> SatelliteParams:
         idle_power_w=p.idle_power_w,
         compute_power_w=p.compute_power_w,
         comms_power_w=p.comms_power_w,
-        thermal_rc=300.0,
         thermal_ambient_c=p.thermal_ambient_c,
     )

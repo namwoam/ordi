@@ -203,7 +203,7 @@ class ORDIScheduler(EpochRoutingCacheMixin):
         # has a higher miss rate than onboard-only baselines. Zero ISL bits/energy.
         src_state = self.states.get(task.source_sat)
         if src_state and src_state.A_i:
-            t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+            t_compute = (src_state.Q_i + tile.compute_ops) / max(src_state.C_i, 1.0)
             # Reuse the epoch-level downlink cache for the source satellite.
             src_idx = sat_index.get(task.source_sat) if sat_index is not None else None
             if ell_down_cache is not None and src_idx is not None:

@@ -1,14 +1,14 @@
 """
 Per-satellite state vector σ_i(t) = (C_i, B_i, Θ_i, Q_i, A_i).
 
-Models compute throttling, battery energy balance, and thermal dynamics
-consistent with a COTS-equipped LEO nanosatellite (Jetson-class payload).
+This module contains scheduler-facing state and hardware parameters. It does
+not evolve physical state; :mod:`ordi.sim.basilisk_backend` projects Basilisk
+and BSK-RL outputs into these objects after every environment step.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
-import math
 
 
 # ── default hardware parameters (Jetson Orin NX class) ───────────────────────
@@ -22,8 +22,10 @@ DEFAULT_IDLE_POWER_W        = 3.0        # platform power when not computing
 DEFAULT_COMPUTE_POWER_W     = 15.0       # incremental power during full compute
 DEFAULT_COMMS_POWER_W       = 5.0        # incremental ISL/downlink Tx power
 DEFAULT_DOWNLINK_RATE_BPS   = 100e6      # 100 Mbps RF ground downlink
-DEFAULT_THERMAL_RC          = 300.0      # thermal time constant (seconds)
 DEFAULT_THERMAL_AMBIENT_C   = 20.0       # effective ambient (radiative sink)
+DEFAULT_THERMAL_AREA_M2     = 0.01       # exposed payload radiator area
+DEFAULT_THERMAL_MASS_KG     = 0.5        # thermally active payload mass
+DEFAULT_SPECIFIC_HEAT       = 900.0      # aluminium-like heat capacity (J/kg/K)
 
 
 @dataclass
@@ -38,8 +40,12 @@ class SatelliteParams:
     idle_power_w: float = DEFAULT_IDLE_POWER_W
     compute_power_w: float = DEFAULT_COMPUTE_POWER_W
     comms_power_w: float = DEFAULT_COMMS_POWER_W
-    thermal_rc: float = DEFAULT_THERMAL_RC
     thermal_ambient_c: float = DEFAULT_THERMAL_AMBIENT_C
+    thermal_area_m2: float = DEFAULT_THERMAL_AREA_M2
+    thermal_absorptivity: float = 0.2
+    thermal_emissivity: float = 0.8
+    thermal_mass_kg: float = DEFAULT_THERMAL_MASS_KG
+    thermal_specific_heat_j_kg_k: float = DEFAULT_SPECIFIC_HEAT
 
     @property
     def battery_j(self) -> float:
@@ -50,8 +56,8 @@ class SatelliteParams:
         return self.battery_j * self.battery_min_frac
 
     @property
-    def compute_rate_cycles_per_s(self) -> float:
-        # 1 GFLOP ≈ 2e9 FP operations → treat as CPU cycles for scheduling
+    def compute_rate_flops_per_s(self) -> float:
+        """Convert the configured GFLOP/s rate to FLOP/s."""
         return self.compute_rate_gflops * 1e9
 
 
@@ -60,10 +66,10 @@ class SatelliteState:
     """
     Mutable per-satellite state for one scheduling epoch.
 
-    C_i : available compute rate (cycles/s) — may be throttled
+    C_i : available compute rate (FLOP/s) — may be throttled
     B_i : current battery energy (Joules)
     Θ_i : current chip temperature (°C)
-    Q_i : queued compute load (cycles) already committed
+    Q_i : queued compute load (FLOPs) already committed
     A_i : availability flag (0/1)
     """
     params: SatelliteParams
@@ -71,11 +77,13 @@ class SatelliteState:
     B_i: float = field(init=False)
     Theta_i: float = field(init=False)
     Q_i: float = 0.0
+    D_i: float = 0.0
     A_i: int = 1
     _injected_failure: bool = False
+    _compute_rate_multiplier: float = 1.0
 
     def __post_init__(self):
-        self.C_i = self.params.compute_rate_cycles_per_s
+        self.C_i = self.params.compute_rate_flops_per_s
         self.B_i = self.params.battery_j * 0.85   # start at 85% charge
         self.Theta_i = DEFAULT_THERMAL_INIT_C
 
@@ -87,70 +95,22 @@ class SatelliteState:
             return
         if self.B_i < self.params.battery_min_j:
             self.A_i = 0
-        elif self.Theta_i >= self.params.thermal_max_c:
-            self.A_i = 0
         else:
             self.A_i = 1
 
-    # ── thermal throttling ───────────────────────────────────────────────────
+    def _effective_compute_rate(self) -> float:
+        """Scheduler capacity after injected software straggler faults.
 
-    def _throttled_compute_rate(self) -> float:
-        if self.Theta_i >= self.params.thermal_max_c:
-            return self.params.compute_rate_cycles_per_s * 0.25
-        if self.Theta_i >= self.params.thermal_max_c * 0.90:
-            return self.params.compute_rate_cycles_per_s * 0.60
-        return self.params.compute_rate_cycles_per_s
-
-    # ── epoch advance ─────────────────────────────────────────────────────────
-
-    def advance_epoch(
-        self,
-        epoch_length_s: float,
-        compute_cycles: float = 0.0,
-        tx_bits: float = 0.0,
-        rx_bits: float = 0.0,
-        in_sunlight: bool = True,
-    ):
+        Thermal throttling is intentionally absent here; Basilisk owns that
+        physical state.  This multiplier represents only an ORDI fault event.
         """
-        Advance state by one epoch given the committed workload.
-
-        compute_cycles : total compute cycles assigned this epoch
-        tx_bits        : bits transmitted (ISL + downlink)
-        rx_bits        : bits received (ISL uplink)
-        in_sunlight    : whether satellite is in sunlight (for solar harvest)
-        """
-        dt = epoch_length_s
-
-        # ── energy balance ───────────────────────────────────────────────────
-        solar = self.params.solar_power_w * dt if in_sunlight else 0.0
-        compute_time = min(compute_cycles / max(self.C_i, 1.0), dt)
-        e_compute = self.params.compute_power_w * compute_time
-        tx_time = tx_bits / max(200e6, 1.0)  # assume 200 Mbps ISL
-        e_tx = self.params.comms_power_w * min(tx_time, dt)
-        e_idle = self.params.idle_power_w * dt
-        self.B_i = min(
-            self.params.battery_j,
-            self.B_i + solar - e_idle - e_compute - e_tx
-        )
-
-        # ── thermal: first-order RC ──────────────────────────────────────────
-        P_dissipated = e_compute / dt if dt > 0 else 0.0
-        Theta_ss = self.params.thermal_ambient_c + P_dissipated * self.params.thermal_rc
-        tau = self.params.thermal_rc
-        self.Theta_i = Theta_ss + (self.Theta_i - Theta_ss) * math.exp(-dt / tau)
-
-        # ── update derived fields ────────────────────────────────────────────
-        self.C_i = self._throttled_compute_rate()
-        self._update_availability()
-
-        # Drain committed queue
-        self.Q_i = max(0.0, self.Q_i - compute_cycles)
+        return self.params.compute_rate_flops_per_s * self._compute_rate_multiplier
 
     # ── energy cost estimation ────────────────────────────────────────────────
 
-    def energy_for_compute(self, cycles: float) -> float:
-        """Joules to compute `cycles` on this satellite."""
-        t = cycles / max(self.C_i, 1.0)
+    def energy_for_compute(self, flops: float) -> float:
+        """Joules to execute ``flops`` on this satellite."""
+        t = flops / max(self.C_i, 1.0)
         return self.params.compute_power_w * t
 
     def energy_for_rx(self, bits: float) -> float:
@@ -171,12 +131,6 @@ class SatelliteState:
         """Joules to transmit ``bits`` over the modeled ground downlink."""
         return self.energy_for_tx(bits, DEFAULT_DOWNLINK_RATE_BPS)
 
-    def thermal_increase(self, cycles: float, epoch_length_s: float) -> float:
-        """Approximate chip temperature increase (°C) from compute load."""
-        P = self.params.compute_power_w * (cycles / max(self.C_i, 1.0)) / max(epoch_length_s, 1.0)
-        delta_ss = P * self.params.thermal_rc / (self.params.thermal_rc + 1)
-        return max(0.0, delta_ss)
-
     def inject_failure(self):
         self._injected_failure = True
         self.A_i = 0
@@ -187,10 +141,10 @@ class SatelliteState:
 
     def __repr__(self):
         return (f"SatState({self.params.sat_id}: "
-                f"C={self.C_i/1e9:.1f}G cycles/s, "
+                f"C={self.C_i/1e9:.1f} GFLOP/s, "
                 f"B={self.B_i/3600:.1f}Wh, "
                 f"Θ={self.Theta_i:.1f}°C, "
-                f"Q={self.Q_i/1e9:.1f}G, A={self.A_i})")
+                f"Q={self.Q_i/1e9:.1f} GFLOP, A={self.A_i})")
 
 
 def make_constellation_states(
@@ -211,7 +165,7 @@ def make_constellation_states(
         # slight variation
         s.B_i = p.battery_j * rng.uniform(0.70, 0.95)
         s.Theta_i = rng.uniform(18.0, 35.0)
-        s.C_i = s._throttled_compute_rate()
+        s.C_i = p.compute_rate_flops_per_s
         s._update_availability()
         states[sid] = s
     return states

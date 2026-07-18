@@ -1,7 +1,7 @@
 """Real hardware-state replay from BUPT-1 in-orbit telemetry.
 
 Instead of the synthetic RC-thermal + energy-balance model in
-``SatelliteState.advance_epoch`` (which the epoch loop never even calls), this
+the Basilisk/BSK-RL state projection, this
 drives battery energy (B_i), chip temperature (Theta_i), and the compute-throttle
 (C_i) from the real measured telemetry stream of the BUPT-1 Atlas 200DK payload
 (SatelliteCOTS ``CommonData-Telemetries/telemetry_all.csv``, ~10M rows spanning
@@ -186,7 +186,7 @@ def make_telemetry_state_driver(
             idx = _index_at(epoch_start_s + offsets.get(sid, 0.0))
             st.B_i = trace.soc[idx] * st.params.battery_j
             st.Theta_i = trace.temp_c[idx]
-            st.C_i = st._throttled_compute_rate()
+            st.C_i = st._effective_compute_rate()
             st._update_availability()
 
     return driver

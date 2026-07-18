@@ -173,7 +173,7 @@ class OnboardOnly:
                 continue
 
             for tile in task.tiles:
-                t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                t_compute = (src_state.Q_i + tile.compute_ops) / max(src_state.C_i, 1.0)
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,
@@ -318,7 +318,7 @@ class ServalLike:
 
             time_offset = 0.0
             for tile in high_priority + low_priority:
-                t_compute = tile.compute_ops / max(src_state.C_i, 1.0)
+                t_compute = (src_state.Q_i + tile.compute_ops) / max(src_state.C_i, 1.0)
                 _max_ep = int(math.ceil(tau_k / cfg.epoch_length)) + 1
                 ell_down = earliest_downlink(
                     src, epoch, self.graphs, tile.d_out_bits, self.ground_stations,

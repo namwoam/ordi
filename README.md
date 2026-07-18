@@ -22,7 +22,7 @@ The simulator models Walker constellations, field-of-view-constrained task arriv
 
 ## Requirements
 
-- Python 3.14
+- Python 3.11
 - [uv](https://docs.astral.sh/uv/)
 - Optional: [Task](https://taskfile.dev/) for the shorthand commands below
 
@@ -92,7 +92,16 @@ Experiment CSV files are written to `results/`. Generated plots are written to `
 
 ## Orbit Propagation
 
-Orbits and contact windows are computed with Skyfield + SGP4.
+Orbit, eclipse, power, battery, thermal, and spacecraft availability state are
+simulated by Basilisk 2.11 through the BSK-RL multi-satellite environment. ORDI
+is an ordinary scheduling policy: it consumes BSK-RL/Basilisk state and owns
+tile placement, redundancy, bandwidth allocation, and store-and-forward
+routing. Skyfield/SGP4 remains only as an optional independent contact-window
+cross-check, not as the mission simulator.
+
+On first use Basilisk downloads its official support data (gravity and SPICE
+ephemerides) through `pooch`; set `BSK_SUPPORT_DATA_CACHE` to a writable shared
+directory in CI or on a cluster.
 
 ## Repository Layout
 

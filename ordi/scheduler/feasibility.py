@@ -99,7 +99,7 @@ def compute_candidates(
             continue
 
         # compute time on helper
-        t_compute = tile.compute_ops / max(h_state.C_i, 1.0)
+        t_compute = (h_state.Q_i + tile.compute_ops) / max(h_state.C_i, 1.0)
 
         # helper-as-aggregator: helper processes AND downlinks directly (no ISL output)
         if ell_down_cache is not None and h_idx is not None:

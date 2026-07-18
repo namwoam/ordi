@@ -61,7 +61,7 @@ class FaultInjector:
         self._scheduled: List[FaultEvent] = []
         # Maps fault id → {ep_idx: [(a, b, rate, cap, ltype), ...]} for ground_contact_miss
         self._removed_edges: Dict[int, Dict[int, list]] = {}
-        # Maps fault id → {sat_id: C_i} snapshot at apply time, for straggler restore
+        # Maps fault id → {sat_id: rate multiplier} for straggler restoration.
         self._compute_snapshots: Dict[int, Dict[str, float]] = {}
 
     def schedule(self, fault: FaultEvent):
@@ -81,6 +81,34 @@ class FaultInjector:
         for fault in expired:
             self._withdraw(fault)
         self._active = [f for f in self._active if f.end_epoch > epoch]
+
+    def refresh_active_state(self):
+        """Reassert state faults that a physical/telemetry update may overwrite.
+
+        Faults are applied once at their start epoch, while battery, temperature,
+        and compute rate evolve every epoch.  Reasserting only the affected state
+        keeps multi-epoch faults active without replaying graph mutations or
+        taking duplicate straggler snapshots.
+        """
+        for fault in self._active:
+            if fault.fault_type == "battery_shortage":
+                for sat_id in fault.targets:
+                    if sat_id in self.states:
+                        state = self.states[sat_id]
+                        state.B_i = state.params.battery_min_j * 0.5
+                        state._update_availability()
+            elif fault.fault_type == "thermal_throttle":
+                for sat_id in fault.targets:
+                    if sat_id in self.states:
+                        state = self.states[sat_id]
+                        state.Theta_i = state.params.thermal_max_c + 5.0
+                        state.C_i = state._effective_compute_rate()
+                        state._update_availability()
+            elif fault.fault_type == "straggler":
+                for sat_id in fault.targets:
+                    if sat_id in self.states:
+                        state = self.states[sat_id]
+                        state.C_i = state._effective_compute_rate()
 
     # ── apply/withdraw per fault type ─────────────────────────────────────────
 
@@ -119,8 +147,10 @@ class FaultInjector:
             snapshot = self._compute_snapshots.setdefault(id(fault), {})
             for sat_id in fault.targets:
                 if sat_id in self.states:
-                    snapshot[sat_id] = self.states[sat_id].C_i
-                    self.states[sat_id].C_i *= factor
+                    state = self.states[sat_id]
+                    snapshot[sat_id] = state._compute_rate_multiplier
+                    state._compute_rate_multiplier *= factor
+                    state.C_i = state._effective_compute_rate()
 
         elif ft == "ground_contact_miss":
             # Remove sat→ground edges from epoch graphs for the fault duration
@@ -151,7 +181,7 @@ class FaultInjector:
                 if sat_id in self.states:
                     s = self.states[sat_id]
                     s.Theta_i = s.params.thermal_max_c + 5.0
-                    s.C_i = s._throttled_compute_rate()
+                    s.C_i = s._effective_compute_rate()
                     s._update_availability()
 
     def _withdraw(self, fault: FaultEvent):
@@ -175,13 +205,15 @@ class FaultInjector:
                     del self.reliability._node_overrides[sat_id]
 
         elif ft == "straggler":
-            # Restore the exact pre-fault C_i captured at apply time, rather than
-            # inverting the multiply (which loses state if throttling changed C_i
-            # during the fault window or if straggler windows overlapped).
+            # Restore the pre-fault multiplier, then recompute C_i from the
+            # current thermal state.  This keeps the straggler active across
+            # end-of-epoch thermal/rate updates.
             snapshot = self._compute_snapshots.pop(id(fault), {})
             for sat_id in fault.targets:
                 if sat_id in self.states and sat_id in snapshot:
-                    self.states[sat_id].C_i = snapshot[sat_id]
+                    state = self.states[sat_id]
+                    state._compute_rate_multiplier = snapshot[sat_id]
+                    state.C_i = state._effective_compute_rate()
 
         elif ft == "ground_contact_miss":
             self._restore_edges(fault)
@@ -204,7 +236,7 @@ class FaultInjector:
                     s = self.states[sat_id]
                     # Restore temperature below throttle threshold.
                     s.Theta_i = s.params.thermal_ambient_c
-                    s.C_i = s._throttled_compute_rate()
+                    s.C_i = s._effective_compute_rate()
                     s.recover()
 
     # ── epoch-graph edge removal/restore (shared by graph-mutating faults) ─────

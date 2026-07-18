@@ -67,6 +67,12 @@ _NORTHERN_GS = [
 ]
 
 
+def _worker_count(n_jobs: int) -> int:
+    """Bound process concurrency to avoid memory/CPU starvation in orbit builds."""
+    configured = int(os.environ.get("ORDI_MAX_WORKERS", "8"))
+    return max(1, min(n_jobs, configured))
+
+
 # ── simulation bootstrap ──────────────────────────────────────────────────────
 
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
@@ -176,6 +182,79 @@ def _uncommitted_tasks(pending, committed):
     return out
 
 
+def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
+    """Apply newly committed assignment load to every satellite state.
+
+    Assignment energy records are converted back to compute work using the
+    helper's current rate and compute power.  Communication load includes the
+    source-to-helper input, helper-to-aggregator result, and aggregator-to-ground
+    output.  Idle satellites are also advanced so solar harvest, platform idle
+    power, and thermal relaxation apply constellation-wide.
+
+    Real-telemetry experiments do not call this helper: their state driver is
+    authoritative and overwrites B_i/Theta_i/C_i/A_i each epoch.
+    """
+    tile_by_key = {
+        (task.task_id, tile.tile_id): (task.source_sat, tile)
+        for task in tasks
+        for tile in task.tiles
+    }
+    compute_work = {sat_id: 0.0 for sat_id in states}
+    isl_tx_bits = {sat_id: 0.0 for sat_id in states}
+    rx_bits = {sat_id: 0.0 for sat_id in states}
+    downlink_bits = {sat_id: 0.0 for sat_id in states}
+
+    for assignment in assignments:
+        source_and_tile = tile_by_key.get((assignment.task_id, assignment.tile_id))
+        if source_and_tile is None:
+            continue
+        source, tile = source_and_tile
+
+        # Direct-downlink assignments have no compute replica.
+        if not assignment.replicas:
+            bits = assignment.downlink_bits
+            if bits is not None and source in downlink_bits:
+                downlink_bits[source] += bits
+            continue
+
+        for replica in assignment.replicas:
+            helper = replica.helper
+            aggregator = replica.aggregator
+            helper_state = states.get(helper)
+            if helper_state is None:
+                continue
+
+            # e_compute = P_compute * work / C at placement time.  Recovering
+            # work this way preserves reduced-work baselines such as compression.
+            power = helper_state.params.compute_power_w
+            if power > 0.0:
+                compute_work[helper] += (
+                    replica.e_compute * helper_state.C_i / power
+                )
+
+            if source != helper and source in isl_tx_bits:
+                isl_tx_bits[source] += replica.d_in_bits
+                rx_bits[helper] += replica.d_in_bits
+            if helper != aggregator and aggregator in states:
+                isl_tx_bits[helper] += replica.d_out_bits
+                rx_bits[aggregator] += replica.d_out_bits
+
+            bits = assignment.downlink_bits
+            if bits is None:
+                bits = tile.d_out_bits
+            if aggregator in downlink_bits:
+                downlink_bits[aggregator] += bits
+
+    # Physical evolution is deliberately delegated to Basilisk/BSK-RL.  Keep
+    # this function as a workload translator for callers that own a backend.
+    from ordi.sim.basilisk_backend import Workload
+    return {
+        sid: Workload(compute_flops=compute_work[sid], tx_bits=isl_tx_bits[sid],
+                      rx_bits=rx_bits[sid], downlink_bits=downlink_bits[sid])
+        for sid in states
+    }
+
+
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                        reliability=None, realized_trials=500, realized_seed=0,
                        state_driver=None):
@@ -190,10 +269,18 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     the realized_* fields report delivery outcomes the modeled z_kv assumes
     away.  Hard outages already pruned infeasible candidates during scheduling;
     this layer adds the soft stochastic loss the reliability model specifies."""
-    # Compute budget over the full horizon (cycles): the final assignment set is
-    # a lifetime record spanning all epochs, so helper_utilization divides the
-    # cycles it consumes by each satellite's C_i·epoch_length summed over N_EPOCHS.
-    sat_cap = {s: states[s].C_i * EPOCH_LENGTH_S * N_EPOCHS for s in sat_ids}
+    # Accumulate the compute capacity actually available in each epoch.  This
+    # keeps helper utilization consistent with thermal/straggler rate changes
+    # and excludes epochs in which a satellite is unavailable.
+    sat_cap = {s: 0.0 for s in sat_ids}
+    # Basilisk/BSK-RL is the sole owner of orbit, eclipse, power, battery,
+    # thermal, availability, and data-state evolution for synthetic runs.
+    physical_backend = None
+    if state_driver is None:
+        from ordi.sim.basilisk_backend import BasiliskBackend
+        physical_backend = BasiliskBackend(
+            sat_ids, states, cfg.epoch_length, seed=realized_seed
+        )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], TileAssignment] = {}
 
@@ -205,6 +292,12 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         # real pipeline) after fault injection so injected failures still win.
         if state_driver is not None:
             state_driver(epoch, ep_start, states)
+        if injector:
+            injector.refresh_active_state()
+        for sat_id in sat_ids:
+            state = states[sat_id]
+            if state.A_i:
+                sat_cap[sat_id] += state.C_i * cfg.epoch_length
         # Drop committed tiles whose every replica lost a node → re-planned.
         for key in list(committed.keys()):
             if not _assignment_viable(committed[key], states):
@@ -212,9 +305,15 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
         result = schedule_fn(epoch, todo)
+        newly_committed = []
         for a in result.assignments:
             if a.z_kv > 0 and not math.isinf(a.L_hat):
                 committed[(a.task_id, a.tile_id)] = a
+                newly_committed.append(a)
+        if state_driver is None:
+            physical_backend.submit(_advance_synthetic_states(
+                newly_committed, tasks, states, cfg.epoch_length
+            ))
         if injector:
             injector.withdraw_epoch(epoch + 1)
 
@@ -325,7 +424,7 @@ def _run_parallel(shared: Tuple, job_args: List[Tuple],
 
     n = len(job_args)
     results: Dict[str, List[EpochMetrics]] = {}
-    n_workers = min(n, 16)
+    n_workers = _worker_count(n)
     with ProcessPoolExecutor(max_workers=n_workers,
                              initializer=_init_worker_shared,
                              initargs=(shared,)) as pool:
@@ -413,7 +512,12 @@ def _run_configs_parallel(config_args: List[Tuple],
 
     results: Dict[str, List[EpochMetrics]] = {}
     n = len(config_args)
-    with ProcessPoolExecutor(max_workers=min(n, 16)) as pool:
+    if _worker_count(n) == 1:
+        for args in tqdm(config_args, desc=desc, unit="config"):
+            for key, metrics in _build_and_run_config(args):
+                results[key] = metrics
+        return results
+    with ProcessPoolExecutor(max_workers=_worker_count(n)) as pool:
         futures = [pool.submit(_build_and_run_config, args) for args in config_args]
         for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="config"):
             for key, metrics in fut.result():
@@ -916,7 +1020,10 @@ def _build_sim_real(task_source="fire"):
 
     Returns the shared real inputs plus a provenance dict for the banner.
     """
-    from ordi.orbit.real_tles import load_planet_constellation
+    raise RuntimeError(
+        "The legacy Skyfield/SGP4 real-TLE path was removed; use the "
+        "Basilisk/BSK-RL backend for orbital propagation."
+    )
     from ordi.sim.telemetry_replay import load_bupt1_telemetry
 
     w0 = _REAL_WINDOW_START.timestamp()

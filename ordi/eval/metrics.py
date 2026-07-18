@@ -51,7 +51,7 @@ def compute_metrics(
     result: SchedulerResult,
     tasks: List[EOTask],
     epoch_start: float,
-    sat_compute_capacity: Dict[str, float],   # sat_id → compute-cycle budget (C_i·epoch_length, summed over the horizon for lifetime records)
+    sat_compute_capacity: Dict[str, float],   # sat_id → FLOP budget (C_i·epoch length, summed over the horizon for lifetime records)
     alpha: float = 0.002,
     downlink_power_w: float = DEFAULT_COMMS_POWER_W,
     downlink_rate_bps: float = DEFAULT_DOWNLINK_RATE_BPS,
@@ -118,10 +118,10 @@ def compute_metrics(
                         if n_tiles > 0 else 0.0)
 
     # Helper utilization: fraction of the constellation's compute budget the
-    # scheduled work consumes. Numerator is actual compute cycles (each replica
+    # scheduled work consumes. Numerator is actual FLOPs (each replica
     # runs its tile's compute_ops on the helper); denominator is the summed
     # per-satellite capacity C_i·epoch_length passed by the caller (horizon-wide
-    # when the assignment set is a lifetime record). Both sides are in cycles,
+    # when the assignment set is a lifetime record). Both sides are in FLOPs,
     # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
     compute_used = sum(

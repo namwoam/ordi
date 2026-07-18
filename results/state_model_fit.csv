@@ -1,0 +1,2 @@
+thermal_intervals,thermal_mae_c,thermal_rmse_c,thermal_within_5c_pct,battery_intervals,battery_mae_pp,battery_rmse_pp,battery_within_1pp_pct,battery_unchanged_pct
+282,2.4268009521162544,2.885113479571643,98.22695035460993,168647,0.5997655202681168,1.6968358202148355,89.57467372677841,89.57467372677841

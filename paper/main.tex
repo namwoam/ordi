@@ -59,7 +59,7 @@ This paper asks: \emph{how much redundancy does distributed orbital inference ac
 
 \textbf{(3) Reactive replanning.} Detected helper failures, missed contacts, and stragglers trigger re-scheduling of affected tiles within the epoch, using the same feasibility machinery.
 
-We implement \ordi{} and eight baselines in a discrete-epoch simulator with a realistic LEO-EO configuration: a Walker constellation at 550\,km, field-of-view-constrained task arrivals, per-workload log-normal deadlines reflecting EO service tiers~\cite{lemaitre2002}, and satellite power, thermal, and compute parameters loaded directly from the public in-orbit measurement logs of a Tiansuan COTS payload~\cite{wang2024cots}. Experiments over up to 60 random seeds show that \ordi{} (i) outperforms non-distributed baselines on deadline miss ratio and delivered utility, (ii) retains 77\% more delivered utility than non-redundant placement at 50\% fault intensity, (iii) stays within 3.5 percentage points of full replication's realized miss ratio under a one-plane outage with 44\% less energy, and (iv) slightly exceeds the ILP reference's utility while using $5.8\times$ less ISL traffic.
+We implement \ordi{} and eight baselines in a discrete-epoch simulator with a realistic LEO-EO configuration: a Walker constellation at 550\,km, field-of-view-constrained task arrivals, per-workload log-normal deadlines reflecting EO service tiers~\cite{lemaitre2002}, and satellite power, thermal, and compute parameters calibrated from public in-orbit measurement logs of a Tiansuan COTS payload~\cite{wang2024cots}. Experiments over up to 60 random seeds show that \ordi{} (i) outperforms non-distributed baselines on deadline miss ratio and delivered utility, (ii) retains 76\% more delivered utility than non-redundant placement at 50\% fault intensity, (iii) stays within 3.5 percentage points of full replication's realized miss ratio under a one-plane outage with 44\% less energy, and (iv) slightly exceeds the ILP reference's utility while using $5.8\times$ less ISL traffic.
 
 \section{Background and Related Work}
 \label{sec:motivation}
@@ -69,7 +69,7 @@ We implement \ordi{} and eight baselines in a discrete-epoch simulator with a re
 EO satellites are bandwidth-starved: ground contact windows last only 5--10 minutes per pass, and many operators schedule only high-latitude stations, so a satellite over the southern hemisphere may wait most of an orbit to downlink. Onboard inference attacks this at the source, reducing a megabyte-scale tile to a kilobyte-scale result and shifting the bottleneck from downlink to onboard compute, which is in turn bounded by a small spacecraft's power and thermal envelope. That this is practical is now established by flight programs across agencies and industry: ESA's $\Phi$-Sat-1 flew the first on-board deep-neural-network demonstrator~\cite{giuffrida2022phisat}, re-trainable payloads have been uplinked and run in orbit on a 1\,W VPU~\cite{ruzicka2023worldfloods}, the NASA/HPE Spaceborne Computer-2 ran AI workloads on the ISS with software radiation hardening~\cite{hpe_sbc2}, and the Tiansuan constellation reported systematic in-orbit COTS measurements~\cite{wang2024cots} showing accelerators throttled well below nameplate throughput by thermal and battery limits. Earlier work established the paradigm (orbital edge computing~\cite{denby2020oec}, onboard model specialization~\cite{denby2022kodan}), and recent surveys catalogue it~\cite{yin2025oecsurvey}. This body of work is almost entirely \emph{single-satellite} inference; \ordi{} addresses the next question of distributing one task across satellites when a single satellite's compute or downlink cannot meet the deadline.
 
 \subsection{Multi-Satellite Offloading and Placement}
-As LEO mega-constellations mature, several systems schedule computation across satellites. Serval bifurcates near-real-time EO queries on one satellite's resources~\cite{tao2024serval}; SECO optimizes latency or energy for multi-satellite placement~\cite{seco}; and LEOEdge co-designs satellite-ground AI-inference placement with per-satellite adaptive models~\cite{leoedge2025}. These approaches optimize placement under nominal availability but assume scheduled resources survive; we show this assumption costs $3.3\times$ in miss ratio at realistic fault rates, and that structured redundancy closes the gap cheaply.
+As LEO mega-constellations mature, several systems schedule computation across satellites. Serval bifurcates near-real-time EO queries on one satellite's resources~\cite{tao2024serval}; SECO optimizes latency or energy for multi-satellite placement~\cite{seco}; and LEOEdge co-designs satellite-ground AI-inference placement with per-satellite adaptive models~\cite{leoedge2025}. These approaches optimize placement under nominal availability but assume scheduled resources survive; we quantify the resulting reliability loss and show that structured redundancy recovers utility efficiently.
 
 \subsection{Priced Redundancy under Correlated Failures}
 Tiling makes inference embarrassingly parallel: a $4{\times}4$ grid yields 16 independent units that ISLs can spread across a neighborhood. But every replica's success requires the source to emit the tile, each ISL hop to hold, the helper to survive compute, and the aggregator's downlink to materialize---and these events are correlated, since satellites in one plane share geometry, eclipse cycles, and deployment batch, so a plane-wide outage disables many helpers at once. Tail-tolerant duplication~\cite{dean2013tail} and coded computation~\cite{lee2018codes,cocoi} address this in datacenters, but assume cheap bandwidth and independent failures. In orbit, full replication costs roughly double the energy and ISL traffic that a 20--30\,Wh-class spacecraft cannot afford, and correlation breaks the coding assumption. The design space between zero redundancy and full replication, priced by orbital state and placed against the actual failure correlation, is the territory \ordi{} explores.
@@ -77,36 +77,55 @@ Tiling makes inference embarrassingly parallel: a $4{\times}4$ grid yields 16 in
 \section{System Model}
 \label{sec:model}
 
-\subsection{Network and Contact Model}
-We consider $N$ satellites $\mathcal{S}$ and ground stations $\mathcal{G}$ over 60\,s epochs. We set $h{=}550$\,km, within PlanetScope's 450--580\,km Earth-observation orbit range~\cite{planet2026spec}. An optical ISL exists at slant range $d\leq4{,}000$\,km, the limit specified for Starlink mini lasers~\cite{starlinktechnology}. At this altitude, the threshold is 26\% below the 5,408\,km geometric line-of-sight limit and gives 255\,km minimum limb clearance. All benchmarks use a conservative $25^\circ$ RF elevation mask, matching an authorized minimum for LEO user and gateway links at comparable 540--570\,km altitudes~\cite{fcc2021spacex}. Contacts form per-epoch graphs $E(t)$, and earliest-arrival Dijkstra search over the time-expanded graph yields $\ell_{ab}(t,d)$, including store-and-forward waits.
+We consider satellites $\mathcal{S}$ and ground stations $\mathcal{G}$. At epoch $t$, the contact graph is
+\[
+\mathcal{C}(t)=\big(\mathcal{S}\cup\mathcal{G},E(t)\big),\qquad
+E(t)=E^{\mathrm{ISL}}(t)\cup E^{\mathrm{DL}}(t),
+\]
+where $E^{\mathrm{ISL}}(t)\subseteq\mathcal{S}\times\mathcal{S}$ contains satellite-to-satellite contacts and $E^{\mathrm{DL}}(t)\subseteq\mathcal{S}\times\mathcal{G}$ contains satellite-to-ground contacts.
 
-\subsection{Satellite State}
-Each satellite $i$ carries state $\sigma_i(t) = (C_i, B_i, \Theta_i, Q_i, A_i)$: compute rate (GFLOP/s), battery energy (J), temperature, queued work, and availability. Battery follows an energy balance of solar harvest against idle, compute, and communication draw; temperature follows a first-order RC model driven by compute-power dissipation. Availability $A_i = 0$ when battery falls below a floor, temperature exceeds a ceiling, or a failure is injected; thermal stress throttles $C_i$ before forcing unavailability. Rather than assuming datasheet values, we instantiate $\sigma_i$ parameters (compute rate, idle and active power, battery capacity, solar harvest, thermal limits) from public in-orbit measurement logs of an Atlas 200DK payload on the Tiansuan BUPT-1 satellite~\cite{wang2024cots}.
+For a $d$-bit payload available at $a$ in epoch $t$, $\ell_{ab}(t,d)$ is the minimum delay to $b$, including transmission, multi-hop forwarding, and contact waits. $\ell_{ab}(t,d)=\infty$ if $b$ is unreachable from $a$ within the horizon.
 
-\subsection{Task and Tile Model}
-Tasks arrive as a Poisson process, gated by sensing geometry: a task is generated only when a satellite's camera footprint covers a ground target. Task $k$ released at $r_k$ on source satellite $s_k$ carries an image partitioned into tiles $v$ with input size $d^{\mathrm{in}}_{kv}$, output size $d^{\mathrm{out}}_{kv}$, compute demand $c_{kv}$ (FLOPs), and utility $u_{kv}$. We model four EO workloads profiled on MobileNetV2, YOLOv5-nano, a lightweight U-Net, and a Siamese CNN (wildfire detection, ship detection, cloud filtering, change detection), with per-type deadlines drawn log-normally ($\sigma{=}0.6$) around medians of 300, 600, 1200, and 480\,s respectively, reflecting EO service tiers~\cite{lemaitre2002}.
+Satellite $i$ has state $\sigma_i(t)=(C_i,B_i,\Theta_i,Q_i,A_i)$ with domain
+\[
+\begin{aligned}
+C_i&\in\mathbb{R}_{>0},&
+B_i&\in[0,B_i^{\max}],&
+\Theta_i&\in\mathbb{R},\\
+Q_i&\in\mathbb{R}_{\geq0},&
+A_i&\in\{0,1\}.&&
+\end{aligned}
+\]
+Here $C_i$ is available compute throughput (FLOP/s), $B_i$ is battery energy (J), $\Theta_i$ is payload temperature ($^\circ$C), $Q_i$ is committed but unfinished computation (FLOPs), and $A_i$ is a binary availability flag.
+\begin{equation}
+\sigma_i(t+1)=F_i\!\left(\sigma_i(t),u_i(t),\omega_i(t);\xi_i\right),
+\label{eq:state-transition}
+\end{equation}
+where $u_i(t)$ is the scheduled compute and communication load, $\omega_i(t)$ collects exogenous conditions such as illumination and faults, and $\xi_i$ denotes fixed platform parameters. The transition is the component-wise map
+\[
+F_i=(F_i^C,F_i^B,F_i^\Theta,F_i^Q,F_i^A),
+\]
+not a learned function: $F_i^B$, $F_i^\Theta$, and $F_i^Q$ first account for the epoch's energy, heat, and completed work; $F_i^C$ derives the next available rate from the resulting operating state; and $F_i^A$ applies the battery, temperature, and failure constraints. This abstraction allows the scheduler to consume measured, predicted, or simulated state without depending on a particular hardware model. Section~\ref{sec:setup} gives the concrete component equations and parameters used in our evaluation.
 
-\subsection{Reliability Model}
-Links and nodes succeed per epoch with probabilities $\pi$: ISL $\pi_{\mathrm{isl}}{=}0.97$, downlink $\pi_{\mathrm{down}}{=}0.92$ (0.70 adverse), node survival $\pi_{\mathrm{node}}{=}0.98$. A replica of tile $(k,v)$ on helper $i$ with aggregator $a$ succeeds with
+Task $k$, released at $r_k$ on source $s_k$, is partitioned into tiles $v$. Each tile has input and output sizes $(d^{\mathrm{in}}_{kv},d^{\mathrm{out}}_{kv})$, compute demand $c_{kv}$ (FLOPs), utility $u_{kv}$, and remaining deadline $\tau_k(t)$. A replica assigns a tile to helper $i$ and aggregator $a$. Given node, path, and downlink success probabilities, its end-to-end success probability is
 \begin{equation}
 p_{kvia} = \pi_{s_k}\,\pi_i \cdot \pi_{\mathrm{path}}(s_k{\to}i) \cdot \pi_{\mathrm{path}}(i{\to}a) \cdot \pi_{\mathrm{down},a}.
 \label{eq:preplica}
 \end{equation}
-Source survival is a single point of failure shared by all replicas of a tile, so it is factored once at the tile level: with replica set $R_{kv}$,
+Because source survival is shared by every replica, the success probability of replica set $R_{kv}$ is
 \begin{equation}
 z_{kv} = \pi_{s_k}\Big[1 - \prod_{r \in R_{kv}}\big(1 - p_r / \pi_{s_k}\big)\Big],
 \label{eq:zkv}
 \end{equation}
-which avoids overcounting redundancy against a failure no replica can survive. Independence across the remaining terms is an explicit approximation; Section~\ref{sec:e7} stresses it with correlated plane-wide faults.
+which does not credit replicas for a shared source failure. We otherwise approximate failures as independent and explicitly test correlated plane outages in Section~\ref{sec:e7}.
 
-\subsection{Problem Statement}
-Let $L_{kv}$ denote the earliest completion latency among a tile's replicas and $\tau_k(t)$ the remaining deadline budget. The scheduler chooses replica sets to maximize
+Let $L_{kv}$ be the earliest completion latency among a tile's replicas. The scheduler selects replica sets to maximize
 \begin{equation}
 \sum_{k,v} u_{kv}\, z_{kv}\, e^{-\alpha L_{kv}}
 \;-\; \lambda_E E \;-\; \lambda_C C \;-\; \lambda_R R,
 \label{eq:objective}
 \end{equation}
-subject to per-replica deadline feasibility $L_{kvia} \le \tau_k(t)$, helper energy budgets $B_i \ge B_{\min}$, and link capacities, where $E$ is total helper energy, $C$ is congestion-weighted ISL traffic, $R$ is the count of extra replicas, and $e^{-\alpha L}$ encodes freshness decay ($\alpha{=}0.002\,\mathrm{s}^{-1}$). The exact problem is an integer program coupling routing, placement, and redundancy; we use it (Section~\ref{sec:e8}) only as a small-instance reference.
+subject to $L_{kvia}\leq\tau_k(t)$, energy reserve $B_i\geq B_{\min}$, availability, and link-capacity constraints. Here $E$, $C$, and $R$ denote energy, congestion-weighted ISL traffic, and extra replicas; $e^{-\alpha L}$ discounts stale results. The resulting routing, placement, and redundancy problem is an integer program; Section~\ref{sec:design} gives the online heuristic and Section~\ref{sec:e8} uses the exact program only as a small-instance reference.
 
 \section{ORDI Design}
 \label{sec:design}
@@ -119,7 +138,9 @@ For tile $(k,v)$, an available helper--aggregator pair $(i,a)$ is a candidate wi
 L_{kvia} = \ell_{s_k i}(d^{\mathrm{in}}_{kv}) + \frac{c_{kv}}{C_i(t)} + \ell_{ia}(d^{\mathrm{out}}_{kv}) + \ell^{\mathrm{down}}_{a}(d^{\mathrm{out}}_{kv}),
 \label{eq:latency}
 \end{equation}
-and is feasible iff $L_{kvia}\le\tau_k(t)$, $A_i=A_a=1$, and its committed energy leaves the helper above $B_{\min}$. The set also includes helper-as-aggregator and source self-processing cases. The four latency terms reduce to source-to-all, all-pairs, and all-to-ground earliest-arrival lookups; shared Dijkstra sweeps compute these dense caches once per epoch rather than once per candidate.
+and is feasible iff $L_{kvia}\le\tau_k(t)$, $A_i=A_a=1$, and its committed energy leaves the helper above $B_{\min}$. The set also includes helper-as-aggregator and source self-processing cases.
+
+We compute $\ell_{ab}(t,d)$ with Dijkstra over states $(e,n,b_{\mathrm{rem}})$: epoch, current node, and undelivered bits. The search starts at $(t,a,d)$. Traversing an active contact of rate $r$ and residual capacity $q$ sends $x=\min(b_{\mathrm{rem}},q)$ bits at cost $x/r$; any residual advances to the next epoch. A storage edge instead advances one epoch at the same node and charges the contact-wait time. The first zero-residual state popped at destination $b$ gives $\ell_{ab}(t,d)$; exhaustion gives $\infty$. Single-source sweeps fill the source-to-all, all-pairs, and all-to-ground caches once per epoch rather than running one search per candidate.
 
 Each feasible candidate is scored by its primary-placement gain
 \begin{equation}
@@ -169,11 +190,90 @@ In Algorithm~\ref{alg:ordi}, $H_R$ is the set of selected helpers and $\phi(h)$ 
 
 \subsection{Setup}
 \label{sec:setup}
-Unless stated otherwise: Walker constellation, 6 planes $\times$ 6 satellites at 550\,km (96\,min period); horizon of 3 orbits (17{,}280\,s, 288 epochs); two northern ground stations (Fairbanks, Greenwich), a deliberately constrained ground segment typical of high-latitude EO operations that creates genuine routing pressure for southern-hemisphere sources; field-of-view-gated Poisson arrivals at 6 tasks/orbit over 100 ground targets; $25^\circ$ ground-station elevation mask; ISL rate 200\,Mb/s. Satellite parameters are the Tiansuan-calibrated COTS profile. The core comparison further stresses this setup with a sparser 6\,$\times$\,4 Walker (24 satellites) and 8 tasks/orbit, so that deadlines bind and routing pressure is real; it aggregates 60 random seeds. Fault and sweep experiments use matched seeds across algorithms; error bars are one standard deviation. Table~\ref{tab:configs} in the appendix gives every per-experiment configuration.
+\textbf{Network.} Unless stated otherwise, we simulate a 6-plane $\times$ 6-satellite Walker constellation at 550\,km (96\,min period) for three orbits, discretized into 288 epochs of 60\,s. The altitude lies within PlanetScope's 450--580\,km Earth-observation range~\cite{planet2026spec}. Optical ISLs operate at 200\,Mb/s for slant range $d\leq4{,}000$\,km, the specified limit for Starlink mini lasers~\cite{starlinktechnology}; at 550\,km this is 26\% below the 5,408\,km geometric line-of-sight limit and leaves 255\,km limb clearance. Ground links use a conservative $25^\circ$ elevation mask, matching an authorized minimum for LEO user and gateway links at comparable altitudes~\cite{fcc2021spacex}. Two northern stations (Fairbanks and Greenwich) deliberately constrain downlink opportunities.
+
+\textbf{Tasks and satellite state.} Field-of-view-gated Poisson arrivals average six tasks/orbit over 100 ground targets. Four EO profiles use MobileNetV2, YOLOv5-nano, lightweight U-Net, and Siamese CNN for wildfire, ship, cloud, and change detection. Their deadline medians are 300, 600, 1200, and 480\,s with log-normal $\sigma{=}0.6$, reflecting EO service tiers~\cite{lemaitre2002}. Compute, power, battery, and solar parameters are parsed from public Atlas 200DK measurements on BUPT-1~\cite{wang2024cots}. From its four-thread inference trace, we compute
+\[
+C_i^{\max}=\frac{N_{\mathrm{img}}F_{\mathrm{img}}}{T_{\mathrm{run}}}
+=9.67\ \text{GFLOP/s},
+\]
+where $N_{\mathrm{img}}$ is the completed image count, $F_{\mathrm{img}}{=}0.9$\,GFLOP is the profiled work per image, and $T_{\mathrm{run}}$ is measured execution time. The simulator then produces the available rate as
+\begin{equation}
+\begin{aligned}
+C_i(t)&=\eta_i(t)\rho_i(t)C_i^{\max},&
+\rho_i(t)&=
+\begin{cases}
+1, & \vartheta_i<0.9,\\
+0.60, & 0.9\leq\vartheta_i<1,\\
+0.25, & \vartheta_i\geq1,
+\end{cases}
+\end{aligned}
+\label{eq:compute-rate}
+\end{equation}
+where $\vartheta_i=\Theta_i/\Theta_i^{\max}$ and $\eta_i=1$ normally or $0.1$ during an injected straggler. The thermal factors are conservative stress parameters, not values inferred from the Atlas trace; the source platform uses fixed power levels and showed less than 1\% satellite--ground performance variation~\cite{wang2024cots}.
+
+After each synthetic scheduling epoch, the simulator aggregates the compute, source-to-helper input, helper-to-aggregator relay, and aggregator-to-ground traffic of newly committed replicas and calls the transition in Eq.~\eqref{eq:state-transition} for every satellite, including idle ones. For each epoch of length $\Delta{=}60$\,s, let $a_i(t)$ be newly committed work and $w_i(t)=\min\{Q_i(t)+a_i(t),C_i(t)\Delta\}$ the work executed. Thus $t_i^c=w_i/C_i$. ISL transmit, downlink, and receive volumes $(x_i^{\mathrm{isl}},x_i^{\mathrm{dl}},x_i^{\mathrm{rx}})$ produce
+\[
+\begin{aligned}
+E_i^x&=P_i^{\mathrm{tx}}\min\!\left\{\Delta,\frac{x_i^{\mathrm{isl}}}{200\,\mathrm{Mb/s}}+\frac{x_i^{\mathrm{dl}}}{100\,\mathrm{Mb/s}}\right\},\\
+E_i^r&=0.4P_i^{\mathrm{tx}}\min\!\left\{\Delta,\frac{x_i^{\mathrm{rx}}}{200\,\mathrm{Mb/s}}\right\}.
+\end{aligned}
+\]
+Battery energy is then updated by
+\begin{equation}
+\begin{aligned}
+B_i(t{+}1)=\Big[B_i(t)&+\Delta(P_i^{\mathrm{sol}}-P_i^{\mathrm{idle}})\\
+&{}-t_i^cP_i^{\mathrm{comp}}-E_i^x-E_i^r\Big]_{0}^{B_i^{\max}},
+\end{aligned}
+\label{eq:battery-update}
+\end{equation}
+where $[y]_0^b=\min\{b,\max\{0,y\}\}$. Because $P_i^{\mathrm{sol}}$ is the measured orbit-average harvested power, it is applied in every epoch rather than through a separate binary eclipse model. Average compute power is $\bar P_i^c=P_i^{\mathrm{comp}}t_i^c/\Delta$. The first-order RC update is
+\begin{equation}
+\begin{aligned}
+\Theta_i^{\mathrm{ss}}(t)&=\Theta_i^{\mathrm{amb}}+R_i^\Theta\bar P_i^c(t),\\
+\Theta_i(t{+}1)&=\Theta_i^{\mathrm{ss}}(t)
++[\Theta_i(t)-\Theta_i^{\mathrm{ss}}(t)]e^{-\Delta/\tau_i},\\
+Q_i(t{+}1)&=Q_i(t)+a_i(t)-w_i(t),
+\end{aligned}
+\label{eq:thermal-queue-update}
+\end{equation}
+where $R_i^\Theta{=}16.62^\circ$C/W is derived from the measured 17--57$^\circ$C rise divided by 2.41\,W incremental compute power, and $\tau_i{=}300$\,s. The updated temperature determines $\rho_i$ in Eq.~\eqref{eq:compute-rate}; the next available rate is therefore computed after the physical-state update. Finally,
+\[
+\begin{aligned}
+A_i(t{+}1)=\mathbf{1}\!\big[&\neg f_i(t)\ \land\ B_i(t{+}1)\geq0.15B_i^{\max}\\
+&{}\land\ \Theta_i(t{+}1)<80^\circ\mathrm{C}\big],
+\end{aligned}
+\]
+where $f_i(t)$ denotes an injected node failure. Initial battery charge is sampled uniformly from 70--95\% and initial temperature from 18--35$^\circ$C. Matched algorithms receive identical initial states and exogenous fault traces; their subsequent state can differ because their assignments impose different compute and communication loads. Table~\ref{tab:params} lists the measured parameters, simulator thresholds, and workload sizes.
+
+\textbf{Reliability and scheduler.} Per-epoch success probabilities are $\pi_{\mathrm{isl}}{=}0.97$, $\pi_{\mathrm{down}}{=}0.92$ (0.70 adverse), and $\pi_{\mathrm{node}}{=}0.98$. We set $\alpha{=}0.002\,\mathrm{s}^{-1}$, $\lambda_E{=}10^{-5}$, $\lambda_C{=}10^{-12}$, $\lambda_R{=}0.05$, and one backup by default. The core comparison further stresses the setup with a sparser 6\,$\times$\,4 Walker and eight tasks/orbit; it aggregates 60 seeds. Other experiments use matched seeds across algorithms, and error bars show one standard deviation. Table~\ref{tab:configs} gives each experiment's deviations.
 
 \textbf{Baselines.} B1 direct downlink (bent pipe, no inference); B2 onboard-only; B3 onboard with $0.15\times$ output compression; B4 Serval-like priority bifurcation, one satellite per task~\cite{tao2024serval}; B5 SECO-like multi-satellite placement without redundancy~\cite{seco}; B6 full replication to $r_{\max}$ helpers~\cite{dean2013tail}; B7 random-helper replication; B8 CoCoI-like MDS-coded redundancy adapted to contact windows~\cite{cocoi,lee2018codes}. All baselines share \ordi{}'s contact graphs, state model, and routing caches.
 
 \textbf{Metrics.} Deadline miss ratio (primary), delivered utility per \eqref{eq:objective}'s first term, partial task coverage, recovery latency, ISL traffic, energy, and mean replicas per tile. Energy includes onboard compute, ISL communication, and spacecraft-to-ground transmission; the latter is charged as transmit power times airtime at the modeled 100\,Mbps downlink rate, consistent with demonstrated high-rate CubeSat links surveyed by NASA~\cite{nasa2026comms}. Thus B1 pays to transmit raw tile inputs, while inference methods transmit compact outputs.
+
+\subsection{Agreement with In-Orbit State Data}
+\label{sec:state-fit}
+
+We check whether the concrete transition model in Eqs.~\eqref{eq:battery-update}--\eqref{eq:thermal-queue-update} is consistent with the BUPT-1 data used in our experiments~\cite{wang2024cots}. We first derive its fixed parameters directly from the flight artifact: the inference trace gives $C_i^{\max}{=}9.67$\,GFLOP/s and idle/active payload powers of 7.78/10.19\,W, while the discharge curves give $B_i^{\max}{=}118.87$\,Wh. These are calibration targets, rather than prediction results.
+
+We then evaluate one 60-s transition at a time, holding the initial measured state fixed. For temperature, the input is the measured active-sample fraction in each non-overlapping interval of the 1-s inference trace. For battery, we apply the idle, orbit-average-harvest update to consecutive samples of the four-month 60-s telemetry trace; SOC is estimated using a conservative 14.4--16.8\,V empty/full envelope. Table~\ref{tab:state-fit} reports the resulting agreement. The thermal update is within 5$^\circ$C for 98.2\% of intervals, and the battery update is within one percentage point for 89.6\%. However, 89.6\% of measured SOC transitions are unchanged at the voltage proxy's resolution; the battery result therefore bounds short-horizon update error rather than demonstrating detailed charge dynamics.
+
+\begin{table}[t]
+\caption{One-epoch agreement with in-orbit measurements. Battery errors are SOC percentage points (pp).}
+\label{tab:state-fit}
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+State transition & 60-s intervals & MAE & RMSE \\
+\midrule
+Temperature $\Theta_i$ & 282 & 2.43$^\circ$C & 2.89$^\circ$C \\
+Battery $B_i$ & 168,647 & 0.60\,pp & 1.70\,pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This check is deliberately short-horizon and in-sample: the long trace lacks synchronized workload, communication, and illumination labels, and its voltage-derived SOC is quantized. We therefore do not claim open-loop trajectory accuracy. Nor do these nominal-temperature data validate the 60\%/25\% stress throttles, which remain conservative sensitivity parameters. The real-data case study in Section~\ref{sec:real} avoids those extrapolations by replaying measured battery and temperature states directly.
 
 \subsection{Core Comparison}
 \label{sec:e1}
@@ -394,7 +494,7 @@ Group & Parameter & Value\\
  & $\pi_{\mathrm{node}}$ & 0.98\\
  & Straggler trigger & $1.5\times$ expected latency\\
 \midrule
-\multirow{9}{*}{\shortstack[l]{Satellite\\(measured,\\Atlas 200DK\\BUPT-1~\cite{wang2024cots})}}
+\multirow{10}{*}{\shortstack[l]{Satellite\\(measured,\\Atlas 200DK\\BUPT-1~\cite{wang2024cots})}}
  & Compute rate & 9.67\,GFLOP/s\\
  & Idle power & 7.78\,W\\
  & Compute power (incr.) & 2.41\,W\\
@@ -403,6 +503,7 @@ Group & Parameter & Value\\
  & Battery floor & 15\%\\
  & Solar harvest (avg.) & 14.43\,W\\
  & Thermal limit / max obs. & $80^\circ$C / $57^\circ$C\\
+ & Effective thermal resistance & 16.62\,$^\circ$C/W\\
  & Thermal RC constant & 300\,s\\
 \bottomrule
 \end{tabular}
