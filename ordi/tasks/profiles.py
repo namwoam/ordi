@@ -10,8 +10,10 @@ Each profile gives:
                       a log-normal distribution: wildfire 600 s, ship 900 s,
                       change 1800 s, and cloud filtering 5760 s (one orbit).
 
-Values are derived from benchmarking MobileNetV2 and YOLOv5-nano on
-typical 128×128-pixel tiles at uint8 resolution (3 channels).
+Each task is a 4096×4096 scene represented by a 4×4 grid of 1024×1024
+logical tiles.  Input volume and inference work are area-scaled from the
+original 128×128 MobileNetV2/YOLOv5-nano profiles.  Sparse detection products
+stay compact; dense cloud/change masks scale with image area.
 """
 
 from __future__ import annotations
@@ -38,15 +40,18 @@ class TileProfile:
         return self.d_out_bits / 8
 
 
-# Tile size: 128×128 pixels, 3 channels, uint8 → 49,152 bytes = 393,216 bits
-_TILE_PIX = 128 * 128 * 3 * 8   # bits
+# A 4×4 grid of these tiles represents one 4096×4096 scene.
+_TILE_EDGE_PIX = 1024
+_REFERENCE_TILE_EDGE_PIX = 128
+_AREA_SCALE = (_TILE_EDGE_PIX / _REFERENCE_TILE_EDGE_PIX) ** 2  # 64×
+_TILE_PIX = _TILE_EDGE_PIX * _TILE_EDGE_PIX * 3 * 8
 
 PROFILES: Dict[str, TileProfile] = {
     "wildfire": TileProfile(
         name="wildfire",
         d_in_bits=_TILE_PIX,
         d_out_bits=1 * 8 * 1024,           # ~1 kB: class label + confidence + bounding box
-        compute_ops=0.3e9,                  # 0.3 GFLOPs (MobileNetV2 classifier)
+        compute_ops=0.3e9 * _AREA_SCALE,    # area-scaled MobileNetV2
         base_utility=1.0,
         deadline_median_s=600.0,            # 10 min — urgent disaster alert
     ),
@@ -54,23 +59,23 @@ PROFILES: Dict[str, TileProfile] = {
         name="ship",
         d_in_bits=_TILE_PIX,
         d_out_bits=5 * 8 * 1024,           # ~5 kB: multiple bounding boxes (YOLOv5-nano)
-        compute_ops=0.9e9,
+        compute_ops=0.9e9 * _AREA_SCALE,
         base_utility=0.8,
         deadline_median_s=900.0,            # 15 min — maritime alert
     ),
     "cloud_filter": TileProfile(
         name="cloud_filter",
         d_in_bits=_TILE_PIX,
-        d_out_bits=50 * 8 * 1024,          # ~50 kB: pixel-wise mask (lightweight U-Net)
-        compute_ops=1.2e9,
+        d_out_bits=50 * 8 * 1024 * _AREA_SCALE,  # dense pixel-wise mask
+        compute_ops=1.2e9 * _AREA_SCALE,
         base_utility=0.5,
         deadline_median_s=5760.0,           # 96 min — finish within one orbit
     ),
     "change": TileProfile(
         name="change",
         d_in_bits=2 * _TILE_PIX,           # two co-registered tiles (before/after)
-        d_out_bits=10 * 8 * 1024,          # ~10 kB: change map
-        compute_ops=1.8e9,                  # Siamese CNN
+        d_out_bits=10 * 8 * 1024 * _AREA_SCALE,  # dense change map
+        compute_ops=1.8e9 * _AREA_SCALE,    # area-scaled Siamese CNN
         base_utility=0.9,
         deadline_median_s=1800.0,           # 30 min — change analysis
     ),

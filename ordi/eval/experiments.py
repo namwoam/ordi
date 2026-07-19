@@ -13,9 +13,11 @@ Shared realistic LEO-EO simulation setup (all experiments unless overridden):
     for an EO system whose camera covers a finite swath.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
-  - Tasks: Poisson arrivals, 16 tasks/orbit, log-normal deadlines (σ=0.6)
-    with medians wildfire 600 s, ship 900 s, change 1800 s, and
-    cloud_filter 5760 s (one orbit).
+  - Tasks: mean 16 requests/orbit in a clustered hot-source process. Half of
+    parent events generate 2–4 same-source requests within 60 s.
+  - Each request is a 4096×4096 scene split into sixteen 1024×1024 tiles.
+  - Deadlines are log-normal (σ=0.6), with medians wildfire 600 s, ship
+    900 s, change 1800 s, and cloud_filter 5760 s (one orbit).
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from ordi.algorithms import (
     ORDI, DirectDownlink, OnboardOnly, SECOAdapted,
     FullReplication, RandomReplication, EpochInput, SatelliteView,
     ContactWindow, PolicyWeights, ExperimentConfig, Assignment, Decision,
+    LocalKnowledgeAdapter,
 )
 ORDIConfig = ExperimentConfig
 CORE_BASELINES = [DirectDownlink, OnboardOnly, SECOAdapted, FullReplication]
@@ -80,12 +83,17 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                deadline_lognorm_sigma=0.6,
                arrival_rate=16.0, ground_stations=None,
                orbit_period_s=5760.0,
+               burst_probability=0.5, burst_size_range=(2, 4),
+               burst_window_s=60.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=25.0, satellite_params_factory=None,
                n_replicas_max=2):
     """Build all shared simulation objects.
 
     orbit_period_s        : realistic LEO period at 550 km altitude (~5760 s / 96 min).
+    burst_probability     : share of parent events that create hot-source bursts.
+    burst_size_range      : inclusive request-count range for a burst.
+    burst_window_s        : release-time spread within a burst.
     deadline_slack        : global deadline scale (reference = 600 s).  Per-type medians
                             (wildfire 600 s, ship 900 s, change 1800 s,
                             cloud_filter 5760 s)
@@ -143,6 +151,9 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         sat_ids, SIM_DURATION_S,
         arrival_rate_per_orbit=arrival_rate,
         orbit_period_s=orbit_period_s,
+        burst_probability=burst_probability,
+        burst_size_range=burst_size_range,
+        burst_window_s=burst_window_s,
         deadline_slack_s=deadline_slack,
         deadline_lognorm_sigma=deadline_lognorm_sigma,
         seed=seed,
@@ -163,13 +174,27 @@ def _assignment_viable(a: Assignment, states) -> bool:
     (a surviving backup avoids re-transmission). No-helper assignments never replan."""
     if not a.helpers:
         return True
-    viable = 0
+    viable = []
     for helper, aggregator in zip(a.helpers, a.aggregators):
         h = states.get(helper)
         g = states.get(aggregator)
         if h is not None and g is not None and h.A_i and g.A_i:
-            viable += 1
-    return viable >= int(a.metadata.get("data_shards", 1))
+            viable.append(True)
+        else:
+            viable.append(False)
+    required = int(a.metadata.get("data_shards", 1))
+    shard_groups = a.metadata.get("shard_groups")
+    if shard_groups is None:
+        return sum(viable) >= required
+    if len(shard_groups) != len(viable):
+        return False
+    grouped = {}
+    for label, alive in zip(shard_groups, viable):
+        grouped.setdefault(label, []).append(alive)
+    return any(
+        len(group) == required and all(group)
+        for group in grouped.values()
+    )
 
 
 def _uncommitted_tasks(pending, committed):
@@ -185,7 +210,8 @@ def _uncommitted_tasks(pending, committed):
     return out
 
 
-def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
+def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
+                              protocol_events=()):
     """Apply newly committed assignment load to every satellite state.
 
     Assignment energy records are converted back to compute work using the
@@ -232,6 +258,9 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
                               if index < len(assignment.input_fractions) else 1.0)
             output_fraction = (assignment.output_fractions[index]
                                if index < len(assignment.output_fractions) else 1.0)
+            protocol_header = float(
+                assignment.metadata.get("protocol_header_bits", 0.0)
+            )
             per_helper_work = float(assignment.metadata.get(
                 "compute_flops", tile.compute_ops * work_fraction
             ))
@@ -239,12 +268,14 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
 
             bits = float(assignment.metadata.get(
                 "downlink_bits", tile.d_out_bits * output_fraction
-            ))
+            )) + protocol_header
             if index < len(assignment.routes):
                 route_in, route_out, route_down = assignment.routes[index]
                 for path, path_bits in (
-                        (route_in, tile.d_in_bits * input_fraction),
-                        (route_out, tile.d_out_bits * output_fraction)):
+                        (route_in, tile.d_in_bits * input_fraction
+                         + protocol_header),
+                        (route_out, tile.d_out_bits * output_fraction
+                         + protocol_header)):
                     for sender, receiver in zip(path, path[1:]):
                         if sender in isl_tx_bits:
                             isl_tx_bits[sender] += path_bits
@@ -260,13 +291,30 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
                         rx_bits[receiver] += bits
             else:
                 if source != helper and source in isl_tx_bits:
-                    isl_tx_bits[source] += tile.d_in_bits * input_fraction
-                    rx_bits[helper] += tile.d_in_bits * input_fraction
+                    isl_tx_bits[source] += (
+                        tile.d_in_bits * input_fraction + protocol_header
+                    )
+                    rx_bits[helper] += (
+                        tile.d_in_bits * input_fraction + protocol_header
+                    )
                 if helper != aggregator and aggregator in states:
-                    isl_tx_bits[helper] += tile.d_out_bits * output_fraction
-                    rx_bits[aggregator] += tile.d_out_bits * output_fraction
+                    isl_tx_bits[helper] += (
+                        tile.d_out_bits * output_fraction + protocol_header
+                    )
+                    rx_bits[aggregator] += (
+                        tile.d_out_bits * output_fraction + protocol_header
+                    )
                 if aggregator in downlink_bits:
                     downlink_bits[aggregator] += bits
+
+    # Resource advertisements occur even in epochs without science work.
+    for event in protocol_events:
+        if (event.kind == "state_advertisement"
+                and event.event == "hop_sent"):
+            if event.node in isl_tx_bits:
+                isl_tx_bits[event.node] += event.bits
+            if event.peer in rx_bits:
+                rx_bits[event.peer] += event.bits
 
     # Physical evolution is deliberately delegated to Basilisk/BSK-RL.  Keep
     # this function as a workload translator for callers that own a backend.
@@ -306,6 +354,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], Assignment] = {}
+    protocol_message_count = 0.0
+    protocol_control_bits = 0.0
 
     for epoch in range(N_EPOCHS):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
@@ -328,6 +378,12 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
         result = schedule_fn(epoch, todo)
+        protocol_message_count += float(
+            result.metadata.get("protocol_message_count", 0.0)
+        )
+        protocol_control_bits += float(
+            result.metadata.get("advertisement_control_bits", 0.0)
+        )
         newly_committed = []
         for a in result.assignments:
             reliability_estimate = float(a.metadata.get(
@@ -339,7 +395,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                 newly_committed.append(a)
         if state_driver is None:
             physical_backend.submit(_advance_synthetic_states(
-                newly_committed, tasks, states, cfg.epoch_length
+                newly_committed, tasks, states, cfg.epoch_length,
+                protocol_events=result.message_events,
             ))
         if injector:
             injector.withdraw_epoch(epoch + 1)
@@ -348,7 +405,13 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                      for task in tasks for tile in task.tiles}
     final = [committed.get(k) or Assignment(k[0], k[1], source_by_key[k])
              for k in all_tiles]
-    res = Decision(N_EPOCHS - 1, tuple(final))
+    res = Decision(
+        N_EPOCHS - 1, tuple(final),
+        metadata={
+            "protocol_message_count": protocol_message_count,
+            "advertisement_control_bits": protocol_control_bits,
+        },
+    )
     # Use the actual constellation radio profile (measurement-backed when the
     # Atlas params factory is used) rather than the synthetic 5 W default.
     downlink_power_w = (sum(s.params.comms_power_w for s in states.values())
@@ -401,7 +464,12 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     # A policy cannot use a contact after every pending task has expired. The
     # old all-horizon projection made each route lookup scan the remaining
     # three-orbit graph, even for tasks due within a few minutes.
-    latest_deadline = max((task.deadline for task in tasks), default=-math.inf)
+    # Always expose the current epoch's contacts so decentralized policies can
+    # exchange state advertisements even when no science task is pending.
+    latest_deadline = max(
+        (task.deadline for task in tasks),
+        default=T_SIM_START + (ep + 1) * cfg.epoch_length,
+    )
     for future in graphs[ep:]:
         if future.t_start > latest_deadline:
             break
@@ -451,7 +519,11 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
             injector.schedule(f)
 
     if scheduler_class is ORDI:
-        sched = scheduler_class(max_replicas=cfg.max_backups + 1)
+        sched = scheduler_class(
+            max_replicas=cfg.max_backups + 1,
+            split_options=cfg.ordi_split_options,
+            halo_fraction=cfg.split_halo_fraction,
+        )
     elif scheduler_class is SECOAdapted:
         sched = scheduler_class(
             split_options=cfg.seco_split_options,
@@ -463,6 +535,9 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
             sched = scheduler_class(seed=seed)
         except TypeError:
             sched = scheduler_class()
+
+    if scheduler_class is not ORDI:
+        sched = LocalKnowledgeAdapter(sched)
 
     feasibility = DecisionFeasibilityModel()
 
@@ -641,15 +716,19 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
 # higher task load. All benchmarks use the same 25° GS elevation mask.
 _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         arrival_rate=16.0, deadline_slack=600.0,
-                        deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
+                        deadline_lognorm_sigma=0.6,
+                        burst_probability=0.5,
+                        burst_size_range=(2, 4), burst_window_s=60.0,
+                        min_elevation_deg=25.0)
 
 def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
-    with 16 Poisson arrivals per orbit so tasks compete for shared compute and
-    contact resources (about 48 candidates over the three-orbit run).
+    with a mean of 16 requests per orbit. Half of parent events create 2–4
+    same-source requests within 60 s, producing realistic hot-source queues
+    while preserving the requested mean rate.
 
     All experiments use six globally distributed ground stations and a 25°
     minimum elevation angle. Relay policies must therefore improve on a

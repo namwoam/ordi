@@ -35,6 +35,8 @@ class EpochMetrics:
     downlink_volume_bits: float = 0.0
     energy_joules: float = 0.0
     helper_utilization: float = 0.0
+    protocol_messages: float = 0.0
+    control_traffic_bits: float = 0.0
     objective: float = 0.0
     n_replicas_avg: float = 0.0
     n_tiles_total: int = 0
@@ -101,6 +103,9 @@ def compute_metrics(
                               if index < len(assignment.input_fractions) else 1.0)
             output_fraction = (assignment.output_fractions[index]
                                if index < len(assignment.output_fractions) else 1.0)
+            protocol_header = float(
+                assignment.metadata.get("protocol_header_bits", 0.0)
+            )
             if index < len(assignment.routes):
                 route_in, route_out, route_down = assignment.routes[index]
                 m.isl_traffic_bits += (tile.d_in_bits * input_fraction
@@ -109,19 +114,42 @@ def compute_metrics(
                                        * max(0, len(route_out) - 1))
                 m.isl_traffic_bits += (tile.d_out_bits * output_fraction
                                        * max(0, len(route_down) - 2))
+                control_hops = (
+                    max(0, len(route_in) - 1)
+                    + max(0, len(route_out) - 1)
+                    + max(0, len(route_down) - 1)
+                )
+                m.control_traffic_bits += protocol_header * control_hops
+                m.isl_traffic_bits += protocol_header * (
+                    max(0, len(route_in) - 1)
+                    + max(0, len(route_out) - 1)
+                    + max(0, len(route_down) - 2)
+                )
             else:
                 if helper != assignment.source:
                     m.isl_traffic_bits += tile.d_in_bits * input_fraction
                 if helper != aggregator:
                     m.isl_traffic_bits += tile.d_out_bits * output_fraction
         m.energy_joules += float(assignment.metadata.get("energy_j", 0.0))
+        advertisement_bits = float(
+            assignment.metadata.get("advertisement_control_bits", 0.0)
+        )
+        m.control_traffic_bits += advertisement_bits
+        m.isl_traffic_bits += advertisement_bits
+        m.protocol_messages += float(
+            assignment.metadata.get("protocol_message_count", 0.0)
+        )
 
         # Every delivered tile incurs spacecraft-to-ground transmit energy.
         # Normal inference schedulers downlink the compact result; direct and
         # compression baselines record their raw/compressed size explicitly.
         if reliability > 0.0 and not math.isinf(latency):
             downlink_bits = float(assignment.metadata.get(
-                "downlink_bits", tile.d_in_bits if assignment.downlink_only else tile.d_out_bits
+                "protocol_ground_bits",
+                assignment.metadata.get(
+                    "downlink_bits",
+                    tile.d_in_bits if assignment.downlink_only else tile.d_out_bits,
+                ),
             ))
             m.downlink_volume_bits += downlink_bits
             if not assignment.metadata.get("includes_downlink_energy", False):
@@ -161,6 +189,16 @@ def compute_metrics(
     )
     m.helper_utilization = (min(1.0, compute_used / total_capacity)
                             if total_capacity > 0 else 0.0)
+
+    decision_metadata = getattr(result, "metadata", {})
+    decision_advertisement_bits = float(
+        decision_metadata.get("advertisement_control_bits", 0.0)
+    )
+    m.protocol_messages += float(
+        decision_metadata.get("protocol_message_count", 0.0)
+    )
+    m.control_traffic_bits += decision_advertisement_bits
+    m.isl_traffic_bits += decision_advertisement_bits
 
     return m
 
@@ -242,7 +280,7 @@ def compute_realized_metrics(
     if n_tiles == 0:
         return base
 
-    scored = []  # (task_id, tile, latency, components, source, required successes)
+    scored = []  # (task_id, tile, latency, alternative shard groups, source)
     for a in result.assignments:
         key = (a.task_id, a.tile_id)
         if key not in tile_lookup:
@@ -259,19 +297,32 @@ def compute_realized_metrics(
             if reliability_estimate > 0 and not math.isinf(latency):
                 aggregator = a.aggregators[0] if a.aggregators else a.source
                 scored.append((task_obj.task_id, tile, latency,
-                               [(("__none__",), (), aggregator)],
-                               task_obj.source_sat, 1))
+                               [[(("__none__",), (), aggregator)]],
+                               task_obj.source_sat))
             else:
                 scored.append((task_obj.task_id, tile, latency, [],
-                               task_obj.source_sat, 1))
+                               task_obj.source_sat))
             continue
         comps = [_replica_components(
             h, g, task_obj.source_sat,
             a.routes[index] if index < len(a.routes) else None,
         ) for index, (h, g) in enumerate(zip(a.helpers, a.aggregators))]
         required = int(a.metadata.get("data_shards", 1))
-        scored.append((task_obj.task_id, tile, latency, comps,
-                       task_obj.source_sat, required))
+        shard_labels = a.metadata.get("shard_groups")
+        if shard_labels is not None and len(shard_labels) == len(comps):
+            by_group = {}
+            for label, component in zip(shard_labels, comps):
+                by_group.setdefault(label, []).append(component)
+            groups = [
+                group for group in by_group.values()
+                if len(group) == required
+            ]
+        elif required > 1:
+            groups = [comps] if len(comps) == required else []
+        else:
+            groups = [[component] for component in comps]
+        scored.append((task_obj.task_id, tile, latency, groups,
+                       task_obj.source_sat))
 
     rng = random.Random(seed)
     miss_trials = []
@@ -305,16 +356,16 @@ def compute_realized_metrics(
         task_delivered: Dict[int, int] = {}
         task_total: Dict[int, int] = {}
 
-        for tid, tile, L_hat, comps, src, required in scored:
+        for tid, tile, L_hat, groups, src in scored:
             task_total[tid] = task_total.get(tid, 0) + 1
-            successes = 0
-            if comps and node_ok(src):
-                for nodes, isl_links, agg in comps:
-                    if (all(node_ok(n) for n in nodes)
-                            and all(link_ok(l) for l in isl_links)
-                            and down_ok(agg)):
-                        successes += 1
-            delivered = successes >= required
+            delivered = False
+            if groups and node_ok(src):
+                delivered = any(all(
+                    all(node_ok(n) for n in nodes)
+                    and all(link_ok(link) for link in isl_links)
+                    and down_ok(agg)
+                    for nodes, isl_links, agg in group
+                ) for group in groups)
             if delivered:
                 util += tile.utility * math.exp(-alpha * L_hat)
                 task_delivered[tid] = task_delivered.get(tid, 0) + 1
@@ -345,6 +396,7 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "deadline_miss_ratio", "delivered_utility", "partial_coverage",
         "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
         "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
+        "protocol_messages", "control_traffic_bits",
         "realized_miss_ratio", "realized_utility", "realized_coverage",
     ]
     out: Dict[str, float] = {}

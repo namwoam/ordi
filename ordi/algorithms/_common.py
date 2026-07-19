@@ -90,34 +90,39 @@ def earliest_direct_downlink(request, source, bits, start=None):
                                   (source,contact.target),bits))
     return min(feasible,key=lambda route:route.arrival) if feasible else None
 
-def enumerate_placements(request, task, tile, allow_source=True):
+def enumerate_placements(request, task, tile, allow_source=True,
+                         work_fraction=1.0, input_fraction=1.0,
+                         output_fraction=1.0):
     deadline=task.deadline; out=[]
     source_state=request.satellites.get(task.source_sat)
     if source_state is None or not source_state.available:
         return out
     for helper,hstate in request.satellites.items():
         if not hstate.available or (not allow_source and helper==task.source_sat): continue
-        route_in=earliest_route(request,task.source_sat,{helper},tile.d_in_bits)
+        input_bits=tile.d_in_bits*input_fraction
+        output_bits=tile.d_out_bits*output_fraction
+        work=tile.compute_ops*work_fraction
+        route_in=earliest_route(request,task.source_sat,{helper},input_bits)
         if route_in is None: continue
         compute_start=route_in.arrival
-        compute_time=(hstate.queued_flops+tile.compute_ops)/max(hstate.compute_rate,1.0)
+        compute_time=(hstate.queued_flops+work)/max(hstate.compute_rate,1.0)
         compute_done=compute_start+compute_time
         for agg,astate in request.satellites.items():
             if not astate.available: continue
-            route_out=earliest_route(request,helper,{agg},tile.d_out_bits,compute_done)
+            route_out=earliest_route(request,helper,{agg},output_bits,compute_done)
             if route_out is None: continue
-            down=earliest_downlink(request,agg,tile.d_out_bits,route_out.arrival)
+            down=earliest_downlink(request,agg,output_bits,route_out.arrival)
             if down is None or down.arrival>deadline: continue
             participating={helper,agg}-{task.source_sat}
             node_reliability=math.prod(request.satellites[node].reliability
                                       for node in participating)
             p=(route_in.reliability*route_out.reliability*down.reliability
                *node_reliability)
-            compute_e=(hstate.compute_power_w * tile.compute_ops
+            compute_e=(hstate.compute_power_w * work
                        / max(hstate.compute_rate, 1.0))
-            isl_bits=(tile.d_in_bits*max(len(route_in.path)-1,0)
-                      + tile.d_out_bits*max(len(route_out.path)-1,0))
-            comm_bits=isl_bits+tile.d_out_bits*max(len(down.path)-1,0)
+            isl_bits=(input_bits*max(len(route_in.path)-1,0)
+                      + output_bits*max(len(route_out.path)-1,0))
+            comm_bits=isl_bits+output_bits*max(len(down.path)-1,0)
             # Ground transmit energy is accounted once by the evaluator.
             comm_e=hstate.comms_power_w*isl_bits/200e6
             out.append(Placement(helper,agg,down.arrival-request.sim_time,p,

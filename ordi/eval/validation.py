@@ -103,6 +103,20 @@ class DecisionFeasibilityModel:
             for task in request.tasks for tile in task.tiles
         }
 
+        # State advertisements are physical ISL messages even when an epoch
+        # has no science assignment. Reserve them before policy work so every
+        # algorithm sees identical residual contact capacity.
+        reserved_advertisements = set()
+        for event in decision.message_events:
+            if (event.kind != "state_advertisement"
+                    or event.event != "hop_sent"
+                    or event.message_id in reserved_advertisements):
+                continue
+            trial._reserve_hop(
+                request, event.node, event.peer, event.bits, event.time
+            )
+            reserved_advertisements.add(event.message_id)
+
         for assignment in decision.assignments:
             key = (assignment.task_id, assignment.tile_id)
             task = task_by_id.get(assignment.task_id)
@@ -134,6 +148,73 @@ class DecisionFeasibilityModel:
                     raise InvalidDecisionError(
                         f"assignment {key} does not provide one aggregator per helper"
                     )
+                if assignment.node_decisions:
+                    allowed_actions = {
+                        "execute_forward", "delegate", "split", "replicate"
+                    }
+                    for local in assignment.node_decisions:
+                        if local.action not in allowed_actions:
+                            raise InvalidDecisionError(
+                                f"assignment {key} contains unknown node action "
+                                f"{local.action!r}"
+                            )
+                        if local.node != local.item.current_node:
+                            raise InvalidDecisionError(
+                                f"assignment {key} has node {local.node!r} "
+                                f"acting on work held by "
+                                f"{local.item.current_node!r}"
+                            )
+                        if (local.item.task_id, local.item.tile_id) != key:
+                            raise InvalidDecisionError(
+                                f"assignment {key} contains a decision for a "
+                                "different work item"
+                            )
+                    terminal = [
+                        local for local in assignment.node_decisions
+                        if local.action == "execute_forward"
+                    ]
+                    if len(terminal) != len(assignment.helpers):
+                        raise InvalidDecisionError(
+                            f"assignment {key} has {len(assignment.helpers)} "
+                            f"compute operations but {len(terminal)} terminal "
+                            "node decisions"
+                        )
+                    for index, local in enumerate(terminal):
+                        work_fraction = (
+                            assignment.work_fractions[index]
+                            if index < len(assignment.work_fractions) else 1.0
+                        )
+                        input_fraction = (
+                            assignment.input_fractions[index]
+                            if index < len(assignment.input_fractions) else 1.0
+                        )
+                        output_fraction = (
+                            assignment.output_fractions[index]
+                            if index < len(assignment.output_fractions) else 1.0
+                        )
+                        route_down = assignment.routes[index][2]
+                        destination = local.item.destination
+                        destination_ok = (
+                            not route_down
+                            or destination == route_down[-1]
+                            or (isinstance(destination, tuple)
+                                and route_down[-1] in destination)
+                        )
+                        if (local.node != assignment.helpers[index]
+                                or not math.isclose(
+                                    local.item.work_fraction, work_fraction
+                                )
+                                or not math.isclose(
+                                    local.item.input_fraction, input_fraction
+                                )
+                                or not math.isclose(
+                                    local.item.output_fraction, output_fraction
+                                )
+                                or not destination_ok):
+                            raise InvalidDecisionError(
+                                f"assignment {key} terminal node decision "
+                                f"{index} disagrees with its physical operation"
+                            )
                 for index, helper in enumerate(assignment.helpers):
                     route_in, route_out, route_down = assignment.routes[index]
                     work_fraction = (
@@ -148,9 +229,13 @@ class DecisionFeasibilityModel:
                         assignment.output_fractions[index]
                         if index < len(assignment.output_fractions) else 1.0
                     )
+                    protocol_header_bits = float(
+                        assignment.metadata.get("protocol_header_bits", 0.0)
+                    )
                     now = trial._reserve_path(
                         request, route_in,
-                        tile.d_in_bits * input_fraction,
+                        tile.d_in_bits * input_fraction
+                        + protocol_header_bits,
                         request.sim_time,
                     )
                     now = trial._reserve_compute(
@@ -159,11 +244,13 @@ class DecisionFeasibilityModel:
                     )
                     now = trial._reserve_path(
                         request, route_out,
-                        tile.d_out_bits * output_fraction, now,
+                        tile.d_out_bits * output_fraction
+                        + protocol_header_bits, now,
                     )
                     now = trial._reserve_path(
                         request, route_down,
-                        tile.d_out_bits * output_fraction, now,
+                        tile.d_out_bits * output_fraction
+                        + protocol_header_bits, now,
                     )
                     finishes.append(now)
 
@@ -187,7 +274,26 @@ class DecisionFeasibilityModel:
             modeled_finish = request.sim_time + float(
                 assignment.metadata.get("latency", math.inf)
             )
-            feasible_delivery = sorted(finishes)[required - 1]
+            shard_groups = assignment.metadata.get("shard_groups")
+            if shard_groups is not None:
+                if len(shard_groups) != len(finishes):
+                    raise InvalidDecisionError(
+                        f"assignment {key} provides {len(finishes)} operations "
+                        f"but {len(shard_groups)} shard-group labels"
+                    )
+                grouped = {}
+                for label, finish in zip(shard_groups, finishes):
+                    grouped.setdefault(label, []).append(finish)
+                if any(len(group) != required for group in grouped.values()):
+                    raise InvalidDecisionError(
+                        f"assignment {key} must provide exactly {required} "
+                        "shards in every reconstruction group"
+                    )
+                feasible_delivery = min(
+                    max(group) for group in grouped.values()
+                )
+            else:
+                feasible_delivery = sorted(finishes)[required - 1]
             if not retime and feasible_delivery > modeled_finish + 1e-6:
                 raise InvalidDecisionError(
                     f"assignment {key} reports delivery at "

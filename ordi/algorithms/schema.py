@@ -48,6 +48,9 @@ class ExperimentConfig:
     epoch_length: float = 60.0
     isl_rate_bps: float = 200e6
     max_backups: int = 1
+    # A receiving ORDI node chooses the number of compute shards per tile.
+    # Redundancy, when selected, creates another complete shard group.
+    ordi_split_options: tuple[int, ...] = (1, 2, 4)
     plane_disjoint_backup: bool = False
     # SECO-aligned processing model.  A captured image tile may be split into
     # this many parallel shards.  Spatial splitting duplicates a small halo at
@@ -67,6 +70,50 @@ class EpochInput:
     contacts: Sequence[ContactWindow] = ()
     epoch_length: float = 60.0
     weights: PolicyWeights = PolicyWeights()
+    # Populated for a node-local policy view. Missing entries mean that the
+    # observer has never received a state advertisement from that satellite.
+    state_age_s: Mapping[str, float] = field(default_factory=dict)
+    observer: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    """A unit of work delivered to a node with its intended destination."""
+    task_id: int
+    tile_id: int
+    destination: str | tuple[str, ...]
+    current_node: str
+    work_fraction: float = 1.0
+    input_fraction: float = 1.0
+    output_fraction: float = 1.0
+    group_id: int = 0
+    depth: int = 0
+
+
+@dataclass(frozen=True)
+class NodeDecision:
+    """A node-local action taken after receiving a WorkItem."""
+    node: str
+    action: str
+    item: WorkItem
+    delegates: tuple[WorkItem, ...] = ()
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class MessageEvent:
+    """One immutable event emitted by the discrete-event protocol runtime."""
+    time: float
+    event: str
+    message_id: str
+    kind: str
+    node: str
+    peer: str = ""
+    bits: float = 0.0
+    task_id: int = -1
+    tile_id: int = -1
+    group_id: int = 0
+    shard_id: int = 0
 
 @dataclass(frozen=True)
 class Assignment:
@@ -84,11 +131,17 @@ class Assignment:
     work_fractions: tuple[float, ...] = ()
     input_fractions: tuple[float, ...] = ()
     output_fractions: tuple[float, ...] = ()
+    # Auditable decentralized protocol trace. The physical model validates
+    # that terminal execute/send actions agree with the submitted placement.
+    node_decisions: tuple[NodeDecision, ...] = ()
+    message_events: tuple[MessageEvent, ...] = ()
 
 @dataclass(frozen=True)
 class Decision:
     epoch: int
     assignments: tuple[Assignment, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    message_events: tuple[MessageEvent, ...] = ()
 
 class Algorithm(Protocol):
     name: str

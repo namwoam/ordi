@@ -57,6 +57,7 @@ class EOTask:
     task_type: str
     tiles: List[Tile] = field(default_factory=list)
     n_tiles_side: int = 4   # n_tiles_side × n_tiles_side grid
+    burst_id: int = -1      # parent arrival; clustered requests share this ID
 
     @property
     def n_tiles(self) -> int:
@@ -174,6 +175,9 @@ def generate_tasks(
     task_type_weights: Dict[str, float] = None,
     n_replicas_max: int = 2,
     seed: int = 0,
+    burst_probability: float = 0.0,
+    burst_size_range: Tuple[int, int] = (2, 4),
+    burst_window_s: float = 60.0,
     # ── FOV-aware mode (optional) ──────────────────────────────────────────
     sat_groundtrack: Optional[Dict[str, List[Tuple[float, float, float]]]] = None,
     # {sat_id: [(t_s, lat_deg, lon_deg), ...]} sampled at regular intervals
@@ -199,6 +203,16 @@ def generate_tasks(
         (Lublin & Feitelson 2003; Google Borg trace analysis).
         Set to 0.0 for deterministic (fixed) deadlines.
 
+    burst_probability : probability that one parent arrival creates a cluster
+        of requests.  Every request in a cluster uses the same source and task
+        type and is released within ``burst_window_s``.  The parent-event rate
+        is reduced so ``arrival_rate_per_orbit`` remains the expected REQUEST
+        rate rather than becoming the cluster rate.
+
+    burst_size_range : inclusive minimum/maximum requests in a burst.
+
+    burst_window_s : maximum release-time spread within one hot-source burst.
+
     FOV-aware mode (when sat_groundtrack and ground_targets are given):
       Each task event first picks a random ground target, then finds all
       satellites with their sub-satellite point within fov_range_km of the
@@ -216,7 +230,18 @@ def generate_tasks(
     types = list(task_type_weights.keys())
     weights = [task_type_weights[t] for t in types]
 
-    lam = arrival_rate_per_orbit / orbit_period_s  # tasks per second
+    burst_min, burst_max = burst_size_range
+    if not 0.0 <= burst_probability <= 1.0:
+        raise ValueError("burst_probability must be between 0 and 1")
+    if burst_min < 2 or burst_max < burst_min:
+        raise ValueError("burst_size_range must satisfy 2 <= min <= max")
+    if burst_window_s < 0.0:
+        raise ValueError("burst_window_s must be non-negative")
+    mean_burst_size = (burst_min + burst_max) / 2.0
+    mean_cluster_size = 1.0 + burst_probability * (mean_burst_size - 1.0)
+    # Parent clusters per second.  Dividing by mean cluster size preserves the
+    # requested mean number of individual tasks per orbit.
+    lam = arrival_rate_per_orbit / orbit_period_s / mean_cluster_size
 
     # Build a time→index lookup for the groundtrack (O(1) per event)
     pos_at = groundtrack_lookup(sat_groundtrack) if sat_groundtrack else None
@@ -224,6 +249,7 @@ def generate_tasks(
     tasks: List[EOTask] = []
     t = 0.0
     task_id = 0
+    burst_id = 0
 
     while t < sim_duration_s:
         # exponential inter-arrival
@@ -255,17 +281,33 @@ def generate_tasks(
         ttype = rng.choices(types, weights=weights, k=1)[0]
         profile = PROFILES[ttype]
 
-        task = EOTask(
-            task_id=task_id,
-            source_sat=src,
-            release_time=t,
-            deadline=draw_deadline(profile, t, deadline_slack_s,
-                                   deadline_lognorm_sigma, rng),
-            task_type=ttype,
-            n_tiles_side=n_tiles_side,
+        cluster_size = (rng.randint(burst_min, burst_max)
+                        if rng.random() < burst_probability else 1)
+        release_times = [t]
+        release_times.extend(
+            t + rng.uniform(0.0, burst_window_s)
+            for _ in range(cluster_size - 1)
         )
-        task.tiles = build_tiles(task_id, profile, n_tiles_side, n_replicas_max, rng)
-        tasks.append(task)
-        task_id += 1
+        for release_time in sorted(release_times):
+            if release_time >= sim_duration_s:
+                continue
+            task = EOTask(
+                task_id=task_id,
+                source_sat=src,
+                release_time=release_time,
+                deadline=draw_deadline(
+                    profile, release_time, deadline_slack_s,
+                    deadline_lognorm_sigma, rng,
+                ),
+                task_type=ttype,
+                n_tiles_side=n_tiles_side,
+                burst_id=burst_id,
+            )
+            task.tiles = build_tiles(
+                task_id, profile, n_tiles_side, n_replicas_max, rng
+            )
+            tasks.append(task)
+            task_id += 1
+        burst_id += 1
 
     return tasks
