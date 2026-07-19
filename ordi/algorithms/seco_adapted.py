@@ -17,6 +17,7 @@ import heapq
 import math
 
 from .schema import Assignment, Decision
+from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,10 @@ class SECOAdapted:
         self.split_options = tuple(sorted(set(split_options)))
         self.halo_fraction = halo_fraction
         self.battery_reserve_frac = battery_reserve_frac
+        # The SECO planning ledger below handles contention within one call.
+        # This persistent model ledger also protects future contacts and compute
+        # slots already committed by decisions from earlier epochs.
+        self.resources = DecisionFeasibilityModel()
 
     def _part_candidate(self, request, task, tile, ledger, work_fraction,
                         input_fraction, output_fraction):
@@ -329,7 +334,7 @@ class SECOAdapted:
                 part.reliability for part in plan.parts
             )
             q = plan.split_count
-            assignments.append(Assignment(
+            assignment = Assignment(
                 task.task_id,
                 tile.tile_id,
                 task.source_sat,
@@ -354,5 +359,11 @@ class SECOAdapted:
                 work_fractions=(plan.work_fraction,) * q,
                 input_fractions=(plan.input_fraction,) * q,
                 output_fractions=(plan.output_fraction,) * q,
-            ))
+            )
+            try:
+                assignments.append(
+                    self.resources.retime_and_reserve(request, assignment)
+                )
+            except InvalidDecisionError:
+                continue
         return Decision(request.epoch, tuple(assignments))

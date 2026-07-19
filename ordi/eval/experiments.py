@@ -6,17 +6,16 @@ Results are saved to results/<experiment_id>.csv.
 
 Shared realistic LEO-EO simulation setup (all experiments unless overridden):
   - Synthetic Walker constellation: 6 planes × 6 sats = 36 sats (default)
-  - 2 Northern-hemisphere ground stations (Fairbanks, Greenwich) — typical
-    for a Northern-focus EO mission; creates genuine routing pressure since
-    Southern-hemisphere source sats have no direct downlink within 300 s.
+  - 6 geographically distributed ground stations: Fairbanks, Greenwich,
+    Singapore, Nairobi, Hawaii, and Punta Arenas.
   - FOV-constrained task generation: tasks arise only when a satellite is
     within 600 km of one of 100 random ground targets — physically correct
     for an EO system whose camera covers a finite swath.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
-  - Tasks: Poisson arrivals, 6 tasks/orbit, log-normal deadlines (σ=0.6)
-    with per-type medians: wildfire 300 s, change 480 s, ship 600 s,
-    cloud_filter 1200 s (EO SLA tiers; Lemaître et al. 2002).
+  - Tasks: Poisson arrivals, 16 tasks/orbit, log-normal deadlines (σ=0.6)
+    with medians wildfire 600 s, ship 900 s, change 1800 s, and
+    cloud_filter 5760 s (one orbit).
 """
 
 from __future__ import annotations
@@ -58,11 +57,14 @@ EPOCH_LENGTH_S = 60.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
 
-# Two Northern-hemisphere GS used as the shared ground segment across all
-# experiments — Fairbanks (65°N) and Greenwich (51°N).
-_NORTHERN_GS = [
+# Six geographically distributed stations avoid making relay policies win
+# merely because the direct baseline has an artificially sparse ground segment.
+_EVALUATION_GS = [
     gs for gs in DEFAULT_GROUND_STATIONS
-    if gs[0] in {"fairbanks", "greenwich"}
+    if gs[0] in {
+        "fairbanks", "greenwich", "singapore",
+        "nairobi", "hawaii", "punta_arenas",
+    }
 ]
 
 
@@ -76,7 +78,7 @@ def _worker_count(n_jobs: int) -> int:
 
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                deadline_lognorm_sigma=0.6,
-               arrival_rate=6.0, ground_stations=None,
+               arrival_rate=16.0, ground_stations=None,
                orbit_period_s=5760.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=25.0, satellite_params_factory=None,
@@ -85,7 +87,8 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
 
     orbit_period_s        : realistic LEO period at 550 km altitude (~5760 s / 96 min).
     deadline_slack        : global deadline scale (reference = 600 s).  Per-type medians
-                            (wildfire 300 s, change 480 s, ship 600 s, cloud_filter 1200 s)
+                            (wildfire 600 s, ship 900 s, change 1800 s,
+                            cloud_filter 5760 s)
                             are multiplied by deadline_slack / 600.
     deadline_lognorm_sigma: log-space std-dev for per-task deadline sampling (σ=0.6).
     use_fov               : FOV-constrained task generation — tasks arise only when a
@@ -97,7 +100,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     """
     import random as _rng_mod
     if ground_stations is None:
-        ground_stations = _NORTHERN_GS
+        ground_stations = _EVALUATION_GS
     sats = build_synthetic_walker(n_planes=n_planes, sats_per_plane=sats_per_plane)
     sat_ids = [s.name for s in sats]
     gs_names = {gs[0] for gs in ground_stations}
@@ -637,7 +640,7 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
 # The stressed reference scenario: a sparser Walker and
 # higher task load. All benchmarks use the same 25° GS elevation mask.
 _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
-                        arrival_rate=8.0, deadline_slack=600.0,
+                        arrival_rate=16.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
 
 def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
@@ -645,27 +648,24 @@ def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     Core performance comparison using the shared realistic LEO-EO setup.
 
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
-    with arrival_rate=8 so the FOV filter still yields ~13 tasks.
+    with 16 Poisson arrivals per orbit so tasks compete for shared compute and
+    contact resources (about 48 candidates over the three-orbit run).
 
-    All experiments use a 25° minimum elevation angle for ground-station
-    contacts. At 550 km altitude, a pass lasts about 4.5 min, so a given source
-    satellite is in direct view only about 9% of the time.
+    All experiments use six globally distributed ground stations and a 25°
+    minimum elevation angle. Relay policies must therefore improve on a
+    credible direct ground segment rather than a sparse two-station network.
 
     B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
-    satellite itself to enter a GS contact window — no ISL relay. With narrow
-    windows and log-normal deadlines whose medians range from 300 s (wildfire)
-    to 1200 s (cloud_filter), source satellites are often not in direct GS view
-    and B1 misses heavily. ORDI and the cooperative controls route via ISL to whichever
-    satellite is currently in GS contact, so they remain feasible.
+    satellite itself to enter a GS contact window. ORDI and cooperative
+    controls may route compact products through an ISL-connected satellite.
 
-    Deadline distribution: log-normal σ=0.6, per-type medians at scale 600 s
-    (wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s) matching
-    empirical EO SLA tiers (Lemaître et al. 2002; Globus et al. 2004).
+    Deadline distribution: log-normal σ=0.6, with medians wildfire→600 s,
+    ship→900 s, change→1800 s, and cloud_filter→5760 s (one orbit).
 
     Each seed rebuilds the full environment (orbital phasing, ground targets,
     task arrivals, deadline draws); the CSV reports across-seed mean and std.
     """
-    print(f"E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, "
+    print(f"E1: Core performance (6×4 Walker, 6 global GS, lognormal deadlines, "
           f"25° GS elevation, {n_seeds} seeds)")
     build_kwargs = dict(_E1_BUILD_KWARGS)
     alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in CORE_BASELINES]

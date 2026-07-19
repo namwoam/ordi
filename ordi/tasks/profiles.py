@@ -7,14 +7,8 @@ Each profile gives:
   compute_ops       : FLOPs required for inference on this tile
   utility           : base utility/priority weight
   deadline_median_s : per-type deadline median (seconds) used as the centre of
-                      a log-normal deadline distribution.  Higher-utility tasks
-                      are more time-critical.  At the 600 s reference scale:
-                        wildfire  → 300 s  (disaster response, most urgent)
-                        change    → 480 s  (change detection)
-                        ship      → 600 s  (maritime surveillance)
-                        cloud_filter → 1200 s  (quality filter, routine)
-                      These reflect typical EO SLA tiers (ESA/CNES scheduling
-                      studies; Lemaître et al. 2002, Globus et al. 2004).
+                      a log-normal distribution: wildfire 600 s, ship 900 s,
+                      change 1800 s, and cloud filtering 5760 s (one orbit).
 
 Values are derived from benchmarking MobileNetV2 and YOLOv5-nano on
 typical 128×128-pixel tiles at uint8 resolution (3 channels).
@@ -54,7 +48,7 @@ PROFILES: Dict[str, TileProfile] = {
         d_out_bits=1 * 8 * 1024,           # ~1 kB: class label + confidence + bounding box
         compute_ops=0.3e9,                  # 0.3 GFLOPs (MobileNetV2 classifier)
         base_utility=1.0,
-        deadline_median_s=300.0,            # 5 min — disaster response
+        deadline_median_s=600.0,            # 10 min — urgent disaster alert
     ),
     "ship": TileProfile(
         name="ship",
@@ -62,7 +56,7 @@ PROFILES: Dict[str, TileProfile] = {
         d_out_bits=5 * 8 * 1024,           # ~5 kB: multiple bounding boxes (YOLOv5-nano)
         compute_ops=0.9e9,
         base_utility=0.8,
-        deadline_median_s=600.0,            # 10 min — maritime surveillance
+        deadline_median_s=900.0,            # 15 min — maritime alert
     ),
     "cloud_filter": TileProfile(
         name="cloud_filter",
@@ -70,7 +64,7 @@ PROFILES: Dict[str, TileProfile] = {
         d_out_bits=50 * 8 * 1024,          # ~50 kB: pixel-wise mask (lightweight U-Net)
         compute_ops=1.2e9,
         base_utility=0.5,
-        deadline_median_s=1200.0,           # 20 min — routine quality filter
+        deadline_median_s=5760.0,           # 96 min — finish within one orbit
     ),
     "change": TileProfile(
         name="change",
@@ -78,7 +72,7 @@ PROFILES: Dict[str, TileProfile] = {
         d_out_bits=10 * 8 * 1024,          # ~10 kB: change map
         compute_ops=1.8e9,                  # Siamese CNN
         base_utility=0.9,
-        deadline_median_s=480.0,            # 8 min — change detection
+        deadline_median_s=1800.0,           # 30 min — change analysis
     ),
 }
 
