@@ -174,7 +174,14 @@ class MessageSimulator:
         )
 
     def local_view(self, request, observer):
-        """Return only state known to ``observer``, preserving stale values."""
+        """Return local live state plus the deterministic orbital contact plan.
+
+        Satellite resource state remains limited to advertisements received by
+        ``observer``. Contact windows are predictable from ephemerides and are
+        therefore shared independently of live state, allowing an unknown
+        satellite to act as a store-and-forward relay without also exposing
+        its battery, queue, temperature, or availability.
+        """
         known = {observer: request.satellites[observer]}
         ages = {observer: 0.0}
         for sat_id, (view, generated_at, delivered_at) in (
@@ -182,22 +189,9 @@ class MessageSimulator:
             if delivered_at <= request.sim_time + 1e-9:
                 known[sat_id] = view
                 ages[sat_id] = max(0.0, request.sim_time - generated_at)
-        known_nodes = set(known) | set(request.ground_stations)
-        local_contacts = tuple(
-            contact for contact in request.contacts
-            if (contact.source in known_nodes
-                and contact.target in known_nodes)
-        )
-        local_opportunities = {
-            node: tuple(
-                neighbor for neighbor in request.opportunities.get(node, ())
-                if neighbor in known_nodes
-            )
-            for node in known
-        }
         return replace(
-            request, satellites=known, contacts=local_contacts,
-            opportunities=local_opportunities,
+            request, satellites=known, contacts=tuple(request.contacts),
+            opportunities=request.opportunities,
             state_age_s=ages, observer=observer,
         )
 

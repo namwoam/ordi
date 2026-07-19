@@ -497,6 +497,37 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     )
 
 
+def _validate_feasible_subset(feasibility, request, decision):
+    """Admit policy assignments independently through the model ledger.
+
+    State advertisements are reserved once for the epoch. Each science
+    assignment is then transactional: an invalid tile is dropped without
+    rolling back earlier feasible tiles or aborting the complete experiment.
+    """
+    feasibility.validate_and_reserve(
+        request,
+        Decision(
+            decision.epoch, (),
+            decision.metadata, decision.message_events,
+        ),
+    )
+    accepted = []
+    for assignment in decision.assignments:
+        try:
+            result = feasibility.validate_and_reserve(
+                request,
+                Decision(decision.epoch, (assignment,)),
+                retime=True,
+            )
+        except InvalidDecisionError:
+            continue
+        accepted.append(result.assignments[0])
+    return Decision(
+        decision.epoch, tuple(accepted),
+        decision.metadata, decision.message_events,
+    )
+
+
 def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     """
     Worker for ProcessPoolExecutor.
@@ -555,7 +586,9 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         )
         decision = sched.schedule(request)
         try:
-            return feasibility.validate_and_reserve(request, decision)
+            return _validate_feasible_subset(
+                feasibility, request, decision
+            )
         except InvalidDecisionError as error:
             raise InvalidDecisionError(
                 f"{sched.name} submitted an invalid decision in epoch {ep}: "

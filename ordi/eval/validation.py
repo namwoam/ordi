@@ -324,7 +324,7 @@ class DecisionFeasibilityModel:
         self.contact_ready_at = trial.contact_ready_at
         self.contact_residual_bits = trial.contact_residual_bits
         self.compute_ready_at = trial.compute_ready_at
-        return (Decision(decision.epoch, tuple(accepted))
+        return (replace(decision, assignments=tuple(accepted))
                 if retime else decision)
 
     def retime_and_reserve(self, request: EpochInput,

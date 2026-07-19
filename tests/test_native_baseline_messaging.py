@@ -100,3 +100,28 @@ def test_seco_acceptance_precedes_split_image_transfer():
 
     assert accept_time <= first_remote_image
     assert assignment.metadata["helper_request_kind"] == "split"
+
+
+def test_seco_keeps_unknown_downlink_satellites_as_route_only_relays():
+    request = _request()
+    states = dict(request.satellites)
+    states["src"] = replace(states["src"], compute_rate=1.0)
+    contacts = (
+        ContactWindow("src", "helper", 0.0, 10.0, 10_000.0, "isl"),
+        ContactWindow("helper", "src", 0.0, 10.0, 10_000.0, "isl"),
+        ContactWindow("helper", "relay", 0.0, 10.0, 10_000.0, "data"),
+        ContactWindow("relay", "ground", 0.0, 10.0, 10_000.0, "downlink"),
+    )
+    request = replace(request, satellites=states, contacts=contacts)
+    scheduler = SECOAdapted(split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "src", request.satellites,
+        generated_at=0.0, delivered_at=0.0,
+    )
+
+    assignment = scheduler.schedule(request).assignments[0]
+
+    assert assignment.aggregators == ("helper",)
+    assert assignment.routes[0][2] == (
+        "helper", "relay", "ground"
+    )

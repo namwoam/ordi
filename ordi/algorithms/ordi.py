@@ -6,12 +6,13 @@ The resulting node decisions are retained on the Assignment as an auditable
 protocol trace; the model-side resource ledger remains authoritative.
 """
 
+from copy import copy
 from dataclasses import dataclass, replace
 import math
 
 from .schema import Assignment, Decision, NodeDecision, WorkItem
 from ._common import enumerate_placements, plane
-from ordi.eval.validation import DecisionFeasibilityModel
+from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
 
@@ -27,6 +28,13 @@ class _LocalPlan:
     energy_j: float
     communication_bits: float
     value: float
+
+
+@dataclass(frozen=True)
+class _RetryState:
+    next_retry_time: float
+    attempts: int
+    reason: str
 
 
 class ORDI:
@@ -45,6 +53,65 @@ class ORDI:
         self.halo_fraction = max(0.0, halo_fraction)
         self.resources = DecisionFeasibilityModel()
         self.messages = MessageSimulator()
+        self.waiting: dict[tuple[int, int], _RetryState] = {}
+
+    @staticmethod
+    def _contact_key(contact):
+        return (
+            contact.source, contact.target, contact.opens, contact.closes,
+            contact.rate_bps, contact.kind,
+        )
+
+    def _resource_aware_view(self, request):
+        """Project committed protocol work into the next placement search."""
+        contacts = []
+        for contact in request.contacts:
+            key = self._contact_key(contact)
+            capacity = max(0.0, contact.closes - contact.opens) * max(
+                contact.rate_bps, 0.0
+            )
+            residual = self.messages.contact_residual_bits.get(key, capacity)
+            opens = max(
+                contact.opens,
+                self.messages.contact_ready_at.get(key, contact.opens),
+            )
+            closes = min(
+                contact.closes,
+                opens + residual / max(contact.rate_bps, 1.0),
+            )
+            if closes > opens + 1e-9:
+                contacts.append(replace(
+                    contact, opens=opens, closes=closes
+                ))
+
+        satellites = {}
+        for sat_id, state in request.satellites.items():
+            ready = self.messages.compute_ready_at.get(sat_id)
+            queued = state.queued_flops
+            if ready is not None:
+                queued = max(
+                    queued,
+                    max(0.0, ready - request.sim_time)
+                    * max(state.compute_rate, 1.0),
+                )
+            satellites[sat_id] = replace(state, queued_flops=queued)
+        return replace(
+            request, contacts=tuple(contacts), satellites=satellites
+        )
+
+    def _defer(self, request, task, tile, reason):
+        """Wait one scheduling epoch before retrying an uncommitted tile."""
+        key = (task.task_id, tile.tile_id)
+        previous = self.waiting.get(key)
+        next_retry = request.sim_time + request.epoch_length
+        if next_retry >= task.deadline - 1e-9:
+            self.waiting.pop(key, None)
+            return
+        self.waiting[key] = _RetryState(
+            next_retry,
+            1 if previous is None else previous.attempts + 1,
+            reason,
+        )
 
     @staticmethod
     def _placement_utility(request, task, tile, placement):
@@ -69,6 +136,7 @@ class ORDI:
             work_fraction=work_fraction,
             input_fraction=input_fraction,
             output_fraction=output_fraction,
+            protocol_header_bits=self.messages.header_bits,
         )
 
         # One shard group cannot assign two required shards to the same compute
@@ -139,6 +207,7 @@ class ORDI:
             work_fraction=primary.work_fraction,
             input_fraction=primary.input_fraction,
             output_fraction=primary.output_fraction,
+            protocol_header_bits=self.messages.header_bits,
         )
         used_helpers = {p.helper for p in primary.placements}
         used_planes = {plane(p.helper) for p in primary.placements}
@@ -239,14 +308,25 @@ class ORDI:
         assignments = []
         advertisements = self.messages.prepare_epoch(request)
         for task in request.tasks:
-            local_request = self.messages.local_view(
-                request, task.source_sat
-            )
             for tile in task.tiles:
+                # Rebuild the effective view after every committed tile so
+                # subsequent candidates see newly consumed contacts/compute.
+                local_request = self._resource_aware_view(
+                    self.messages.local_view(request, task.source_sat)
+                )
+                key = (task.task_id, tile.tile_id)
+                retry = self.waiting.get(key)
+                if (retry is not None
+                        and request.sim_time + 1e-9
+                        < retry.next_retry_time):
+                    continue
                 primary = self._decide_primary(
                     local_request, task, tile
                 )
                 if primary is None:
+                    self._defer(
+                        request, task, tile, "no_primary_plan"
+                    )
                     continue
                 groups = [primary.placements]
                 backup = self._decide_backup(
@@ -314,13 +394,24 @@ class ORDI:
                         local_request, task, tile, groups, primary
                     ),
                 )
-                execution = self.messages.execute(
-                    request, task, tile, assignment
-                )
+                # Commit protocol and model ledgers together. A route can
+                # become infeasible after earlier tiles consume a future
+                # contact even when the placement was nominally reachable.
+                trial_messages = copy(self.messages)
+                trial_resources = copy(self.resources)
+                try:
+                    execution = trial_messages.execute(
+                        request, task, tile, assignment
+                    )
+                except InvalidDecisionError:
+                    self._defer(
+                        request, task, tile, "protocol_rejected"
+                    )
+                    continue
                 metadata = dict(assignment.metadata)
                 metadata.update({
                     "latency": execution.delivery_time - request.sim_time,
-                    "protocol_header_bits": self.messages.header_bits,
+                    "protocol_header_bits": trial_messages.header_bits,
                     "protocol_message_count": execution.message_count,
                     "protocol_control_bits": execution.control_bits,
                     "protocol_ground_bits": execution.ground_bits,
@@ -329,11 +420,27 @@ class ORDI:
                     assignment, metadata=metadata,
                     message_events=execution.events,
                 )
-                # Invalid local decisions are surfaced; the physical model
-                # verifies the same data and header traffic independently.
-                self.resources.validate_and_reserve(
-                    request, Decision(request.epoch, (assignment,))
-                )
+                # The protocol runtime and model-side ledger serialize the
+                # same work independently. Keep the later completion time so
+                # small differences in their reservation order cannot make an
+                # otherwise feasible assignment under-report its latency.
+                try:
+                    modeled = trial_resources.retime_and_reserve(
+                        request, assignment
+                    )
+                except InvalidDecisionError:
+                    self._defer(
+                        request, task, tile, "model_rejected"
+                    )
+                    continue
+                modeled_latency = float(modeled.metadata["latency"])
+                if modeled_latency > float(assignment.metadata["latency"]):
+                    metadata = dict(assignment.metadata)
+                    metadata["latency"] = modeled_latency
+                    assignment = replace(assignment, metadata=metadata)
+                self.messages = trial_messages
+                self.resources = trial_resources
+                self.waiting.pop(key, None)
                 assignments.append(assignment)
         return Decision(
             request.epoch, tuple(assignments),
@@ -341,6 +448,10 @@ class ORDI:
                 "protocol_message_count": advertisements.message_count,
                 "protocol_control_bits": advertisements.control_bits,
                 "advertisement_control_bits": advertisements.control_bits,
+                "waiting_tiles": len(self.waiting),
+                "retry_attempts": sum(
+                    retry.attempts for retry in self.waiting.values()
+                ),
             },
             message_events=advertisements.events,
         )

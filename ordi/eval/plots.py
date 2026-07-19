@@ -35,6 +35,15 @@ ALG_LABELS = {
     "random_replication":     "Random Replication",
 }
 
+E1_PLOT_METRICS = (
+    ("realized_miss_ratio", 1.0, "Deadline Miss Ratio (↓)"),
+    (
+        "isl_traffic_bits_per_delivered_tile",
+        1e6,
+        "ISL Traffic / Delivered Tile (Mbit) (↓)",
+    ),
+)
+
 
 def _read_csv(exp_id: str) -> List[Dict]:
     path = os.path.join(RESULTS_DIR, f"{exp_id}.csv")
@@ -69,18 +78,15 @@ def plot_E1():
 
     # E1 reports only algorithm-neutral operational outcomes. Utility and the
     # composite objective are ORDI-defined preference functions.
-    metrics = ["realized_miss_ratio", "isl_traffic_bits"]
-    titles = ["Deadline Miss Ratio (↓)", "ISL Traffic (bits) (↓)"]
-
     algs = [r["algorithm"] for r in rows]
     colors = [ALG_COLORS.get(a, "#888") for a in algs]
     labels = [ALG_LABELS.get(a, a) for a in algs]
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(10, 4))
+    fig, axes = plt.subplots(1, len(E1_PLOT_METRICS), figsize=(10, 4))
 
-    for ax, metric, title in zip(axes, metrics, titles):
-        vals = [_float(r, metric) for r in rows]
-        errs = [_std(r, metric) for r in rows]
+    for ax, (metric, scale, title) in zip(axes, E1_PLOT_METRICS):
+        vals = [_float(r, metric) / scale for r in rows]
+        errs = [_std(r, metric) / scale for r in rows]
         bars = ax.bar(range(len(algs)), vals, color=colors,
                       yerr=errs, capsize=2, error_kw={"linewidth": 0.8})
         ax.set_title(title, fontsize=9)

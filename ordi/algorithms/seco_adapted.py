@@ -18,6 +18,7 @@ import math
 
 from .schema import Assignment, Decision
 from ._common import advertisement_metadata, protocol_trace
+from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
 
@@ -227,9 +228,9 @@ class SECOAdapted:
             )
             trial.compute_ready_at[helper] = compute_done
 
-            # The time-dependent path implicitly chooses all result relays and
-            # the final downlink satellite.  Represent that last satellite as
-            # the aggregator instead of redundantly enumerating every node.
+            # SECO computes and assembles this part at the helper. Subsequent
+            # satellites on route_down are store-and-forward relays; they need
+            # not expose live resource state to the source policy.
             route_down = _route(
                 request, trial, helper, request.ground_stations,
                 output_bits + header_bits, compute_done,
@@ -237,8 +238,7 @@ class SECOAdapted:
             if route_down is None or route_down.arrival > task.deadline:
                 continue
             _reserve_route(request, trial, route_down)
-            aggregator = (route_down.path[-2]
-                          if len(route_down.path) >= 2 else helper)
+            aggregator = helper
             route_out = ReservedRoute(
                 compute_done, 1.0, (helper,), (), (), output_bits
             )
@@ -363,7 +363,6 @@ class SECOAdapted:
                 plan = self._best_plan(local, task, tile, ledger)
                 if plan is None:
                     continue
-                ledger = plan.ledger_after
                 source_pi = local.satellites[source].reliability
                 reliability = source_pi * math.prod(
                     part.reliability for part in plan.parts
@@ -408,9 +407,13 @@ class SECOAdapted:
                         plan.output_fraction,
                     ),
                 )
-                execution = self.messages.execute(
-                    request, task, tile, assignment
-                )
+                try:
+                    execution = self.messages.execute(
+                        request, task, tile, assignment
+                    )
+                except InvalidDecisionError:
+                    continue
+                ledger = plan.ledger_after
                 metadata = dict(assignment.metadata)
                 metadata.update({
                     "latency": execution.delivery_time - request.sim_time,

@@ -7,6 +7,7 @@ from ._common import (
     advertisement_metadata, enumerate_placements, protocol_trace,
     tile_success,
 )
+from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
 
@@ -65,9 +66,12 @@ class FullReplication:
                         local, task, tile, groups
                     ),
                 )
-                execution = self.messages.execute(
-                    request, task, tile, assignment
-                )
+                try:
+                    execution = self.messages.execute(
+                        request, task, tile, assignment
+                    )
+                except InvalidDecisionError:
+                    continue
                 accepted = [
                     unique[index] for index in execution.executed_shards
                 ]

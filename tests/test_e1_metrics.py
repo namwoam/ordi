@@ -5,6 +5,7 @@ import pytest
 from ordi.algorithms import Assignment, Decision, MessageEvent
 from ordi.eval.experiments import E1_METRIC_KEYS
 from ordi.eval.metrics import compute_metrics
+from ordi.eval.plots import E1_PLOT_METRICS
 
 
 def _event(kind, event, shard):
@@ -82,3 +83,10 @@ def test_e1_exports_reliability_latency_cost_and_decentralization_metrics():
         "helper_acceptance_ratio", "state_age_p95_s",
     }
     assert required <= set(E1_METRIC_KEYS)
+
+
+def test_e1_plot_uses_exported_normalized_isl_traffic():
+    plotted = {metric for metric, _scale, _title in E1_PLOT_METRICS}
+
+    assert "isl_traffic_bits_per_delivered_tile" in plotted
+    assert "isl_traffic_bits" not in plotted

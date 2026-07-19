@@ -108,10 +108,10 @@ def test_message_headers_can_make_nominal_data_route_invalid():
         link_rate=100.0, link_close=10.0, include_helper=False
     )
 
-    with pytest.raises(InvalidDecisionError, match="message has no contact"):
-        ORDI(
-            max_replicas=1, split_options=(1,)
-        ).schedule(request)
+    result = ORDI(
+        max_replicas=1, split_options=(1,)
+    ).schedule(request)
+    assert not result.assignments
 
 
 def test_duplicate_job_attempt_is_suppressed_within_one_epoch():
@@ -121,10 +121,7 @@ def test_duplicate_job_attempt_is_suppressed_within_one_epoch():
     )
     scheduler.schedule(request)
 
-    with pytest.raises(
-        InvalidDecisionError, match="no complete reconstruction group"
-    ):
-        scheduler.schedule(request)
+    assert not scheduler.schedule(request).assignments
 
 
 def test_protocol_enforces_hop_and_split_depth_limits():
@@ -192,6 +189,125 @@ def test_state_advertisements_are_delayed_and_then_used_locally():
     )
 
 
+def test_local_view_preserves_contacts_through_unknown_relays():
+    states = {
+        name: SatelliteView(
+            name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        )
+        for name in ("src", "helper")
+    }
+    contacts = (
+        ContactWindow("src", "relay", 0.0, 10.0, 10_000.0, "data"),
+        ContactWindow("relay", "helper", 0.0, 10.0, 10_000.0, "data"),
+        ContactWindow(
+            "helper", "ground", 0.0, 10.0, 10_000.0, "downlink"
+        ),
+    )
+    tile = SimpleNamespace(
+        tile_id=0, n_replicas_max=1, d_in_bits=100.0,
+        d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=10.0, tiles=[tile]
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
+    )
+    scheduler = ORDI(max_replicas=1, split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "src", {"helper": states["helper"]},
+        generated_at=0.0, delivered_at=0.0,
+    )
+
+    assignment = scheduler.schedule(request).assignments[0]
+
+    assert "relay" in {
+        node for route in assignment.routes[0] for node in route
+    }
+    assert "relay" not in scheduler.messages.local_view(
+        request, "src"
+    ).satellites
+
+
+def test_ordi_waits_until_next_epoch_before_retrying():
+    state = SatelliteView(
+        "src", True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+        compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+    )
+    tile = SimpleNamespace(
+        tile_id=0, n_replicas_max=1, d_in_bits=100.0,
+        d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=180.0, tiles=[tile]
+    )
+    base = EpochInput(
+        0, 0.0, [task], {"src": state}, {},
+        frozenset({"ground"}), (),
+    )
+    scheduler = ORDI(max_replicas=1, split_options=(1,))
+
+    assert not scheduler.schedule(base).assignments
+    assert scheduler.waiting[(1, 0)].next_retry_time == pytest.approx(60.0)
+
+    contact = ContactWindow(
+        "src", "ground", 30.0, 120.0, 10_000.0, "downlink"
+    )
+    assert not scheduler.schedule(replace(
+        base, epoch=1, sim_time=30.0, contacts=(contact,)
+    )).assignments
+
+    retried = scheduler.schedule(replace(
+        base, epoch=2, sim_time=60.0, contacts=(contact,)
+    ))
+    assert retried.assignments
+    assert (1, 0) not in scheduler.waiting
+
+
+def test_ordi_planning_uses_residual_contact_capacity():
+    states = {
+        "src": SatelliteView(
+            "src", True, 1.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        ),
+        "helper": SatelliteView(
+            "helper", True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        ),
+    }
+    contacts = (
+        # One 100-bit image plus the 2,048-bit header fits; two do not.
+        ContactWindow("src", "helper", 0.0, 2.2, 1_000.0, "data"),
+        ContactWindow(
+            "helper", "ground", 0.0, 20.0, 10_000.0, "downlink"
+        ),
+    )
+    tiles = [
+        SimpleNamespace(
+            tile_id=index, n_replicas_max=1, d_in_bits=100.0,
+            d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
+        )
+        for index in range(2)
+    ]
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=120.0, tiles=tiles
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
+    )
+    scheduler = ORDI(max_replicas=1, split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "src", {"helper": states["helper"]},
+        generated_at=0.0, delivered_at=0.0,
+    )
+
+    result = scheduler.schedule(request)
+
+    assert len(result.assignments) == 1
+    assert scheduler.waiting[(1, 1)].reason == "no_primary_plan"
+
+
 def test_stale_advertisement_does_not_hide_physical_failure():
     request, _task, _tile = _request()
     reverse = ContactWindow(
@@ -212,7 +328,28 @@ def test_stale_advertisement_does_not_hide_physical_failure():
         contacts=warmup.contacts,
     )
 
-    with pytest.raises(
-        InvalidDecisionError, match="unavailable node 'helper'"
-    ):
-        scheduler.schedule(stale_request)
+    assert not scheduler.schedule(stale_request).assignments
+
+
+def test_ordi_keeps_later_model_side_completion_time():
+    request, _task, _tile = _request()
+    scheduler = _informed_scheduler(
+        request, max_replicas=1, split_options=(2,)
+    )
+
+    class LaterModel:
+        def retime_and_reserve(self, _request, assignment):
+            metadata = dict(assignment.metadata)
+            metadata["latency"] = float(metadata["latency"]) + 0.5
+            return replace(assignment, metadata=metadata)
+
+    scheduler.resources = LaterModel()
+    assignment = scheduler.schedule(request).assignments[0]
+
+    protocol_delivery = max(
+        event.time for event in assignment.message_events
+        if event.event == "delivered" and event.kind == "result_shard"
+    )
+    assert assignment.metadata["latency"] == pytest.approx(
+        protocol_delivery - request.sim_time + 0.5
+    )

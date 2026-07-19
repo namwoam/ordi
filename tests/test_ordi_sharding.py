@@ -20,9 +20,9 @@ def _view(name):
 def test_ordi_splits_one_tile_across_two_distinct_helpers():
     states = {name: _view(name) for name in ("src", "helper")}
     contacts = (
-        ContactWindow("src", "helper", 0.0, 10.0, 1_000.0, "isl"),
-        ContactWindow("src", "ground", 0.0, 10.0, 1_000.0, "downlink"),
-        ContactWindow("helper", "ground", 0.0, 10.0, 1_000.0, "downlink"),
+        ContactWindow("src", "helper", 0.0, 10.0, 1e9, "isl"),
+        ContactWindow("src", "ground", 0.0, 10.0, 1e9, "downlink"),
+        ContactWindow("helper", "ground", 0.0, 10.0, 1e9, "downlink"),
     )
     tile = SimpleNamespace(
         tile_id=0, n_replicas_max=1, d_in_bits=100.0,
@@ -81,9 +81,9 @@ def test_ordi_splits_one_tile_across_two_distinct_helpers():
 def test_receiving_node_dynamically_selects_parallelism():
     states = {name: _view(name) for name in ("src", "helper")}
     contacts = (
-        ContactWindow("src", "helper", 0.0, 10.0, 1_000.0, "isl"),
-        ContactWindow("src", "ground", 0.0, 10.0, 1_000.0, "downlink"),
-        ContactWindow("helper", "ground", 0.0, 10.0, 1_000.0, "downlink"),
+        ContactWindow("src", "helper", 0.0, 10.0, 1e9, "isl"),
+        ContactWindow("src", "ground", 0.0, 10.0, 1e9, "downlink"),
+        ContactWindow("helper", "ground", 0.0, 10.0, 1e9, "downlink"),
     )
     tile = SimpleNamespace(
         tile_id=0, n_replicas_max=1, d_in_bits=100.0,
@@ -114,7 +114,7 @@ def test_receiving_node_dynamically_selects_parallelism():
         0, 0.0, [task], {"src": states["src"]}, {},
         frozenset({"ground"}),
         (ContactWindow(
-            "src", "ground", 0.0, 10.0, 1_000.0, "downlink"
+            "src", "ground", 0.0, 10.0, 1e9, "downlink"
         ),),
         weights=request.weights,
     )).assignments[0]

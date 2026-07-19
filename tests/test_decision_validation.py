@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ from ordi.algorithms import (
     Assignment, ContactWindow, Decision, DirectDownlink, EpochInput,
     FullReplication, OnboardOnly, ORDI, RandomReplication, SatelliteView,
 )
+from ordi.eval.experiments import _validate_feasible_subset
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 
@@ -57,6 +59,37 @@ def test_model_accepts_replication_when_shared_contact_has_capacity():
         _request(contact_bits=200.0), decision
     )
     assert accepted is decision
+
+
+def test_retiming_preserves_decision_metadata_and_events():
+    decision = replace(
+        _replicated_decision(),
+        metadata={"protocol_message_count": 3},
+        message_events=(),
+    )
+
+    accepted = DecisionFeasibilityModel().validate_and_reserve(
+        _request(contact_bits=200.0), decision, retime=True
+    )
+
+    assert accepted.metadata == decision.metadata
+    assert accepted.message_events == decision.message_events
+
+
+def test_model_side_admission_drops_only_invalid_assignments():
+    decision = replace(
+        _replicated_decision(),
+        metadata={"protocol_message_count": 3},
+    )
+
+    accepted = _validate_feasible_subset(
+        DecisionFeasibilityModel(),
+        _request(contact_bits=100.0),
+        decision,
+    )
+
+    assert not accepted.assignments
+    assert accepted.metadata == decision.metadata
 
 
 @pytest.mark.parametrize(
