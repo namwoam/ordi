@@ -12,12 +12,13 @@ residual link/compute capacity.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import heapq
 import math
 
 from .schema import Assignment, Decision
-from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
+from ._common import advertisement_metadata, protocol_trace
+from ordi.sim.messaging import MessageSimulator
 
 
 @dataclass(frozen=True)
@@ -177,13 +178,11 @@ class SECOAdapted:
         self.split_options = tuple(sorted(set(split_options)))
         self.halo_fraction = halo_fraction
         self.battery_reserve_frac = battery_reserve_frac
-        # The SECO planning ledger below handles contention within one call.
-        # This persistent model ledger also protects future contacts and compute
-        # slots already committed by decisions from earlier epochs.
-        self.resources = DecisionFeasibilityModel()
+        self.messages = MessageSimulator()
 
     def _part_candidate(self, request, task, tile, ledger, work_fraction,
-                        input_fraction, output_fraction):
+                        input_fraction, output_fraction,
+                        excluded_helpers=frozenset()):
         best = None
         source_state = request.satellites.get(task.source_sat)
         if source_state is None or not source_state.available:
@@ -191,15 +190,30 @@ class SECOAdapted:
 
         input_bits = tile.d_in_bits * input_fraction
         output_bits = tile.d_out_bits * output_fraction
+        header_bits = self.messages.header_bits
         work = tile.compute_ops * work_fraction
 
         for helper, hstate in request.satellites.items():
-            if not hstate.available:
+            if not hstate.available or helper in excluded_helpers:
                 continue
             trial = ledger.clone()
-            route_in = _route(
-                request, trial, task.source_sat, {helper}, input_bits,
+            split_request = _route(
+                request, trial, task.source_sat, {helper}, header_bits,
                 request.sim_time,
+            )
+            if split_request is None:
+                continue
+            _reserve_route(request, trial, split_request)
+            split_response = _route(
+                request, trial, helper, {task.source_sat}, header_bits,
+                split_request.arrival,
+            )
+            if split_response is None:
+                continue
+            _reserve_route(request, trial, split_response)
+            route_in = _route(
+                request, trial, task.source_sat, {helper},
+                input_bits + header_bits, split_response.arrival,
             )
             if route_in is None:
                 continue
@@ -218,7 +232,7 @@ class SECOAdapted:
             # the aggregator instead of redundantly enumerating every node.
             route_down = _route(
                 request, trial, helper, request.ground_stations,
-                output_bits, compute_done,
+                output_bits + header_bits, compute_done,
             )
             if route_down is None or route_down.arrival > task.deadline:
                 continue
@@ -235,6 +249,8 @@ class SECOAdapted:
             }
             energy_by_node = _merge_energy(
                 compute_energy,
+                _route_energy_by_node(request, split_request),
+                _route_energy_by_node(request, split_response),
                 _route_energy_by_node(request, route_in),
                 _route_energy_by_node(request, route_down),
             )
@@ -283,6 +299,7 @@ class SECOAdapted:
             chosen = self._part_candidate(
                 request, task, tile, trial, work_fraction,
                 input_fraction, output_fraction,
+                frozenset(part.helper for part in parts),
             )
             if chosen is None:
                 return None
@@ -303,67 +320,118 @@ class SECOAdapted:
         return min(feasible, key=lambda plan: plan.completion) if feasible else None
 
     def schedule(self, request):
-        ledger = ResourceLedger.from_request(request)
-        unscheduled = [
-            (task, tile) for task in request.tasks for tile in task.tiles
-        ]
-        max_compute_rate = max(
-            (state.compute_rate for state in request.satellites.values()
-             if state.available), default=1.0
-        )
-        max_link_rate = max(
-            (contact.rate_bps for contact in request.contacts), default=1.0
-        )
-        # Shortest-processing-time ordering is the greedy rule for minimizing
-        # summed completion time.  Deadlines break ties but are not part of the
-        # SECO time objective.
-        unscheduled.sort(key=lambda pair: (
-            pair[1].compute_ops / max_compute_rate
-            + (pair[1].d_in_bits + pair[1].d_out_bits) / max_link_rate,
-            pair[0].deadline, pair[0].task_id, pair[1].tile_id,
-        ))
+        advertisements = self.messages.prepare_epoch(request)
         assignments = []
-
-        for task, tile in unscheduled:
-            plan = self._best_plan(request, task, tile, ledger)
-            if plan is None:
-                continue
-            ledger = plan.ledger_after
-            source_pi = request.satellites[task.source_sat].reliability
-            reliability = source_pi * math.prod(
-                part.reliability for part in plan.parts
-            )
-            q = plan.split_count
-            assignment = Assignment(
-                task.task_id,
-                tile.tile_id,
-                task.source_sat,
-                tuple(part.helper for part in plan.parts),
-                tuple(part.aggregator for part in plan.parts),
-                metadata={
-                    "latency": plan.completion - request.sim_time,
-                    "reliability": reliability,
-                    "data_shards": q,
-                    "split_count": q,
-                    "partitioned": True,
-                    "effective_replicas": 1.0,
-                    "energy_j": sum(part.energy_j for part in plan.parts),
-                    "includes_downlink_energy": True,
-                    "time_objective": plan.completion - request.sim_time,
-                },
-                routes=tuple(
-                    (part.route_in.path, part.route_out.path,
-                     part.route_down.path)
-                    for part in plan.parts
-                ),
-                work_fractions=(plan.work_fraction,) * q,
-                input_fractions=(plan.input_fraction,) * q,
-                output_fractions=(plan.output_fraction,) * q,
-            )
-            try:
-                assignments.append(
-                    self.resources.retime_and_reserve(request, assignment)
+        by_source = {}
+        for task in request.tasks:
+            by_source.setdefault(task.source_sat, []).append(task)
+        for source, tasks in by_source.items():
+            local = self.messages.local_view(request, source)
+            ledger = ResourceLedger.from_request(local)
+            # The local planner knows the residual capacity consumed by state
+            # advertisements sent before this decision.
+            for index, contact in enumerate(local.contacts):
+                key = (
+                    contact.source, contact.target, contact.opens,
+                    contact.closes, contact.rate_bps, contact.kind,
                 )
-            except InvalidDecisionError:
-                continue
-        return Decision(request.epoch, tuple(assignments))
+                if key in self.messages.contact_residual_bits:
+                    ledger.contact_residual_bits[index] = (
+                        self.messages.contact_residual_bits[key]
+                    )
+                if key in self.messages.contact_ready_at:
+                    ledger.contact_ready_at[index] = (
+                        self.messages.contact_ready_at[key]
+                    )
+            unscheduled = [
+                (task, tile) for task in tasks for tile in task.tiles
+            ]
+            max_compute_rate = max(
+                (state.compute_rate for state in local.satellites.values()
+                 if state.available), default=1.0
+            )
+            max_link_rate = max(
+                (contact.rate_bps for contact in local.contacts), default=1.0
+            )
+            unscheduled.sort(key=lambda pair: (
+                pair[1].compute_ops / max_compute_rate
+                + (pair[1].d_in_bits + pair[1].d_out_bits) / max_link_rate,
+                pair[0].deadline, pair[0].task_id, pair[1].tile_id,
+            ))
+
+            for task, tile in unscheduled:
+                plan = self._best_plan(local, task, tile, ledger)
+                if plan is None:
+                    continue
+                ledger = plan.ledger_after
+                source_pi = local.satellites[source].reliability
+                reliability = source_pi * math.prod(
+                    part.reliability for part in plan.parts
+                )
+                q = plan.split_count
+                assignment = Assignment(
+                    task.task_id, tile.tile_id, source,
+                    tuple(part.helper for part in plan.parts),
+                    tuple(part.aggregator for part in plan.parts),
+                    metadata={
+                        "latency": plan.completion - request.sim_time,
+                        "reliability": reliability,
+                        "data_shards": q,
+                        "split_count": q,
+                        "partitioned": q > 1,
+                        "effective_replicas": 1.0,
+                        "energy_j": sum(
+                            part.energy_j for part in plan.parts
+                        ),
+                        "includes_downlink_energy": True,
+                        "time_objective": plan.completion - request.sim_time,
+                        "helper_handshake": True,
+                        "helper_request_kind": "split",
+                        "battery_reserve_frac": self.battery_reserve_frac,
+                        "state_observer": source,
+                        "known_state_nodes": len(local.satellites),
+                        "max_state_age_s": max(
+                            local.state_age_s.values(), default=0.0
+                        ),
+                    },
+                    routes=tuple(
+                        (part.route_in.path, part.route_out.path,
+                         part.route_down.path)
+                        for part in plan.parts
+                    ),
+                    work_fractions=(plan.work_fraction,) * q,
+                    input_fractions=(plan.input_fraction,) * q,
+                    output_fractions=(plan.output_fraction,) * q,
+                    node_decisions=protocol_trace(
+                        local, task, tile, (plan.parts,),
+                        plan.work_fraction, plan.input_fraction,
+                        plan.output_fraction,
+                    ),
+                )
+                execution = self.messages.execute(
+                    request, task, tile, assignment
+                )
+                metadata = dict(assignment.metadata)
+                metadata.update({
+                    "latency": execution.delivery_time - request.sim_time,
+                    "protocol_header_bits": self.messages.header_bits,
+                    "protocol_message_count": execution.message_count,
+                    "protocol_control_bits": execution.control_bits,
+                    "protocol_ground_bits": execution.ground_bits,
+                    "handshake_control_bits": sum(
+                        event.bits for event in execution.events
+                        if event.event == "hop_sent"
+                        and event.kind in {
+                            "split_request", "split_accept", "split_reject"
+                        }
+                    ),
+                })
+                assignments.append(replace(
+                    assignment, metadata=metadata,
+                    message_events=execution.events,
+                ))
+        return Decision(
+            request.epoch, tuple(assignments),
+            advertisement_metadata(advertisements),
+            advertisements.events,
+        )

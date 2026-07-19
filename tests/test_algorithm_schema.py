@@ -34,6 +34,7 @@ def test_controls_encode_distinct_replication_rules():
     states={sid:SatelliteView(sid,True,1e9,9000,10000,25,0,10,5,0.98)
             for sid in ("SAT_00_00","SAT_01_00")}
     contacts=(ContactWindow("SAT_00_00","SAT_01_00",0,60,1e6,"isl",0.97),
+              ContactWindow("SAT_01_00","SAT_00_00",0,60,1e6,"isl",0.97),
               ContactWindow("SAT_00_00","ground",0,60,1e6,"downlink",0.92),
               ContactWindow("SAT_01_00","ground",0,60,1e6,"downlink",0.92))
     request=EpochInput(0,0,[task],states,{},frozenset({"ground"}),contacts)
@@ -41,7 +42,11 @@ def test_controls_encode_distinct_replication_rules():
     assert DirectDownlink().schedule(request).assignments[0].downlink_only
     seco = SECOAdapted(split_options=(1,)).schedule(request).assignments[0]
     assert seco.metadata["effective_replicas"] == 1.0
-    assert len(FullReplication().schedule(request).assignments[0].helpers)==2
+    replication = FullReplication()
+    replication.messages.seed_knowledge(
+        "SAT_00_00", states, generated_at=-60.0, delivered_at=0.0
+    )
+    assert len(replication.schedule(request).assignments[0].helpers)==2
 
 
 def test_e1_report_can_exclude_ordi_utility_fields(tmp_path, monkeypatch):

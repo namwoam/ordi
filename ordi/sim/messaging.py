@@ -39,6 +39,7 @@ class ProtocolExecution:
     message_count: int
     control_bits: float
     ground_bits: float
+    executed_shards: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ class MessageSimulator:
         message_count = 0
         control_bits = 0.0
         ground_bits = 0.0
+        executed_shards = set()
 
         terminal = [
             local for local in assignment.node_decisions
@@ -305,6 +307,44 @@ class MessageSimulator:
             control_bits += self.header_bits * hops
             if path and path[-1] in request.ground_stations:
                 ground_bits += message.bits
+
+        def send_image(index, now):
+            nonlocal counter
+            local = terminal[index]
+            helper = assignment.helpers[index]
+            item = local.item
+            if item.current_node != helper:
+                raise InvalidDecisionError(
+                    "terminal work item is not held by its compute helper"
+                )
+            msg_id, counter = self._message_id(counter)
+            image = ProtocolMessage(
+                msg_id, "image_shard", task.source_sat, helper, item,
+                tile.d_in_bits * item.input_fraction + self.header_bits,
+                item.group_id, index, 0, self.max_hops,
+                f"job:{request.epoch}:{task.task_id}:{tile.tile_id}:"
+                f"{item.group_id}:{index}:{helper}",
+            )
+            transmit(image, assignment.routes[index][0], now)
+            executed_shards.add(index)
+
+        def send_helper_request(index, now):
+            nonlocal counter
+            local = terminal[index]
+            helper = assignment.helpers[index]
+            item = local.item
+            msg_id, counter = self._message_id(counter)
+            request_prefix = assignment.metadata.get(
+                "helper_request_kind", "split"
+            )
+            request_kind = f"{request_prefix}_request"
+            helper_request = ProtocolMessage(
+                msg_id, request_kind, task.source_sat, helper, item,
+                self.header_bits, item.group_id, index, 0, self.max_hops,
+                f"{request_kind}:{request.epoch}:{task.task_id}:"
+                f"{tile.tile_id}:{item.group_id}:{index}:{helper}",
+            )
+            transmit(helper_request, assignment.routes[index][0], now)
 
         # A source inbox receives the original job locally.
         root = assignment.node_decisions[0].item
@@ -363,24 +403,66 @@ class MessageSimulator:
             if message.kind == "job_descriptor":
                 # Only after the source receives the root work item does its
                 # local decision emit delegated/split/replicated child jobs.
-                for index, (local, helper, route) in enumerate(zip(
-                        terminal, assignment.helpers, assignment.routes)):
-                    item = local.item
-                    if item.current_node != helper:
-                        raise InvalidDecisionError(
-                            "terminal work item is not held by its compute helper"
-                        )
-                    route_in = route[0]
-                    msg_id, counter = self._message_id(counter)
-                    job_message = ProtocolMessage(
-                        msg_id, "image_shard", task.source_sat, helper, item,
-                        tile.d_in_bits * item.input_fraction
-                        + self.header_bits,
-                        item.group_id, index, 0, self.max_hops,
-                        f"job:{request.epoch}:{task.task_id}:{tile.tile_id}:"
-                        f"{item.group_id}:{index}:{helper}",
+                for index in range(len(terminal)):
+                    if assignment.metadata.get("helper_handshake", False):
+                        send_helper_request(index, now)
+                    else:
+                        send_image(index, now)
+                continue
+            if message.kind in {"split_request", "replica_request"}:
+                state = request.satellites.get(message.receiver)
+                accepted = state is not None and state.available
+                if accepted:
+                    work = tile.compute_ops * message.item.work_fraction
+                    compute_start = max(
+                        now,
+                        request.sim_time + state.queued_flops
+                        / max(state.compute_rate, 1.0),
+                        compute_ready.get(message.receiver, now),
                     )
-                    transmit(job_message, route_in, now)
+                    compute_done = compute_start + work / max(
+                        state.compute_rate, 1.0
+                    )
+                    compute_energy = (
+                        state.compute_power_w * work
+                        / max(state.compute_rate, 1.0)
+                    )
+                    reserve = float(assignment.metadata.get(
+                        "battery_reserve_frac", 0.0
+                    )) * state.battery_capacity_j
+                    accepted = (
+                        compute_done <= task.deadline + 1e-9
+                        and state.battery_j - compute_energy >= reserve
+                    )
+                from ordi.algorithms._common import earliest_route
+                response_route = earliest_route(
+                    request, message.receiver, {task.source_sat},
+                    self.header_bits, now,
+                )
+                if response_route is None:
+                    raise InvalidDecisionError(
+                        f"helper {message.receiver!r} cannot return split response"
+                    )
+                response_id, counter = self._message_id(counter)
+                prefix = message.kind.removesuffix("_request")
+                response_kind = (
+                    f"{prefix}_accept" if accepted
+                    else f"{prefix}_reject"
+                )
+                response = ProtocolMessage(
+                    response_id, response_kind, message.receiver,
+                    task.source_sat, message.item, self.header_bits,
+                    message.group_id, message.shard_id, message.hop_count,
+                    self.max_hops,
+                    f"{response_kind}:{request.epoch}:{task.task_id}:"
+                    f"{tile.tile_id}:{message.group_id}:{message.shard_id}",
+                )
+                transmit(response, response_route.path, now)
+                continue
+            if message.kind in {"split_accept", "replica_accept"}:
+                send_image(message.shard_id, now)
+                continue
+            if message.kind in {"split_reject", "replica_reject"}:
                 continue
             if message.kind == "image_shard":
                 state = request.satellites.get(message.receiver)
@@ -433,6 +515,7 @@ class MessageSimulator:
         return ProtocolExecution(
             delivery_time, tuple(sorted(events, key=lambda item: item.time)),
             message_count, control_bits, ground_bits,
+            tuple(sorted(executed_shards)),
         )
 
 

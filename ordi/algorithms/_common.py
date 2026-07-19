@@ -1,8 +1,9 @@
 """Time-dependent routing and placement shared fairly by all policies."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import heapq
 import math
+from .schema import NodeDecision, WorkItem
 
 @dataclass(frozen=True)
 class Route:
@@ -137,3 +138,77 @@ def independent_success(placements):
 def tile_success(request, task, placements):
     """Replica-union reliability with the source node counted exactly once."""
     return request.satellites[task.source_sat].reliability*independent_success(placements)
+
+
+def protocol_trace(request, task, tile, groups, work_fraction=1.0,
+                   input_fraction=1.0, output_fraction=1.0):
+    """Build node-local work messages for a policy-selected placement.
+
+    This is a shared wire-format helper, not a scheduling policy: each
+    algorithm remains responsible for choosing groups, splits, and replicas.
+    """
+    root = WorkItem(
+        task.task_id, tile.tile_id,
+        tuple(sorted(request.ground_stations)), task.source_sat,
+    )
+    decisions = []
+    for group_id, group in enumerate(groups):
+        leaves = []
+        for placement in group:
+            route_down = placement.route_down
+            if hasattr(route_down, "path"):
+                route_down = route_down.path
+            leaves.append(WorkItem(
+                task.task_id, tile.tile_id,
+                route_down[-1] if route_down else placement.aggregator,
+                placement.helper, work_fraction, input_fraction,
+                output_fraction, group_id, 1,
+            ))
+        leaves = tuple(leaves)
+        if group_id > 0:
+            action = "replicate"
+        elif len(group) > 1:
+            action = "split"
+        elif group[0].helper == task.source_sat:
+            action = "execute_forward"
+        else:
+            action = "delegate"
+        decisions.append(NodeDecision(
+            task.source_sat, action, root,
+            () if action == "execute_forward" else leaves,
+            reason=f"{action} selected by {task.source_sat}",
+        ))
+        for leaf, placement in zip(leaves, group):
+            if action == "execute_forward" and placement.helper == task.source_sat:
+                continue
+            decisions.append(NodeDecision(
+                placement.helper, "execute_forward", leaf, (),
+                reason="terminal policy-selected work item",
+            ))
+    return tuple(decisions)
+
+
+def advertisement_metadata(batch):
+    return {
+        "protocol_message_count": batch.message_count,
+        "protocol_control_bits": batch.control_bits,
+        "advertisement_control_bits": batch.control_bits,
+    }
+
+
+def source_only_view(request, source):
+    """Local state for policies that never discover or delegate to helpers."""
+    known = ({source: request.satellites[source]}
+             if source in request.satellites else {})
+    allowed = {source} | set(request.ground_stations)
+    return replace(
+        request,
+        satellites=known,
+        contacts=tuple(
+            contact for contact in request.contacts
+            if contact.source in allowed and contact.target in allowed
+        ),
+        opportunities={source: ()},
+        state_age_s={source: 0.0},
+        observer=source,
+    )

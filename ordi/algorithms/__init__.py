@@ -7,7 +7,6 @@ from .onboard_only import OnboardOnly
 from .seco_adapted import SECOAdapted
 from .full_replication import FullReplication
 from .random_replication import RandomReplication
-from .local_knowledge import LocalKnowledgeAdapter
 
 ALL_ALGORITHMS = {
     cls.name: cls for cls in (
@@ -22,6 +21,5 @@ __all__ = [
     "WorkItem", "snapshot",
     "ORDI", "DirectDownlink", "OnboardOnly", "SECOAdapted",
     "FullReplication", "RandomReplication",
-    "LocalKnowledgeAdapter",
     "ALL_ALGORITHMS",
 ]

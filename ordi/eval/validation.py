@@ -126,6 +126,21 @@ class DecisionFeasibilityModel:
                     f"assignment references unknown task/tile {key}"
                 )
 
+            reserved_handshakes = set()
+            for event in assignment.message_events:
+                if (event.event != "hop_sent"
+                        or event.kind not in {
+                            "split_request", "split_accept", "split_reject",
+                            "replica_request", "replica_accept",
+                            "replica_reject",
+                        }
+                        or event.message_id in reserved_handshakes):
+                    continue
+                trial._reserve_hop(
+                    request, event.node, event.peer, event.bits, event.time
+                )
+                reserved_handshakes.add(event.message_id)
+
             finishes = []
             if assignment.downlink_only:
                 path = tuple(assignment.metadata.get("path", ()))

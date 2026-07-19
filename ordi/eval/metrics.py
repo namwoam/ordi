@@ -37,6 +37,20 @@ class EpochMetrics:
     helper_utilization: float = 0.0
     protocol_messages: float = 0.0
     control_traffic_bits: float = 0.0
+    delivery_latency_p50_s: float = 0.0
+    delivery_latency_p95_s: float = 0.0
+    isl_traffic_bits_per_delivered_tile: float = 0.0
+    control_traffic_bits_per_delivered_tile: float = 0.0
+    protocol_messages_per_delivered_tile: float = 0.0
+    energy_j_per_delivered_tile: float = 0.0
+    downlink_bits_per_delivered_tile: float = 0.0
+    control_traffic_ratio: float = 0.0
+    active_helper_fraction: float = 0.0
+    compute_load_balance: float = 0.0
+    helper_request_count: float = 0.0
+    helper_acceptance_ratio: float = 1.0
+    state_age_mean_s: float = 0.0
+    state_age_p95_s: float = 0.0
     objective: float = 0.0
     n_replicas_avg: float = 0.0
     n_tiles_total: int = 0
@@ -47,6 +61,20 @@ class EpochMetrics:
     realized_miss_ratio: float = 0.0
     realized_utility: float = 0.0
     realized_coverage: float = 0.0
+
+
+def _percentile(values, quantile):
+    """Linearly interpolated percentile without an external dependency."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = max(0.0, min(1.0, quantile)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
 
 
 def compute_metrics(
@@ -70,6 +98,9 @@ def compute_metrics(
     utility_sum = 0.0
     partial_coverages = []
     recovery_lats = []
+    state_ages = []
+    helper_requests = 0
+    helper_accepts = 0
 
     task_delivered: Dict[int, int] = {}
     task_total: Dict[int, int] = {}
@@ -85,6 +116,8 @@ def compute_metrics(
             "reliability", assignment.metadata.get("reconstruction_probability", 0.0)
         ))
         latency = float(assignment.metadata.get("latency", math.inf))
+        if "max_state_age_s" in assignment.metadata:
+            state_ages.append(float(assignment.metadata["max_state_age_s"]))
         if reliability <= 0.0 or math.isinf(latency):
             n_miss += 1
         else:
@@ -134,11 +167,23 @@ def compute_metrics(
         advertisement_bits = float(
             assignment.metadata.get("advertisement_control_bits", 0.0)
         )
+        handshake_bits = float(
+            assignment.metadata.get("handshake_control_bits", 0.0)
+        )
         m.control_traffic_bits += advertisement_bits
         m.isl_traffic_bits += advertisement_bits
+        m.control_traffic_bits += handshake_bits
+        m.isl_traffic_bits += handshake_bits
         m.protocol_messages += float(
             assignment.metadata.get("protocol_message_count", 0.0)
         )
+        for event in assignment.message_events:
+            if (event.event == "sent"
+                    and event.kind in {"split_request", "replica_request"}):
+                helper_requests += 1
+            elif (event.event == "delivered"
+                    and event.kind in {"split_accept", "replica_accept"}):
+                helper_accepts += 1
 
         # Every delivered tile incurs spacecraft-to-ground transmit energy.
         # Normal inference schedulers downlink the compact result; direct and
@@ -168,6 +213,8 @@ def compute_metrics(
     m.delivered_utility = utility_sum
     m.partial_coverage = sum(partial_coverages) / len(partial_coverages) if partial_coverages else 0.0
     m.recovery_latency = sum(recovery_lats) / len(recovery_lats) if recovery_lats else 0.0
+    m.delivery_latency_p50_s = _percentile(recovery_lats, 0.50)
+    m.delivery_latency_p95_s = _percentile(recovery_lats, 0.95)
     m.objective = sum(float(a.metadata.get("objective", 0.0))
                       for a in result.assignments)
     m.n_replicas_avg = (sum(float(a.metadata.get(
@@ -181,14 +228,36 @@ def compute_metrics(
     # when the assignment set is a lifetime record). Both sides are in FLOPs,
     # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
-    compute_used = sum(
-        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops
-        * (sum(a.work_fractions) if a.work_fractions else len(a.helpers))
-        for a in result.assignments
-        if (a.task_id, a.tile_id) in tile_lookup
-    )
+    compute_by_helper = {sat_id: 0.0 for sat_id in sat_compute_capacity}
+    for assignment in result.assignments:
+        key = (assignment.task_id, assignment.tile_id)
+        if key not in tile_lookup:
+            continue
+        tile = tile_lookup[key][1]
+        for index, helper in enumerate(assignment.helpers):
+            fraction = (
+                assignment.work_fractions[index]
+                if index < len(assignment.work_fractions) else 1.0
+            )
+            compute_by_helper[helper] = (
+                compute_by_helper.get(helper, 0.0)
+                + tile.compute_ops * fraction
+            )
+    compute_used = sum(compute_by_helper.values())
     m.helper_utilization = (min(1.0, compute_used / total_capacity)
                             if total_capacity > 0 else 0.0)
+    constellation_size = len(sat_compute_capacity)
+    active_helpers = sum(
+        amount > 0.0 for amount in compute_by_helper.values()
+    )
+    m.active_helper_fraction = (
+        active_helpers / constellation_size if constellation_size else 0.0
+    )
+    squared_load = sum(amount * amount for amount in compute_by_helper.values())
+    m.compute_load_balance = (
+        compute_used * compute_used / (constellation_size * squared_load)
+        if constellation_size and squared_load > 0.0 else 0.0
+    )
 
     decision_metadata = getattr(result, "metadata", {})
     decision_advertisement_bits = float(
@@ -199,6 +268,35 @@ def compute_metrics(
     )
     m.control_traffic_bits += decision_advertisement_bits
     m.isl_traffic_bits += decision_advertisement_bits
+
+    delivered_tiles = len(recovery_lats)
+    if delivered_tiles:
+        m.isl_traffic_bits_per_delivered_tile = (
+            m.isl_traffic_bits / delivered_tiles
+        )
+        m.control_traffic_bits_per_delivered_tile = (
+            m.control_traffic_bits / delivered_tiles
+        )
+        m.protocol_messages_per_delivered_tile = (
+            m.protocol_messages / delivered_tiles
+        )
+        m.energy_j_per_delivered_tile = m.energy_joules / delivered_tiles
+        m.downlink_bits_per_delivered_tile = (
+            m.downlink_volume_bits / delivered_tiles
+        )
+    total_transmitted_bits = m.isl_traffic_bits + m.downlink_volume_bits
+    m.control_traffic_ratio = (
+        m.control_traffic_bits / total_transmitted_bits
+        if total_transmitted_bits > 0.0 else 0.0
+    )
+    m.helper_request_count = float(helper_requests)
+    m.helper_acceptance_ratio = (
+        helper_accepts / helper_requests if helper_requests else 1.0
+    )
+    m.state_age_mean_s = (
+        sum(state_ages) / len(state_ages) if state_ages else 0.0
+    )
+    m.state_age_p95_s = _percentile(state_ages, 0.95)
 
     return m
 
@@ -397,6 +495,15 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
         "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
         "protocol_messages", "control_traffic_bits",
+        "delivery_latency_p50_s", "delivery_latency_p95_s",
+        "isl_traffic_bits_per_delivered_tile",
+        "control_traffic_bits_per_delivered_tile",
+        "protocol_messages_per_delivered_tile",
+        "energy_j_per_delivered_tile",
+        "downlink_bits_per_delivered_tile", "control_traffic_ratio",
+        "active_helper_fraction", "compute_load_balance",
+        "helper_request_count", "helper_acceptance_ratio",
+        "state_age_mean_s", "state_age_p95_s",
         "realized_miss_ratio", "realized_utility", "realized_coverage",
     ]
     out: Dict[str, float] = {}

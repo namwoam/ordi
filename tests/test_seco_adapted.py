@@ -31,6 +31,8 @@ def test_seco_chooses_parallel_split_without_counting_parts_as_replicas():
     contacts = (
         ContactWindow("src", "h1", 0, 20, 1e6, "isl"),
         ContactWindow("src", "h2", 0, 20, 1e6, "isl"),
+        ContactWindow("h1", "src", 0, 20, 1e6, "isl"),
+        ContactWindow("h2", "src", 0, 20, 1e6, "isl"),
         ContactWindow("h1", "ground", 0, 20, 1e6, "downlink"),
         ContactWindow("h2", "ground", 0, 20, 1e6, "downlink"),
     )
@@ -41,7 +43,11 @@ def test_seco_chooses_parallel_split_without_counting_parts_as_replicas():
         0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
     )
 
-    assignment = SECOAdapted().schedule(request).assignments[0]
+    scheduler = SECOAdapted()
+    scheduler.messages.seed_knowledge(
+        "src", states, generated_at=-60.0, delivered_at=0.0
+    )
+    assignment = scheduler.schedule(request).assignments[0]
 
     assert assignment.metadata["split_count"] == 2
     assert assignment.metadata["data_shards"] == 2
@@ -56,8 +62,9 @@ def test_seco_reserves_contact_capacity_between_tiles():
         "helper": _state("helper"),
     }
     contacts = (
-        # Exactly 1,000 bits: only one of the two 800-bit tiles can use it.
-        ContactWindow("src", "helper", 0, 1, 1_000, "isl"),
+        # One handshake + 800-bit image fits, but two do not.
+        ContactWindow("src", "helper", 0, 2.2, 4_000, "isl"),
+        ContactWindow("helper", "src", 0, 2.2, 4_000, "isl"),
         ContactWindow("helper", "ground", 0, 20, 1_000, "downlink"),
     )
     task = SimpleNamespace(
@@ -69,7 +76,11 @@ def test_seco_reserves_contact_capacity_between_tiles():
         0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
     )
 
-    result = SECOAdapted(split_options=(1,)).schedule(request)
+    scheduler = SECOAdapted(split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "src", states, generated_at=-60.0, delivered_at=0.0
+    )
+    result = scheduler.schedule(request)
 
     assert len(result.assignments) == 1
 

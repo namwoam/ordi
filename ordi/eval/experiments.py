@@ -44,7 +44,6 @@ from ordi.algorithms import (
     ORDI, DirectDownlink, OnboardOnly, SECOAdapted,
     FullReplication, RandomReplication, EpochInput, SatelliteView,
     ContactWindow, PolicyWeights, ExperimentConfig, Assignment, Decision,
-    LocalKnowledgeAdapter,
 )
 ORDIConfig = ExperimentConfig
 CORE_BASELINES = [DirectDownlink, OnboardOnly, SECOAdapted, FullReplication]
@@ -307,6 +306,18 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
                 if aggregator in downlink_bits:
                     downlink_bits[aggregator] += bits
 
+        for event in assignment.message_events:
+            if (event.event == "hop_sent"
+                    and event.kind in {
+                        "split_request", "split_accept", "split_reject",
+                        "replica_request", "replica_accept",
+                        "replica_reject",
+                    }):
+                if event.node in isl_tx_bits:
+                    isl_tx_bits[event.node] += event.bits
+                if event.peer in rx_bits:
+                    rx_bits[event.peer] += event.bits
+
     # Resource advertisements occur even in epochs without science work.
     for event in protocol_events:
         if (event.kind == "state_advertisement"
@@ -536,9 +547,6 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         except TypeError:
             sched = scheduler_class()
 
-    if scheduler_class is not ORDI:
-        sched = LocalKnowledgeAdapter(sched)
-
     feasibility = DecisionFeasibilityModel()
 
     def schedule_fn(ep, td):
@@ -721,6 +729,25 @@ _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         burst_size_range=(2, 4), burst_window_s=60.0,
                         min_elevation_deg=25.0)
 
+E1_METRIC_KEYS = [
+    "realized_miss_ratio",
+    "delivery_latency_p50_s",
+    "delivery_latency_p95_s",
+    "isl_traffic_bits_per_delivered_tile",
+    "control_traffic_bits_per_delivered_tile",
+    "control_traffic_ratio",
+    "protocol_messages_per_delivered_tile",
+    "energy_j_per_delivered_tile",
+    "downlink_bits_per_delivered_tile",
+    "helper_utilization",
+    "active_helper_fraction",
+    "compute_load_balance",
+    "helper_request_count",
+    "helper_acceptance_ratio",
+    "state_age_mean_s",
+    "state_age_p95_s",
+]
+
 def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
@@ -766,7 +793,7 @@ def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     # are therefore not algorithm-neutral E1 outcomes. Report only operational
     # delivery reliability and network cost in the core comparison.
     _save_csv("E1_core", results,
-              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
+              metric_keys=E1_METRIC_KEYS)
     return results
 
 
