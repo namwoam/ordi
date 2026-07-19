@@ -36,7 +36,10 @@ def compute_contact_windows(satellites,t_start_unix,t_end_unix,ground_stations=N
             for k,on in enumerate(np.r_[active,False]):
                 if on and begin is None: begin=times[k]
                 elif not on and begin is not None:
-                    events += [ContactEvent(begin,times[k],satellites[i].name,satellites[j].name,ISL_RATE_BPS,'isl'),ContactEvent(begin,times[k],satellites[j].name,satellites[i].name,ISL_RATE_BPS,'isl')]; begin=None
+                    # The appended False sentinel closes a link that remains
+                    # active through the horizon at k == len(times).
+                    contact_end = times[min(k, len(times) - 1)]
+                    events += [ContactEvent(begin,contact_end,satellites[i].name,satellites[j].name,ISL_RATE_BPS,'isl'),ContactEvent(begin,contact_end,satellites[j].name,satellites[i].name,ISL_RATE_BPS,'isl')]; begin=None
     return sorted(events,key=lambda e:e.t_start)
 
 def compute_sat_groundtracks(satellites,t_start_unix,t_end_unix,dt_seconds=60.0):

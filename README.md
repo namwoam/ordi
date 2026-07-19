@@ -4,7 +4,7 @@
 
 ORDI is a scheduling research prototype for distributing tiled Earth-observation inference workloads across low-Earth-orbit satellites. It runs as a policy on Basilisk/BSK-RL, using orbit-aware contact graphs, satellite resource state, and selective fault-disjoint replication to improve deadline performance without the cost of replicating every task.
 
-The repository includes ORDI, eight self-contained comparison policies, fault injection, an ILP reference policy, ten evaluations, plotting utilities, and the accompanying paper.
+The repository includes ORDI, five core comparison policies, a random-placement control, fault injection, four focused evaluations, plotting utilities, and the accompanying paper.
 
 ![ORDI core evaluation](figure/E1_core.png)
 
@@ -64,16 +64,14 @@ Available evaluations are:
 
 | ID | Evaluation |
 | --- | --- |
-| E1 | ORDI versus all eight baselines |
-| E2 | Robustness by fault type |
-| E3 | Fault-intensity sweep |
+| E1 | ORDI versus five core baselines |
+| E2 | Random-fault intensity sweep |
+| E3 | Correlated orbital-plane failures |
 | E4 | Constellation scalability |
-| E5 | Deadline-tightness sweep |
-| E6 | Replication-penalty sweep |
-| E7 | Correlated orbital-plane failures |
-| E8 | Greedy scheduler versus ILP reference |
-| E9 | Maximum-backup cap ablation |
-| REAL | Planet/FIRMS/BUPT-1 real-data case study |
+
+The former real-data case is excluded until its removed Skyfield/TLE path is
+replaced by Basilisk propagation; it is not advertised as runnable in the
+meantime.
 
 Run the full evaluation suite and generate every plot:
 
@@ -81,7 +79,10 @@ Run the full evaluation suite and generate every plot:
 task all
 ```
 
-The complete suite runs many simulation seeds and may take substantial time. To run or plot all experiments without Task:
+The focused suite uses two matched seeds for E1–E3 and one seed per E4
+constellation size (12, 24, and 36 satellites). Based on measured stage times,
+it finishes in about 24 minutes on a four-worker development machine. To run
+or plot all experiments without Task:
 
 ```bash
 uv run python -m ordi.main run all

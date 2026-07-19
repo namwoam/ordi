@@ -191,7 +191,7 @@ def generate_tasks(
     deadline_slack_s : global deadline scale (reference = 600 s).  Each task
         type has its own median deadline (from TileProfile.deadline_median_s)
         which is multiplied by deadline_slack_s / _DEADLINE_SCALE_BASE.  Set to
-        600 to use profile medians as-is; E5 sweeps this to vary overall tightness.
+        600 to use profile medians as-is.
 
     deadline_lognorm_sigma : log-space std-dev for per-task deadline sampling.
         σ=0.6 gives a realistic spread (5th/95th percentile ≈ 0.30× / 3.32×

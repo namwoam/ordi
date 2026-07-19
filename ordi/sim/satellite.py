@@ -77,7 +77,6 @@ class SatelliteState:
     B_i: float = field(init=False)
     Theta_i: float = field(init=False)
     Q_i: float = 0.0
-    D_i: float = 0.0
     A_i: int = 1
     _injected_failure: bool = False
     _compute_rate_multiplier: float = 1.0
@@ -105,31 +104,6 @@ class SatelliteState:
         physical state.  This multiplier represents only an ORDI fault event.
         """
         return self.params.compute_rate_flops_per_s * self._compute_rate_multiplier
-
-    # ── energy cost estimation ────────────────────────────────────────────────
-
-    def energy_for_compute(self, flops: float) -> float:
-        """Joules to execute ``flops`` on this satellite."""
-        t = flops / max(self.C_i, 1.0)
-        return self.params.compute_power_w * t
-
-    def energy_for_rx(self, bits: float) -> float:
-        """Joules to receive `bits` (antenna + baseband)."""
-        rx_power_w = self.params.comms_power_w * 0.4
-        return rx_power_w * (bits / max(200e6, 1.0))
-
-    def energy_for_tx(self, bits: float, rate_bps: float = 200e6) -> float:
-        """Joules to transmit ``bits`` at ``rate_bps``.
-
-        ISLs use the historical 200 Mbps default.  Ground downlinks pass the
-        100 Mbps contact rate explicitly; keeping the rate in this calculation
-        avoids making a raw-image downlink look energetically free.
-        """
-        return self.params.comms_power_w * (bits / max(rate_bps, 1.0))
-
-    def energy_for_downlink(self, bits: float) -> float:
-        """Joules to transmit ``bits`` over the modeled ground downlink."""
-        return self.energy_for_tx(bits, DEFAULT_DOWNLINK_RATE_BPS)
 
     def inject_failure(self):
         self._injected_failure = True

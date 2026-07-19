@@ -8,69 +8,33 @@ tasks:
 
   # ── individual experiments ─────────────────────────────────────────────────
   e1:
-    desc: "E1 - Core performance: ORDI vs all 8 baselines (no faults)"
+    desc: "E1 - Core performance: ORDI vs five baselines (no faults)"
     cmds:
       - uv run python -m ordi.main run E1
 
   e2:
-    desc: "E2 - Fault type profile: ORDI under each of 7 fault types"
+    desc: "E2 - Fault intensity: ORDI vs nonredundant and full replication"
     cmds:
       - uv run python -m ordi.main run E2
 
   e3:
-    desc: "E3 - Fault intensity sweep: ORDI vs B5 vs B6 at 0-50% fault rates"
+    desc: "E3 - Correlated failures: ORDI vs full and random replication"
     cmds:
       - uv run python -m ordi.main run E3
 
   e4:
-    desc: "E4 - Scalability: ORDI vs B5 across 12-60 satellites"
+    desc: "E4 - Scalability: ORDI vs greedy nonredundant across 12-36 satellites"
     cmds:
       - uv run python -m ordi.main run E4
 
-  e5:
-    desc: "E5 - Deadline tightness: ORDI vs B2 vs B4 at 60-600s slack"
-    cmds:
-      - uv run python -m ordi.main run E5
-
-  e6:
-    desc: "E6 - Lambda_R sweep: replication penalty effect on ORDI"
-    cmds:
-      - uv run python -m ordi.main run E6
-
-  e7:
-    desc: "E7 - Correlated failures: ORDI vs B6 under plane outage"
-    cmds:
-      - uv run python -m ordi.main run E7
-
-  e8:
-    desc: "E8 - ILP vs greedy optimality gap (small instances)"
-    cmds:
-      - uv run python -m ordi.main run E8
-
-  e9:
-    desc: "E9 - Maximum-backup cap ablation"
-    cmds:
-      - uv run python -m ordi.main run E9
-
-  real:
-    desc: "REAL - full real-data pipeline: Planet orbits + NASA FIRMS tasks + BUPT-1 telemetry"
-    cmds:
-      - uv run python -m ordi.main run REAL
-
   # ── run all experiments ────────────────────────────────────────────────────
   run-all:
-    desc: Run all experiments E1-E9 and REAL sequentially
+    desc: Run the focused E1-E4 evaluations sequentially
     cmds:
       - task: e1
       - task: e2
       - task: e3
       - task: e4
-      - task: e5
-      - task: e6
-      - task: e7
-      - task: e8
-      - task: e9
-      - task: real
 
   # ── plotting ───────────────────────────────────────────────────────────────
   plot:
@@ -82,16 +46,6 @@ tasks:
     desc: Plot E1 figure only
     cmds:
       - uv run python -m ordi.main plot E1
-
-  plot-e9:
-    desc: Plot E9 backup-cap ablation only
-    cmds:
-      - uv run python -m ordi.main plot E9
-
-  plot-real:
-    desc: Plot REAL real-data pipeline figure only
-    cmds:
-      - uv run python -m ordi.main plot REAL
 
   # ── run all then plot ──────────────────────────────────────────────────────
   all:

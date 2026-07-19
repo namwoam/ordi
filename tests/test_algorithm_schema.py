@@ -1,6 +1,14 @@
 from types import SimpleNamespace
 from ordi.algorithms import (ALL_ALGORITHMS, ContactWindow, Decision, EpochInput,
                              SatelliteView)
+from ordi.eval.metrics import EpochMetrics
+
+
+def test_focused_evaluation_suite_exposes_only_four_distinct_questions():
+    from ordi.eval.experiments import ALL_EXPERIMENTS
+
+    assert list(ALL_EXPERIMENTS) == ["E1", "E2", "E3", "E4"]
+
 
 def test_all_algorithms_share_epoch_input_decision_contract():
     tile=SimpleNamespace(tile_id=0,n_replicas_max=2,d_in_bits=1000.0,
@@ -19,7 +27,7 @@ def test_all_algorithms_share_epoch_input_decision_contract():
         assert isinstance(result,Decision)
         assert result.epoch==request.epoch
 
-def test_baselines_encode_distinct_replication_rules():
+def test_controls_encode_distinct_replication_rules():
     tile=SimpleNamespace(tile_id=0,n_replicas_max=2,d_in_bits=1000.0,
                          d_out_bits=100.0,compute_ops=1e6,utility=1.0)
     task=SimpleNamespace(task_id=1,source_sat="SAT_00_00",deadline=120.0,tiles=[tile])
@@ -29,9 +37,29 @@ def test_baselines_encode_distinct_replication_rules():
               ContactWindow("SAT_00_00","ground",0,60,1e6,"downlink",0.92),
               ContactWindow("SAT_01_00","ground",0,60,1e6,"downlink",0.92))
     request=EpochInput(0,0,[task],states,{},frozenset({"ground"}),contacts)
-    from ordi.algorithms import DirectDownlink, FullReplication, SECOLike, CoCoILike
+    from ordi.algorithms import DirectDownlink, FullReplication, GreedyNonredundant
     assert DirectDownlink().schedule(request).assignments[0].downlink_only
-    assert len(SECOLike().schedule(request).assignments[0].helpers)==1
+    assert len(GreedyNonredundant().schedule(request).assignments[0].helpers)==1
     assert len(FullReplication().schedule(request).assignments[0].helpers)==2
-    coded=CoCoILike().schedule(request).assignments[0].metadata
-    assert coded["coding"]=="mds" and coded["data_shards"]==1
+
+
+def test_e1_report_can_exclude_ordi_utility_fields(tmp_path, monkeypatch):
+    import ordi.eval.experiments as experiments
+
+    monkeypatch.setattr(experiments, "RESULTS_DIR", str(tmp_path))
+    experiments._save_csv(
+        "E1_core",
+        {"ORDI": [EpochMetrics(
+            epoch=0, realized_miss_ratio=0.2, isl_traffic_bits=100.0,
+            delivered_utility=9.0, objective=8.0,
+        )]},
+        metric_keys=["realized_miss_ratio", "isl_traffic_bits"],
+    )
+
+    header = (tmp_path / "E1_core.csv").read_text().splitlines()[0]
+    assert header.split(",") == [
+        "algorithm", "realized_miss_ratio", "isl_traffic_bits",
+        "realized_miss_ratio_std", "isl_traffic_bits_std",
+    ]
+    assert "utility" not in header
+    assert "objective" not in header

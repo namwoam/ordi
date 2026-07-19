@@ -36,19 +36,36 @@ def load_key(state): return state.queued_flops/max(state.compute_rate,1.0)
 def plane(sat_id):
     parts=sat_id.split("_"); return parts[1] if len(parts)>2 else sat_id
 
+_CONTACT_INDEX_CACHE={}
+
+def _contacts_by_source(contacts):
+    """Index one immutable epoch contact set once without re-hashing it."""
+    key=id(contacts)
+    cached=_CONTACT_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is contacts:
+        return cached[1]
+    indexed={}
+    for contact in sorted(contacts,key=lambda c:c.opens):
+        indexed.setdefault(contact.source,[]).append(contact)
+    result={source:tuple(windows) for source,windows in indexed.items()}
+    if len(_CONTACT_INDEX_CACHE)>=128:
+        _CONTACT_INDEX_CACHE.clear()
+    _CONTACT_INDEX_CACHE[key]=(contacts,result)
+    return result
+
 def earliest_route(request, source, targets, bits, start=None):
     targets=set(targets)
     if source in targets: return Route(start or request.sim_time,1.0,(source,),bits)
     start=request.sim_time if start is None else start
-    contacts=sorted(request.contacts,key=lambda c:c.opens)
+    contacts_by_source=_contacts_by_source(tuple(request.contacts))
     best={source:start}; rel={source:1.0}; paths={source:(source,)}
     queue=[(start,source)]
     while queue:
         now,node=heapq.heappop(queue)
         if now!=best[node]: continue
         if node in targets: return Route(now,rel[node],paths[node],bits)
-        for c in contacts:
-            if c.source!=node or c.closes<now: continue
+        for c in contacts_by_source.get(node,()):
+            if c.closes<now: continue
             depart=max(now,c.opens); finish=depart+bits/max(c.rate_bps,1.0)
             if finish>c.closes: continue
             if finish<best.get(c.target,math.inf):

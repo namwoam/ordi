@@ -1,5 +1,5 @@
 """
-Experiment runner for E1–E9.
+Focused experiment runner for E1–E4.
 
 Each experiment returns a dict: {algorithm_name: List[EpochMetrics]}.
 Results are saved to results/<experiment_id>.csv.
@@ -24,7 +24,6 @@ import csv
 import math
 import os
 import time
-from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import copy, deepcopy
@@ -38,18 +37,16 @@ from ordi.orbit.contacts import (
 )
 from ordi.orbit.graph import build_epoch_graphs
 from ordi.sim.satellite import make_constellation_states
-from ordi.sim.cots_measurements import atlas_200dk_bupt1_params
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.algorithms import (
-    ORDI, DirectDownlink, OnboardOnly, CompressionOnly, ServalLike, SECOLike,
-    FullReplication, RandomReplication, CoCoILike, EpochInput, SatelliteView,
+    ORDI, DirectDownlink, OnboardOnly, CompressionOnly, GreedyNonredundant,
+    FullReplication, RandomReplication, EpochInput, SatelliteView,
     ContactWindow, PolicyWeights, ExperimentConfig, Assignment, Decision,
-    ILPReference,
 )
 ORDIConfig = ExperimentConfig
-ALL_BASELINES = [DirectDownlink, OnboardOnly, CompressionOnly, ServalLike,
-                 SECOLike, FullReplication, RandomReplication, CoCoILike]
+CORE_BASELINES = [DirectDownlink, OnboardOnly, CompressionOnly,
+                  GreedyNonredundant, FullReplication]
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import (
     compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
@@ -387,7 +384,13 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
         reliability.node_pi(sid),
     ) for sid, state in states.items()}
     contacts = []
+    # A policy cannot use a contact after every pending task has expired. The
+    # old all-horizon projection made each route lookup scan the remaining
+    # three-orbit graph, even for tasks due within a few minutes.
+    latest_deadline = max((task.deadline for task in tasks), default=-math.inf)
     for future in graphs[ep:]:
+        if future.t_start > latest_deadline:
+            break
         for a, b, rate, capacity, kind in future.edges:
             duration = capacity / max(rate, 1.0)
             contacts.append(ContactWindow(
@@ -396,7 +399,7 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
             ))
     return EpochInput(
         ep, T_SIM_START + ep * cfg.epoch_length, tasks, views,
-        adjacency, frozenset(gs_names), contacts, cfg.epoch_length,
+        adjacency, frozenset(gs_names), tuple(contacts), cfg.epoch_length,
         PolicyWeights(cfg.alpha, cfg.lambda_E, cfg.lambda_C, cfg.lambda_R),
     )
 
@@ -518,7 +521,7 @@ def _resolve_fault_specs(fault_specs, sat_ids, tasks) -> List[FaultEvent]:
 
 
 def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
-    """Worker for sweeps that rebuild the sim per configuration (E1-E5, E7):
+    """Worker for synthetic sweeps that rebuild the sim per configuration:
     build the environment in-process, then run that config's algorithms
     sequentially via _parallel_run_algorithm (sharing through _WORKER_SHARED).
     Keeping build + jobs in one worker avoids shipping the big sim objects.
@@ -578,13 +581,15 @@ _CSV_METRIC_KEYS = [
     "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
     "realized_miss_ratio", "realized_utility", "realized_coverage",
 ]
-_CSV_FIELDS = (["algorithm"] + _CSV_METRIC_KEYS
-               + [f"{k}_std" for k in _CSV_METRIC_KEYS])
 
 
-def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
+def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
+              metric_keys: Optional[List[str]] = None):
+    """Write aggregate results, optionally restricted to comparable metrics."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
     path = os.path.join(RESULTS_DIR, f"{exp_id}.csv")
+    keys = _CSV_METRIC_KEYS if metric_keys is None else metric_keys
+    fields = ["algorithm"] + keys + [f"{key}_std" for key in keys]
     rows = []
     for alg_name, metrics in results.items():
         agg = aggregate_metrics(metrics)
@@ -593,7 +598,7 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
     if not rows:
         return
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS,
+        writer = csv.DictWriter(f, fieldnames=fields,
                                 extrasaction="ignore", restval="")
         writer.writeheader()
         writer.writerows(rows)
@@ -602,13 +607,13 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]]):
 
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
-# The stressed reference scenario (shared by E1, E5, E6): a sparser Walker and
+# The stressed reference scenario: a sparser Walker and
 # higher task load. All benchmarks use the same 25° GS elevation mask.
 _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         arrival_rate=8.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6, min_elevation_deg=25.0)
 
-def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -620,10 +625,10 @@ def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     satellite is in direct view only about 9% of the time.
 
     B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
-    satellite itself to enter a GS contact window — no ISL relay.  With narrow
+    satellite itself to enter a GS contact window — no ISL relay. With narrow
     windows and log-normal deadlines whose medians range from 300 s (wildfire)
     to 1200 s (cloud_filter), source satellites are often not in direct GS view
-    and B1 misses heavily.  ORDI (and B5/B6) route via ISL to whichever
+    and B1 misses heavily. ORDI and the cooperative controls route via ISL to whichever
     satellite is currently in GS contact, so they remain feasible.
 
     Deadline distribution: log-normal σ=0.6, per-type medians at scale 600 s
@@ -636,7 +641,7 @@ def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
     print(f"E1: Core performance (6×4 Walker, 2 Northern GS, lognormal deadlines, "
           f"25° GS elevation, {n_seeds} seeds)")
     build_kwargs = dict(_E1_BUILD_KWARGS)
-    alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in ALL_BASELINES]
+    alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in CORE_BASELINES]
 
     config_args = []
     for s in range(n_seeds):
@@ -651,64 +656,28 @@ def run_E1(seed=0, n_seeds=60) -> Dict[str, List[EpochMetrics]]:
         results[alg] = [m for s in range(n_seeds)
                         for m in raw[f"{alg}#s{s}"]]
 
-    _save_csv("E1_core", results)
+    # Utility and objective values encode ORDI's own preference function and
+    # are therefore not algorithm-neutral E1 outcomes. Report only operational
+    # delivery reliability and network cost in the core comparison.
+    _save_csv("E1_core", results,
+              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
     return results
 
 
-# ── E2: Fault type profile (each of 7 fault types, ORDI only) ────────────────
+# ── E2: Fault intensity sweep ────────────────────────────────────────────────
 
-def run_E2(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
-    print(f"E2: Fault type profile (ORDI, {n_seeds} seeds)")
-
-    # Every scenario hits the SAME satellites for the SAME duration, so the
-    # differences across bars reflect each fault type's intrinsic severity, not
-    # its scale.  Targets are the satellites that actually carry the most tasks
-    # (FOV sources, resolved post-build by _resolve_fault_specs); hitting idle
-    # satellites would be invisible.  Sustained 40 epochs so ORDI's re-planning
-    # cannot fully absorb the loss.  Repeated across environment seeds.
-    S, D = 10, 40
-    fault_scenarios = {
-        "no_fault": [],
-        "isl_disruption": [("isl_disruption", S, D, "hot_sources")],
-        "plane_outage":   [("plane_outage", S, D, "hot_sources")],
-        "helper_failure": [("helper_failure", S, D, "hot_sources")],
-        "straggler":      [("straggler", S, D, "hot_sources", {"factor": 0.1})],
-        "ground_miss":    [("ground_contact_miss", S, D, "hot_sources")],
-        "downlink_adv":   [("downlink_adverse", S, D, "hot_sources")],
-        "battery":        [("battery_shortage", S, D, "hot_sources")],
-        "thermal":        [("thermal_throttle", S, D, "hot_sources")],
-    }
-
-    config_args = []
-    for s in range(n_seeds):
-        jobs = [(f"{name}#s{s}", "ORDI", ORDI, specs)
-                for name, specs in fault_scenarios.items()]
-        config_args.append(({}, jobs, seed + s))
-
-    raw = _run_configs_parallel(config_args, desc="E2 seeds")
-
-    results: Dict[str, List[EpochMetrics]] = {}
-    for name in fault_scenarios:
-        results[name] = [m for s in range(n_seeds) for m in raw[f"{name}#s{s}"]]
-
-    _save_csv("E2_fault_types", results)
-    return results
-
-
-# ── E3: Fault intensity sweep (ORDI vs B5 vs B6) ─────────────────────────────
-
-def run_E3(seed=0, n_seeds=48) -> Dict[str, List[EpochMetrics]]:
+def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     """
     Fault intensity sweep averaging over BOTH randomness sources: each seed
     rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
     random fault schedule, so the curves carry across-world error bars rather
     than fault-draw jitter on one fixed world.
     """
-    print(f"E3: Fault intensity sweep ({n_seeds} seeds)")
-    fault_rates = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
+    print(f"E2: Fault intensity sweep ({n_seeds} seeds)")
+    fault_rates = [0.0, 0.25, 0.50]
     alg_classes = [("ORDI", ORDI),
-                   ("B5_seco_like", SECOLike),
-                   ("B6_full_replication", FullReplication)]
+                   ("greedy_nonredundant", GreedyNonredundant),
+                   ("full_replication", FullReplication)]
 
     config_args = []
     for s in range(n_seeds):
@@ -720,7 +689,7 @@ def run_E3(seed=0, n_seeds=48) -> Dict[str, List[EpochMetrics]]:
                              alg_name, cls, specs))
         config_args.append(({}, jobs, seed + s))
 
-    raw = _run_configs_parallel(config_args, desc="E3 seeds")
+    raw = _run_configs_parallel(config_args, desc="E2 seeds")
 
     # Collapse the per-seed lifetime records into one list per (rate, alg) so
     # _save_csv's aggregate_metrics reports across-seed mean ± std.
@@ -732,28 +701,28 @@ def run_E3(seed=0, n_seeds=48) -> Dict[str, List[EpochMetrics]]:
                 for m in raw[f"{alg_name}@fault={rate:.2f}#s{s}"]
             ]
 
-    _save_csv("E3_fault_intensity", results)
+    _save_csv("E2_fault_intensity", results,
+              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
     return results
 
 
-# ── E4: Scalability (constellation size 10–100 sats) ─────────────────────────
+# ── E4: Scalability (constellation size 12–36 sats) ─────────────────────────
 
 _E4_CONFIGS = {
     12: (3, 4),   # 3 planes × 4 sats: enough inter-plane contact density
     24: (4, 6),   # 4 planes × 6 sats
     36: (6, 6),   # 6 planes × 6 sats (matches E1 baseline)
-    60: (6, 10),  # 6 planes × 10 sats
 }
 
 
-def run_E4(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
+def run_E4(seed=0, n_seeds=1) -> Dict[str, List[EpochMetrics]]:
     print(f"E4: Scalability sweep ({n_seeds} seeds)")
 
     # Sim is rebuilt per (constellation size, seed); each config worker chains
-    # the 2 algorithms behind one build. With 32 configs the cores stay
-    # saturated, so chaining (which halves the builds) beats per-alg splitting.
-    alg_classes = [("ORDI", ORDI), ("B5_seco_like", SECOLike)]
-    sizes = [12, 24, 36, 60]
+    # the 2 algorithms behind one build. Chaining halves repeated orbit builds.
+    alg_classes = [("ORDI", ORDI),
+                   ("greedy_nonredundant", GreedyNonredundant)]
+    sizes = list(_E4_CONFIGS)
     config_args = []
     for n_sats in sizes:
         planes, per_plane = _E4_CONFIGS[n_sats]
@@ -773,103 +742,37 @@ def run_E4(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
                 for m in raw[f"{alg_name}@n={n_sats}#s{s}"]
             ]
 
-    _save_csv("E4_scalability", results)
+    _save_csv("E4_scalability", results,
+              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
     return results
 
 
-# ── E5: Deadline tightness sweep ──────────────────────────────────────────────
+# ── E3: Correlated failures (orbital-plane outage) ────────────────────────────
 
-def run_E5(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
-    print(f"E5: Deadline tightness sweep (log-normal σ=0.6, {n_seeds} seeds)")
-
-    # Sweep the deadline_slack scale.  At scale=600 (reference), per-type medians
-    # are wildfire→300 s, change→480 s, ship→600 s, cloud_filter→1200 s.
-    # Smaller scales compress all medians proportionally, increasing miss rate.
-    # Uses the E1 stressed setup (6×4 Walker, 25° GS elevation) so downlink
-    # windows remain constrained enough for deadline tightness to matter.
-    # Sim is rebuilt per (scale, seed) → one config worker each, all concurrent.
-    alg_classes = [("ORDI", ORDI),
-                   ("B2_onboard_only", OnboardOnly),
-                   ("B4_serval_like", ServalLike)]
-    slacks = [150, 300, 450, 600, 900]
-    config_args = []
-    for slack in slacks:
-        for s in range(n_seeds):
-            jobs = [(f"{alg_name}@slack={slack}s#s{s}", alg_name, cls)
-                    for alg_name, cls in alg_classes]
-            config_args.append(
-                ({**_E1_BUILD_KWARGS, "deadline_slack": float(slack)},
-                 jobs, seed + s))
-
-    raw = _run_configs_parallel(config_args, desc="E5 scale×seed")
-
-    results: Dict[str, List[EpochMetrics]] = {}
-    for slack in slacks:
-        for alg_name, _cls in alg_classes:
-            results[f"{alg_name}@slack={slack}s"] = [
-                m for s in range(n_seeds)
-                for m in raw[f"{alg_name}@slack={slack}s#s{s}"]
-            ]
-
-    _save_csv("E5_deadline", results)
-    return results
-
-
-# ── E6: λ_R penalty sweep ─────────────────────────────────────────────────────
-
-def run_E6(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
-    print(f"E6: λ_R (replication penalty) sweep ({n_seeds} seeds)")
-
-    # Uses the stressed E1 scenario so the penalty has consequences to trade
-    # against; the interesting output is how λ_R throttles backup placement
-    # (n_replicas_avg) and what that costs in utility.
-    lambda_Rs = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
-    config_args = []
-    for s in range(n_seeds):
-        jobs = [(f"ORDI@lambda_R={l}#s{s}", "ORDI", ORDI,
-                 None, {"lambda_R": l})
-                for l in lambda_Rs]
-        config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
-
-    raw = _run_configs_parallel(config_args, desc="E6 seeds")
-
-    results: Dict[str, List[EpochMetrics]] = {}
-    for l in lambda_Rs:
-        results[f"ORDI@lambda_R={l}"] = [
-            m for s in range(n_seeds) for m in raw[f"ORDI@lambda_R={l}#s{s}"]
-        ]
-
-    _save_csv("E6_lambda_R", results)
-    return results
-
-
-# ── E7: Correlated failures (orbital-plane outage) ────────────────────────────
-
-def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
+def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     """
     Correlated orbital-plane outages probing replica-placement quality.
 
     Sustained outage (epochs 10-50, matching E2's severity) hits one plane or
-    two adjacent planes; the affected plane is swept over all positions so the
-    results cover planes that host many primaries and planes that host few,
-    and the whole sweep is repeated across environment seeds.
+    two adjacent planes. Matched environment seeds vary orbital phasing, task
+    sources, and deadlines while keeping the compact evaluation tractable.
 
-    Algorithms: ORDI, B6 (full replication), B7 (random replication).
+    Algorithms: ORDI, full replication, and random replication.
     Differences isolate how much backup placement and count buy under
     correlated failure.  (Measured property, stated rather than ablated:
     ORDI's greedy scoring already places 100% of backups in a different
     orbital plane than the primary in this constellation.)
     """
-    N_PLANES = 6  # default _build_sim constellation is a 6-plane Walker
-    print(f"E7: Correlated plane outages (placement quality, {n_seeds} seeds)")
+    print(f"E3: Correlated plane outages (placement quality, {n_seeds} seeds)")
     alg_classes = [("ORDI", ORDI),
-                   ("B6_full_replication", FullReplication),
-                   ("B7_random_replication", RandomReplication)]
+                   ("full_replication", FullReplication),
+                   ("random_replication", RandomReplication)]
 
-    # scale → list of affected-plane tuples covering all positions
+    # One fixed representative placement per scale; matched seeds provide the
+    # uncertainty samples without multiplying every seed by nine plane sweeps.
     scenarios = {
-        "1plane":  [(p,) for p in range(N_PLANES)],
-        "2planes": [(p, p + 1) for p in range(0, N_PLANES, 2)],
+        "1plane":  [(0,)],
+        "2planes": [(0, 1)],
     }
 
     config_args = []
@@ -887,7 +790,7 @@ def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
                     jobs.append((key, alg_name, cls, spec, overrides))
         config_args.append(({}, jobs, seed + s))
 
-    raw = _run_configs_parallel(config_args, desc="E7 seeds")
+    raw = _run_configs_parallel(config_args, desc="E3 seeds")
 
     # Collapse over plane positions and seeds → mean ± std per (alg, scale).
     results: Dict[str, List[EpochMetrics]] = {}
@@ -898,341 +801,8 @@ def run_E7(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
                 for m in raw[f"{alg_name}@{label}#p{planes[0]}s{s}"]
             ]
 
-    _save_csv("E7_correlated", results)
-    return results
-
-
-# ── E8: ILP vs greedy optimality gap ─────────────────────────────────────────
-# Each (size, seed) instance runs greedy and ILP on the same built sim in one
-# worker; instances run concurrently. ILP is capped to few threads per worker
-# since parallelism now comes from the instance sweep, not from HiGHS internals.
-
-# Sizes kept within ILP tractability (≤12 sats); arrival_rate low so per-epoch
-# tile counts stay small enough for the MILP to solve within the time limit.
-_E8_SIZES = [(3, 3), (3, 4)]          # (n_planes, sats_per_plane) → 9, 12 sats
-_E8_ARRIVAL_RATE = 3.0
-_E8_ILP_TIME_LIMIT_S = 30.0
-_E8_ILP_THREADS = 2
-
-
-def _run_E8_instance(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
-    """Worker: build one small (size, seed) instance and score greedy + ILP on
-    it with identical stateful lifetime accounting, so the pair is directly
-    comparable and the realized-MC layer sees the same reliability draws."""
-    n_planes, sats_per_plane, seed = args
-    sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg = \
-        _build_sim(n_planes=n_planes, sats_per_plane=sats_per_plane,
-                   arrival_rate=_E8_ARRIVAL_RATE, seed=seed)
-
-    greedy_states = deepcopy(states)
-    greedy_rel = deepcopy(reliability)
-    greedy_sched = ORDI(max_replicas=cfg.max_backups + 1)
-    def greedy_fn(ep, td):
-        return greedy_sched.schedule(_epoch_input(
-            ep, td, sat_ids, greedy_states, greedy_rel, graphs, gs_names, cfg
-        ))
-
-    ilp_states = deepcopy(states)
-    ilp_rel = deepcopy(reliability)
-    ilp_sched = ILPReference(_E8_ILP_TIME_LIMIT_S, _E8_ILP_THREADS)
-    def ilp_fn(ep, td):
-        return ilp_sched.schedule(_epoch_input(
-            ep, td, sat_ids, ilp_states, ilp_rel, graphs, gs_names, cfg
-        ))
-
-    m_greedy = _simulate_stateful(greedy_fn, tasks, sat_ids, greedy_states, cfg,
-                                  reliability=deepcopy(reliability), realized_seed=seed)
-    m_ilp = _simulate_stateful(ilp_fn, tasks, sat_ids, ilp_states, cfg,
-                               reliability=ilp_rel, realized_seed=seed)
-    n_sats = n_planes * sats_per_plane
-    return [(f"ORDI_greedy#n{n_sats}s{seed}", [m_greedy]),
-            (f"ORDI_ILP#n{n_sats}s{seed}", [m_ilp])]
-
-
-def run_E8(seed=0, n_seeds=12) -> Dict[str, List[EpochMetrics]]:
-    """ILP-vs-greedy optimality gap over a distribution of small instances.
-
-    Runs every (size, seed) instance and reports the mean ± std gap across the
-    distribution, replacing the prior single-instance anecdote. Both modeled
-    and realized (Monte-Carlo) metrics are aggregated so the gap is reported on
-    delivery outcomes as well as the modeled objective.
-    """
-    sizes = [f"{p}×{spp}" for p, spp in _E8_SIZES]
-    print(f"E8: ILP vs greedy optimality gap "
-          f"(sizes {sizes}, {n_seeds} seeds each)")
-
-    instances = [(p, spp, seed + s)
-                 for p, spp in _E8_SIZES for s in range(n_seeds)]
-
-    try:
-        from ordi.orbit._dijkstra_numba import warmup_jit
-        warmup_jit()
-    except ImportError:
-        pass
-
-    raw: Dict[str, List[EpochMetrics]] = {}
-    with ProcessPoolExecutor(max_workers=min(len(instances), 16)) as pool:
-        futures = [pool.submit(_run_E8_instance, inst) for inst in instances]
-        for fut in tqdm(as_completed(futures), total=len(instances),
-                        desc="E8 instances", unit="instance"):
-            for key, metrics in fut.result():
-                raw[key] = metrics
-
-    # Collapse over sizes and seeds → one greedy row and one ILP row, each
-    # aggregating the full instance distribution (mean ± across-instance std).
-    results: Dict[str, List[EpochMetrics]] = {"ORDI_greedy": [], "ORDI_ILP": []}
-    for p, spp in _E8_SIZES:
-        n_sats = p * spp
-        for s in range(n_seeds):
-            results["ORDI_greedy"].extend(raw[f"ORDI_greedy#n{n_sats}s{seed + s}"])
-            results["ORDI_ILP"].extend(raw[f"ORDI_ILP#n{n_sats}s{seed + s}"])
-
-    _save_csv("E8_ilp_gap", results)
-    return results
-
-
-# ── E9: maximum-backup cap ablation ─────────────────────────────────────────
-
-def run_E9(seed=0, n_seeds=16) -> Dict[str, List[EpochMetrics]]:
-    """Ablate ORDI's structural backup cap from zero to three.
-
-    The replication price is set to zero in every arm so the cap, rather than
-    lambda_R, is the binding control. Candidates still need positive marginal
-    reliability utility after their energy cost. Tasks permit four total
-    replicas (one primary plus three backups); existing experiments retain the
-    default hard cap of two and max_backups=1.
-    """
-    backup_caps = [0, 1, 2, 3]
-    print(f"E9: backup-cap ablation {backup_caps} (lambda_R=0, {n_seeds} seeds)")
-
-    config_args = []
-    build_kwargs = {**_E1_BUILD_KWARGS, "n_replicas_max": 4}
-    for s in range(n_seeds):
-        jobs = [
-            (f"ORDI@backups={cap}#s{s}", "ORDI", ORDI, None,
-             {"max_backups": cap, "lambda_R": 0.0})
-            for cap in backup_caps
-        ]
-        config_args.append((build_kwargs, jobs, seed + s))
-
-    raw = _run_configs_parallel(config_args, desc="E9 seeds")
-    results: Dict[str, List[EpochMetrics]] = {}
-    for cap in backup_caps:
-        results[f"ORDI@backups={cap}"] = [
-            m for s in range(n_seeds)
-            for m in raw[f"ORDI@backups={cap}#s{s}"]
-        ]
-
-    _save_csv("E9_backup_cap", results)
-    return results
-
-
-# ── REAL: full real-data pipeline (real orbits + tasks + telemetry) ───────────
-
-# A recent UTC window mapped to sim t=0. Real TLEs propagate at real epochs, so
-# contact windows must be computed over a current window rather than unix t=0.
-_REAL_WINDOW_START = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
-_REAL_N_PLANES = 6
-_REAL_MAX_SATS = 24            # cap constellation size for tractable contact calc
-_REAL_FOV_RANGE_KM = 600.0     # realistic EO swath half-width
-_REAL_MIN_ELEV_DEG = 25.0      # match the stressed E1 ground-segment
-# Deadline scale for real wildfire delivery. The wildfire profile median is 300 s,
-# scaled by slack/600, so 3600 → a 30-min median for a calm fire; the FRP
-# tightening in real_requests.py pulls intense fires down to ~12 min. This brackets
-# operational wildfire-alert delivery latencies: OroraTech <10 min (dedicated,
-# onboard), India NRT 15–30 min, NASA EOSDIS "real-time" ≤60 min, practical alert
-# delivery 30 min–2 h. The original 600 (≈5 min, ≈2 min tightened) was tighter than
-# every fielded system and made the ground segment the sole binding constraint.
-_REAL_DEADLINE_SLACK = 3600.0
-_REAL_STAC_LIMIT = 800
-
-
-def _build_sim_real(task_source="fire"):
-    """Build the REAL, seed-independent parts of the environment ONCE.
-
-    Everything here is real measured data with no random component:
-      - Orbits: real Planet (Flock/SkySat) TLEs from CelesTrak, RAAN-clustered
-        into SAT_<plane>_<idx> planes; real contact windows over a current UTC
-        window; real groundtracks.
-      - Requests: real NASA FIRMS active-fire detections (task_source="fire"),
-        real Sentinel-2 captures ("acquisition"), or both.
-      - Telemetry: the real BUPT-1 60 s trace.
-
-    FIRMS fires carry full request semantics (type=wildfire, FRP urgency), so
-    only the source-satellite choice, tile jitter, telemetry phase offset, and
-    Monte-Carlo draws stay sampled. Sentinel-2 captures supply only when+where,
-    so their type is additionally sampled. See run_REAL's docstring.
-
-    Returns the shared real inputs plus a provenance dict for the banner.
-    """
-    raise RuntimeError(
-        "The legacy Skyfield/SGP4 real-TLE path was removed; use the "
-        "Basilisk/BSK-RL backend for orbital propagation."
-    )
-    from ordi.sim.telemetry_replay import load_bupt1_telemetry
-
-    w0 = _REAL_WINDOW_START.timestamp()
-    w_end = w0 + SIM_DURATION_S
-
-    sats, name_map = load_planet_constellation(
-        n_planes=_REAL_N_PLANES, max_sats=_REAL_MAX_SATS)
-    sat_ids = [s.name for s in sats]
-
-    print(f"  Computing real contact windows for {len(sats)} sats × "
-          f"{len(_NORTHERN_GS)} GS over {_REAL_WINDOW_START.date()} ...")
-    t0 = time.time()
-    contacts = compute_contact_windows(
-        sats, t_start_unix=w0, t_end_unix=w_end, dt_seconds=60.0,
-        ground_stations=_NORTHERN_GS, min_elevation_deg=_REAL_MIN_ELEV_DEG,
-    )
-    print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
-
-    # Real contacts carry absolute (2026) unix timestamps, so the epoch graphs
-    # must be bucketed from w0 (not T_SIM_START=0) or every contact falls outside
-    # the [0, horizon] buckets. Epoch INDEX e still maps to both absolute
-    # [w0+e·Δ, ...] and relative [e·Δ, ...] because w0 is defined as relative t=0,
-    # and routing uses only relative time differences, so this stays consistent
-    # with the scheduler's 0-based epoch_start / deadlines.
-    graphs = build_epoch_graphs(contacts, w0, EPOCH_LENGTH_S, N_EPOCHS)
-    gs_names = {gs[0] for gs in _NORTHERN_GS}
-
-    sat_groundtrack = compute_sat_groundtracks(sats, w0, w_end, dt_seconds=60.0)
-
-    fires = []
-    acqs = []
-    if task_source in ("fire", "both"):
-        from ordi.tasks.real_requests import fetch_fire_requests
-        start_date = _REAL_WINDOW_START.strftime("%Y-%m-%d")
-        print(f"  Fetching FIRMS active-fire requests for {start_date} ...")
-        fires = fetch_fire_requests(start_date, days=1)
-        print(f"  {len(fires)} fire detections")
-    if task_source in ("acquisition", "both"):
-        from ordi.tasks.real_acquisitions import fetch_sentinel2_acquisitions
-        dt_range = (f"{_REAL_WINDOW_START.strftime('%Y-%m-%dT%H:%M:%SZ')}/"
-                    f"{datetime.fromtimestamp(w_end, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
-        print(f"  Fetching Sentinel-2 acquisitions {dt_range} ...")
-        acqs = fetch_sentinel2_acquisitions(dt_range, limit=_REAL_STAC_LIMIT)
-        print(f"  {len(acqs)} Sentinel-2 acquisitions")
-
-    trace = load_bupt1_telemetry()
-    reliability = ReliabilityModel()
-    cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
-
-    provenance = {
-        "task_source": task_source,
-        "n_sats": len(sats), "n_contacts": len(contacts),
-        "n_fires": len(fires), "n_acqs": len(acqs),
-        "telemetry_span": f"{trace.span_start} → {trace.span_end}",
-        "telemetry_samples": len(trace),
-        "window": str(_REAL_WINDOW_START.date()),
-    }
-    return (sat_ids, gs_names, graphs, sat_groundtrack, fires, acqs, trace,
-            reliability, cfg, name_map, provenance)
-
-
-def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetrics]]:
-    """Full real-data pipeline: real Planet orbits + real tasking requests +
-    BUPT-1 telemetry replay. Complements (does not replace) the synthetic
-    E1–E9 experiments.
-
-    task_source:
-      "fire"        NASA FIRMS active-fire detections as tasking requests
-                    (default). A fire is a genuine "image here, now, urgently"
-                    event, so type (wildfire) and urgency (fire radiative power)
-                    are REAL, not sampled.
-      "acquisition" Sentinel-2 captures — real when+where only; type is sampled.
-      "both"        union of the two.
-
-    ORDI + the E1 baseline set are compared on identical real inputs, so the
-    numbers are directly comparable to the synthetic core comparison.
-
-    What is REAL (measured, seed-independent):
-      - orbital geometry / ISL + downlink contact windows (Planet TLEs, CelesTrak)
-      - task arrival timing and location (FIRMS fires and/or Sentinel-2, real)
-      - for fires: task type (wildfire) and urgency/priority (FRP) — real
-      - battery-SOC and chip-temperature trajectories (BUPT-1 telemetry)
-      - fixed payload hardware constants (Atlas 200DK measured params)
-
-    What is still SAMPLED per seed (the real data cannot supply it), hence the
-    seed loop and error bars:
-      1. task type -> profile: ONLY for Sentinel-2 acquisitions (no label);
-         FIRMS fires are always wildfire, so this vanishes under task_source="fire".
-      2. source satellite among those in FOV / the earliest covering pass;
-      3. per-tile size/compute jitter and the log-normal deadline spread;
-      4. per-satellite telemetry phase offset (one real satellite stands in for
-         the whole constellation);
-      5. Monte-Carlo reliability draws for the realized-delivery metrics.
-    Tasks are rebuilt per seed so items 1-3 actually vary across seeds.
-    """
-    from ordi.sim.telemetry_replay import make_telemetry_state_driver
-    from ordi.tasks.real_acquisitions import acquisitions_to_tasks
-    from ordi.tasks.real_requests import fire_requests_to_tasks
-
-    print(f"REAL: real orbits (Planet/CelesTrak) + tasks ({task_source}) + "
-          f"telemetry (BUPT-1), {n_seeds} seeds")
-    (sat_ids, gs_names, graphs, sat_groundtrack, fires, acqs, trace, reliability,
-     cfg, name_map, prov) = _build_sim_real(task_source=task_source)
-
-    print("  ── provenance ──")
-    for k, v in prov.items():
-        print(f"    {k}: {v}")
-
-    w0 = _REAL_WINDOW_START.timestamp()
-    alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in ALL_BASELINES]
-    results: Dict[str, List[EpochMetrics]] = {alg: [] for alg, _ in alg_classes}
-
-    def _build_tasks(sd):
-        # Rebuild tasks per seed so the sampled elements (source, jitter, and —
-        # for acquisitions — type) vary and the error bars are meaningful.
-        out = []
-        if fires:
-            out += fire_requests_to_tasks(
-                fires, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
-                deadline_slack_s=_REAL_DEADLINE_SLACK,
-                fov_range_km=_REAL_FOV_RANGE_KM, seed=sd)
-        if acqs:
-            base = len(out)
-            acq_tasks = acquisitions_to_tasks(
-                acqs, sat_ids, sat_groundtrack, w0, SIM_DURATION_S,
-                deadline_slack_s=_REAL_DEADLINE_SLACK,
-                fov_range_km=_REAL_FOV_RANGE_KM, seed=sd)
-            for i, t in enumerate(acq_tasks):  # keep task_ids unique across sources
-                t.task_id = base + i
-                for tile in t.tiles:
-                    tile.task_id = t.task_id
-            out += acq_tasks
-        return out
-
-    for s in tqdm(range(n_seeds), desc="REAL seeds", unit="seed"):
-        tasks = _build_tasks(seed + s)
-        states = make_constellation_states(
-            sat_ids, seed=seed + s, params_factory=atlas_200dk_bupt1_params)
-        driver = make_telemetry_state_driver(trace, sat_ids, seed=seed + s)
-        for alg_name, cls in alg_classes:
-            local_states = deepcopy(states)
-            local_rel = deepcopy(reliability)
-            if cls is ORDI:
-                sched = cls(max_replicas=cfg.max_backups + 1)
-            else:
-                try:
-                    sched = cls(seed=seed + s)
-                except TypeError:
-                    sched = cls()
-
-            def schedule_fn(ep, td, _sched=sched):
-                return _sched.schedule(_epoch_input(
-                    ep, td, sat_ids, local_states, local_rel,
-                    graphs, gs_names, cfg,
-                ))
-
-            m = _simulate_stateful(
-                schedule_fn, tasks, sat_ids, local_states, cfg,
-                reliability=local_rel, realized_seed=seed + s,
-                state_driver=driver,
-            )
-            results[alg_name].append(m)
-
-    _save_csv("REAL", results)
+    _save_csv("E3_correlated", results,
+              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
     return results
 
 
@@ -1240,9 +810,6 @@ def run_REAL(seed=0, n_seeds=8, task_source="fire") -> Dict[str, List[EpochMetri
 
 ALL_EXPERIMENTS = {
     "E1": run_E1, "E2": run_E2, "E3": run_E3, "E4": run_E4,
-    "E5": run_E5, "E6": run_E6, "E7": run_E7, "E8": run_E8,
-    "E9": run_E9,
-    "REAL": run_REAL,
 }
 
 

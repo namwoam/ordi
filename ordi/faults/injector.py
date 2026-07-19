@@ -1,5 +1,5 @@
 """
-Fault injection framework for ORDI evaluation (Phase 6 / E2, E3, E7).
+Fault injection framework for the E2 and E3 robustness evaluations.
 
 Supports eight fault types from the proposal:
   1. ISL disruption          - remove specific ISL edge for N epochs
@@ -333,7 +333,7 @@ def random_fault_schedule(
 ) -> List[FaultEvent]:
     """
     Generate a randomized fault schedule at a given fault_rate.
-    Used for E3 (fault intensity sweep).
+    Used for E2 (fault intensity sweep).
     """
     rng = random.Random(seed)
     fault_types = [
