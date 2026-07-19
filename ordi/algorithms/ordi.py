@@ -1,10 +1,13 @@
 from .schema import Assignment, Decision
 import math
 from ._common import enumerate_placements, independent_success, plane, tile_success
+from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 class ORDI:
     name = "ordi"
-    def __init__(self,max_replicas=2): self.max_replicas=max_replicas
+    def __init__(self,max_replicas=2):
+        self.max_replicas=max_replicas
+        self.resources=DecisionFeasibilityModel()
     def _utility(self,request,task,tile,p):
         w=request.weights
         source_p=request.satellites[task.source_sat].reliability
@@ -31,11 +34,15 @@ class ORDI:
                         request.weights.communication*candidate.communication_bits-
                         request.weights.replication)
                     if gain>0: selected.append(candidate); old_p=new_p
-                out.append(Assignment(task.task_id,tile.tile_id,task.source_sat,
+                assignment=Assignment(task.task_id,tile.tile_id,task.source_sat,
                     tuple(p.helper for p in selected),tuple(p.aggregator for p in selected),
                     metadata={"latency":min(p.latency for p in selected),
                     "reliability":tile_success(request,task,selected),"selective_redundancy":True,
                     "energy_j":sum(p.energy_j for p in selected),
                     "objective":sum(self._utility(request,task,tile,p) for p in selected)},
-                    routes=tuple((p.route_in,p.route_out,p.route_down) for p in selected)))
+                    routes=tuple((p.route_in,p.route_out,p.route_down) for p in selected))
+                try:
+                    out.append(self.resources.retime_and_reserve(request,assignment))
+                except InvalidDecisionError:
+                    continue
         return Decision(request.epoch,tuple(out))

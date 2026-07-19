@@ -21,8 +21,7 @@ ALG_COLORS = {
     "ORDI":                   "#e63946",
     "direct_downlink":        "#457b9d",
     "onboard_only":           "#1d3557",
-    "compression_only":       "#a8dadc",
-    "greedy_nonredundant":    "#e9c46a",
+    "seco_adapted":           "#e9c46a",
     "full_replication":       "#f4a261",
     "random_replication":     "#264653",
 }
@@ -31,8 +30,7 @@ ALG_LABELS = {
     "ORDI":                   "ORDI",
     "direct_downlink":        "Direct Downlink",
     "onboard_only":           "Onboard-Only",
-    "compression_only":       "Compress-Only",
-    "greedy_nonredundant":    "Greedy Nonredundant",
+    "seco_adapted":           "SECO-Adapted",
     "full_replication":       "Full Replication",
     "random_replication":     "Random Replication",
 }
@@ -108,7 +106,7 @@ def plot_E2():
     if not rows:
         print("No E2 data"); return
 
-    algs = ["ORDI", "greedy_nonredundant", "full_replication"]
+    algs = ["ORDI", "seco_adapted", "full_replication"]
     fault_rates = sorted(set(
         float(r["algorithm"].split("fault=")[1]) for r in rows
         if "fault=" in r["algorithm"]
@@ -179,7 +177,7 @@ def plot_E4():
     if not rows:
         print("No E4 data"); return
 
-    algs = ["ORDI", "greedy_nonredundant"]
+    algs = ["ORDI", "seco_adapted"]
     sizes = sorted(set(
         int(r["algorithm"].split("n=")[1]) for r in rows if "n=" in r["algorithm"]
     ))

@@ -40,17 +40,17 @@ from ordi.sim.satellite import make_constellation_states
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.algorithms import (
-    ORDI, DirectDownlink, OnboardOnly, CompressionOnly, GreedyNonredundant,
+    ORDI, DirectDownlink, OnboardOnly, SECOAdapted,
     FullReplication, RandomReplication, EpochInput, SatelliteView,
     ContactWindow, PolicyWeights, ExperimentConfig, Assignment, Decision,
 )
 ORDIConfig = ExperimentConfig
-CORE_BASELINES = [DirectDownlink, OnboardOnly, CompressionOnly,
-                  GreedyNonredundant, FullReplication]
+CORE_BASELINES = [DirectDownlink, OnboardOnly, SECOAdapted, FullReplication]
 from ordi.faults.injector import FaultInjector, random_fault_schedule, FaultEvent
 from ordi.eval.metrics import (
     compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
 )
+from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 RESULTS_DIR = "results"
 SIM_DURATION_S = 17_280       # 3 complete orbits at 550 km (3 × 5760 s)
@@ -160,12 +160,13 @@ def _assignment_viable(a: Assignment, states) -> bool:
     (a surviving backup avoids re-transmission). No-helper assignments never replan."""
     if not a.helpers:
         return True
+    viable = 0
     for helper, aggregator in zip(a.helpers, a.aggregators):
         h = states.get(helper)
         g = states.get(aggregator)
         if h is not None and g is not None and h.A_i and g.A_i:
-            return True
-    return False
+            viable += 1
+    return viable >= int(a.metadata.get("data_shards", 1))
 
 
 def _uncommitted_tasks(pending, committed):
@@ -222,16 +223,25 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
             if helper_state is None:
                 continue
 
+            work_fraction = (assignment.work_fractions[index]
+                             if index < len(assignment.work_fractions) else 1.0)
+            input_fraction = (assignment.input_fractions[index]
+                              if index < len(assignment.input_fractions) else 1.0)
+            output_fraction = (assignment.output_fractions[index]
+                               if index < len(assignment.output_fractions) else 1.0)
             per_helper_work = float(assignment.metadata.get(
-                "compute_flops", tile.compute_ops
+                "compute_flops", tile.compute_ops * work_fraction
             ))
             compute_work[helper] += per_helper_work
 
-            bits = float(assignment.metadata.get("downlink_bits", tile.d_out_bits))
+            bits = float(assignment.metadata.get(
+                "downlink_bits", tile.d_out_bits * output_fraction
+            ))
             if index < len(assignment.routes):
                 route_in, route_out, route_down = assignment.routes[index]
-                for path, path_bits in ((route_in, tile.d_in_bits),
-                                        (route_out, tile.d_out_bits)):
+                for path, path_bits in (
+                        (route_in, tile.d_in_bits * input_fraction),
+                        (route_out, tile.d_out_bits * output_fraction)):
                     for sender, receiver in zip(path, path[1:]):
                         if sender in isl_tx_bits:
                             isl_tx_bits[sender] += path_bits
@@ -247,11 +257,11 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s):
                         rx_bits[receiver] += bits
             else:
                 if source != helper and source in isl_tx_bits:
-                    isl_tx_bits[source] += tile.d_in_bits
-                    rx_bits[helper] += tile.d_in_bits
+                    isl_tx_bits[source] += tile.d_in_bits * input_fraction
+                    rx_bits[helper] += tile.d_in_bits * input_fraction
                 if helper != aggregator and aggregator in states:
-                    isl_tx_bits[helper] += tile.d_out_bits
-                    rx_bits[aggregator] += tile.d_out_bits
+                    isl_tx_bits[helper] += tile.d_out_bits * output_fraction
+                    rx_bits[aggregator] += tile.d_out_bits * output_fraction
                 if aggregator in downlink_bits:
                     downlink_bits[aggregator] += bits
 
@@ -344,7 +354,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         res, tasks, 0.0, sat_cap, cfg.alpha,
         downlink_power_w=downlink_power_w,
     )
-    r_total = sum(max(0, len(a.helpers) - 1) for a in final)
+    r_total = sum(max(0, float(a.metadata.get(
+        "effective_replicas", len(a.helpers))) - 1) for a in final)
     m.objective = (m.delivered_utility
                    - cfg.lambda_E * m.energy_joules
                    - cfg.lambda_R * r_total)
@@ -438,16 +449,32 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
 
     if scheduler_class is ORDI:
         sched = scheduler_class(max_replicas=cfg.max_backups + 1)
+    elif scheduler_class is SECOAdapted:
+        sched = scheduler_class(
+            split_options=cfg.seco_split_options,
+            halo_fraction=cfg.split_halo_fraction,
+            battery_reserve_frac=cfg.battery_reserve_frac,
+        )
     else:
         try:
             sched = scheduler_class(seed=seed)
         except TypeError:
             sched = scheduler_class()
 
+    feasibility = DecisionFeasibilityModel()
+
     def schedule_fn(ep, td):
-        return sched.schedule(_epoch_input(
+        request = _epoch_input(
             ep, td, sat_ids, local_states, local_rel, local_graphs, gs_names, cfg
-        ))
+        )
+        decision = sched.schedule(request)
+        try:
+            return feasibility.validate_and_reserve(request, decision)
+        except InvalidDecisionError as error:
+            raise InvalidDecisionError(
+                f"{sched.name} submitted an invalid decision in epoch {ep}: "
+                f"{error}"
+            ) from error
 
     m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector,
                            reliability=local_rel, realized_seed=seed)
@@ -676,7 +703,7 @@ def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     print(f"E2: Fault intensity sweep ({n_seeds} seeds)")
     fault_rates = [0.0, 0.25, 0.50]
     alg_classes = [("ORDI", ORDI),
-                   ("greedy_nonredundant", GreedyNonredundant),
+                   ("seco_adapted", SECOAdapted),
                    ("full_replication", FullReplication)]
 
     config_args = []
@@ -721,7 +748,7 @@ def run_E4(seed=0, n_seeds=1) -> Dict[str, List[EpochMetrics]]:
     # Sim is rebuilt per (constellation size, seed); each config worker chains
     # the 2 algorithms behind one build. Chaining halves repeated orbit builds.
     alg_classes = [("ORDI", ORDI),
-                   ("greedy_nonredundant", GreedyNonredundant)]
+                   ("seco_adapted", SECOAdapted)]
     sizes = list(_E4_CONFIGS)
     config_args = []
     for n_sats in sizes:

@@ -49,6 +49,12 @@ class ExperimentConfig:
     isl_rate_bps: float = 200e6
     max_backups: int = 1
     plane_disjoint_backup: bool = False
+    # SECO-aligned processing model.  A captured image tile may be split into
+    # this many parallel shards.  Spatial splitting duplicates a small halo at
+    # every internal boundary, so total input and compute grow with the split.
+    seco_split_options: tuple[int, ...] = (1, 2, 4)
+    split_halo_fraction: float = 0.05
+    battery_reserve_frac: float = 0.15
 
 @dataclass(frozen=True)
 class EpochInput:
@@ -72,6 +78,12 @@ class Assignment:
     downlink_only: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
     routes: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = ()
+    # Parallel partitions are not replicas: each entry says what fraction of
+    # the original tile's compute/input/output is assigned to the matching
+    # helper.  Empty tuples preserve the historical whole-tile replica model.
+    work_fractions: tuple[float, ...] = ()
+    input_fractions: tuple[float, ...] = ()
+    output_fractions: tuple[float, ...] = ()
 
 @dataclass(frozen=True)
 class Decision:

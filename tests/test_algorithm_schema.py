@@ -37,9 +37,10 @@ def test_controls_encode_distinct_replication_rules():
               ContactWindow("SAT_00_00","ground",0,60,1e6,"downlink",0.92),
               ContactWindow("SAT_01_00","ground",0,60,1e6,"downlink",0.92))
     request=EpochInput(0,0,[task],states,{},frozenset({"ground"}),contacts)
-    from ordi.algorithms import DirectDownlink, FullReplication, GreedyNonredundant
+    from ordi.algorithms import DirectDownlink, FullReplication, SECOAdapted
     assert DirectDownlink().schedule(request).assignments[0].downlink_only
-    assert len(GreedyNonredundant().schedule(request).assignments[0].helpers)==1
+    seco = SECOAdapted(split_options=(1,)).schedule(request).assignments[0]
+    assert seco.metadata["effective_replicas"] == 1.0
     assert len(FullReplication().schedule(request).assignments[0].helpers)==2
 
 

@@ -97,16 +97,23 @@ def compute_metrics(
         # optional energy estimate is useful only as an objective diagnostic.
         for index, (helper, aggregator) in enumerate(
                 zip(assignment.helpers, assignment.aggregators)):
+            input_fraction = (assignment.input_fractions[index]
+                              if index < len(assignment.input_fractions) else 1.0)
+            output_fraction = (assignment.output_fractions[index]
+                               if index < len(assignment.output_fractions) else 1.0)
             if index < len(assignment.routes):
                 route_in, route_out, route_down = assignment.routes[index]
-                m.isl_traffic_bits += tile.d_in_bits * max(0, len(route_in) - 1)
-                m.isl_traffic_bits += tile.d_out_bits * max(0, len(route_out) - 1)
-                m.isl_traffic_bits += tile.d_out_bits * max(0, len(route_down) - 2)
+                m.isl_traffic_bits += (tile.d_in_bits * input_fraction
+                                       * max(0, len(route_in) - 1))
+                m.isl_traffic_bits += (tile.d_out_bits * output_fraction
+                                       * max(0, len(route_out) - 1))
+                m.isl_traffic_bits += (tile.d_out_bits * output_fraction
+                                       * max(0, len(route_down) - 2))
             else:
                 if helper != assignment.source:
-                    m.isl_traffic_bits += tile.d_in_bits
+                    m.isl_traffic_bits += tile.d_in_bits * input_fraction
                 if helper != aggregator:
-                    m.isl_traffic_bits += tile.d_out_bits
+                    m.isl_traffic_bits += tile.d_out_bits * output_fraction
         m.energy_joules += float(assignment.metadata.get("energy_j", 0.0))
 
         # Every delivered tile incurs spacecraft-to-ground transmit energy.
@@ -117,7 +124,10 @@ def compute_metrics(
                 "downlink_bits", tile.d_in_bits if assignment.downlink_only else tile.d_out_bits
             ))
             m.downlink_volume_bits += downlink_bits
-            m.energy_joules += downlink_power_w * downlink_bits / downlink_rate_bps
+            if not assignment.metadata.get("includes_downlink_energy", False):
+                m.energy_joules += (
+                    downlink_power_w * downlink_bits / downlink_rate_bps
+                )
 
     # Partial coverage per task
     for tid, total in task_total.items():
@@ -132,8 +142,9 @@ def compute_metrics(
     m.recovery_latency = sum(recovery_lats) / len(recovery_lats) if recovery_lats else 0.0
     m.objective = sum(float(a.metadata.get("objective", 0.0))
                       for a in result.assignments)
-    m.n_replicas_avg = (sum(len(a.helpers) for a in result.assignments) / n_tiles
-                        if n_tiles > 0 else 0.0)
+    m.n_replicas_avg = (sum(float(a.metadata.get(
+        "effective_replicas", len(a.helpers))) for a in result.assignments)
+                        / n_tiles if n_tiles > 0 else 0.0)
 
     # Helper utilization: fraction of the constellation's compute budget the
     # scheduled work consumes. Numerator is actual FLOPs (each replica
@@ -143,7 +154,8 @@ def compute_metrics(
     # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
     compute_used = sum(
-        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops * len(a.helpers)
+        tile_lookup[(a.task_id, a.tile_id)][1].compute_ops
+        * (sum(a.work_fractions) if a.work_fractions else len(a.helpers))
         for a in result.assignments
         if (a.task_id, a.tile_id) in tile_lookup
     )
