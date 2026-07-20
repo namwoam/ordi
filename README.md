@@ -64,7 +64,7 @@ Available evaluations are:
 
 | ID | Evaluation |
 | --- | --- |
-| E1 | ORDI versus five core baselines |
+| E1 | ORDI versus five core baselines under matched random faults |
 | E2 | Random-fault intensity sweep |
 | E3 | Correlated orbital-plane failures |
 | E4 | Constellation scalability |
@@ -79,10 +79,9 @@ Run the full evaluation suite and generate every plot:
 task all
 ```
 
-The focused suite uses two matched seeds for E1–E3 and one seed per E4
-constellation size (12, 24, and 36 satellites). Based on measured stage times,
-it finishes in about 24 minutes on a four-worker development machine. To run
-or plot all experiments without Task:
+The focused suite uses eight matched seeds for E1, two matched seeds for E2–E3,
+and one seed per E4 constellation size (12, 24, and 36 satellites). To run or
+plot all experiments without Task:
 
 ```bash
 uv run python -m ordi.main run all

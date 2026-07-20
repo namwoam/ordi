@@ -9,6 +9,7 @@ from ordi.algorithms import (
 )
 from ordi.eval.experiments import _validate_feasible_subset
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
+from ordi.sim.ground import H100_SXM_PROFILE
 
 
 def _request(contact_bits=100.0):
@@ -128,3 +129,41 @@ def test_policies_retime_multiple_tiles_before_model_validation(algorithm_type):
 
     assert len(decision.assignments) == 2
     DecisionFeasibilityModel().validate_and_reserve(request, decision)
+
+
+def test_direct_downlink_serializes_h100_ground_inference():
+    rate = H100_SXM_PROFILE.compute_rate_flops_per_s
+    states = {
+        "src": SatelliteView(
+            "src", True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            reliability=0.99,
+        )
+    }
+    contacts = (
+        ContactWindow("src", "ground", 0.0, 20.0, 100.0, "downlink"),
+    )
+    tiles = [
+        SimpleNamespace(
+            tile_id=index, d_in_bits=100.0, d_out_bits=10.0,
+            compute_ops=2.0 * rate, utility=1.0,
+        )
+        for index in range(2)
+    ]
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=20.0, tiles=tiles,
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts,
+    )
+
+    assignments = DirectDownlink().schedule(request).assignments
+
+    assert len(assignments) == 2
+    assert assignments[0].metadata["ground_compute_profile"].startswith(
+        "NVIDIA H100 SXM"
+    )
+    assert assignments[0].metadata["latency"] == pytest.approx(3.0)
+    assert assignments[1].metadata["latency"] == pytest.approx(5.0)
+    assert assignments[0].metadata["ground_compute_energy_j"] == pytest.approx(
+        2.0 * H100_SXM_PROFILE.active_power_w
+    )

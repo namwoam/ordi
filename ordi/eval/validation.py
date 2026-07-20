@@ -31,12 +31,14 @@ class DecisionFeasibilityModel:
     contact_ready_at: dict[tuple, float] = field(default_factory=dict)
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
+    ground_compute_ready_at: dict[str, float] = field(default_factory=dict)
 
     def _copy(self):
         return DecisionFeasibilityModel(
             self.contact_ready_at.copy(),
             self.contact_residual_bits.copy(),
             self.compute_ready_at.copy(),
+            self.ground_compute_ready_at.copy(),
         )
 
     def _reserve_hop(self, request, source, target, bits, start):
@@ -92,6 +94,20 @@ class DecisionFeasibilityModel:
         self.compute_ready_at[helper] = finish
         return finish
 
+    def _reserve_ground_compute(self, station, work, rate, start):
+        if not station:
+            raise InvalidDecisionError("ground compute has no station")
+        if rate <= 0.0:
+            raise InvalidDecisionError(
+                f"ground compute station {station!r} has no capacity"
+            )
+        compute_start = max(
+            start, self.ground_compute_ready_at.get(station, start)
+        )
+        finish = compute_start + max(0.0, work) / rate
+        self.ground_compute_ready_at[station] = finish
+        return finish
+
     def validate_and_reserve(self, request: EpochInput, decision: Decision,
                              *, retime: bool = False):
         """Validate one decision and atomically reserve all accepted work."""
@@ -142,6 +158,7 @@ class DecisionFeasibilityModel:
                 reserved_handshakes.add(event.message_id)
 
             finishes = []
+            source_release_time = None
             if assignment.downlink_only:
                 path = tuple(assignment.metadata.get("path", ()))
                 if len(path) < 2:
@@ -151,8 +168,26 @@ class DecisionFeasibilityModel:
                 bits = float(assignment.metadata.get(
                     "downlink_bits", tile.d_in_bits
                 ))
-                finishes.append(trial._reserve_path(
+                downlink_finish = trial._reserve_path(
                     request, path, bits, request.sim_time
+                )
+                source_release_time = downlink_finish
+                ground_work = float(assignment.metadata.get(
+                    "ground_compute_flops", 0.0
+                ))
+                ground_rate = float(assignment.metadata.get(
+                    "ground_compute_rate_flops_per_s", 0.0
+                ))
+                if ground_work <= 0.0 or ground_rate <= 0.0:
+                    raise InvalidDecisionError(
+                        f"direct-downlink assignment {key} does not include "
+                        "ground inference"
+                    )
+                station = str(assignment.metadata.get(
+                    "ground_station", path[-1]
+                ))
+                finishes.append(trial._reserve_ground_compute(
+                    station, ground_work, ground_rate, downlink_finish
                 ))
             else:
                 if len(assignment.routes) != len(assignment.helpers):
@@ -319,12 +354,27 @@ class DecisionFeasibilityModel:
             if retime:
                 metadata = dict(assignment.metadata)
                 metadata["latency"] = feasible_delivery - request.sim_time
+                metadata["delivery_time"] = feasible_delivery
+                if source_release_time is not None:
+                    metadata["source_release_time"] = source_release_time
+                ground_work = float(metadata.get("ground_compute_flops", 0.0))
+                ground_rate = float(metadata.get(
+                    "ground_compute_rate_flops_per_s", 0.0
+                ))
+                ground_power = float(metadata.get(
+                    "ground_compute_power_w", 0.0
+                ))
+                if ground_work > 0.0 and ground_rate > 0.0:
+                    metadata["ground_compute_energy_j"] = (
+                        ground_power * ground_work / ground_rate
+                    )
                 assignment = replace(assignment, metadata=metadata)
             accepted.append(assignment)
 
         self.contact_ready_at = trial.contact_ready_at
         self.contact_residual_bits = trial.contact_residual_bits
         self.compute_ready_at = trial.compute_ready_at
+        self.ground_compute_ready_at = trial.ground_compute_ready_at
         return (replace(decision, assignments=tuple(accepted))
                 if retime else decision)
 

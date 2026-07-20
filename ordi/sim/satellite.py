@@ -109,6 +109,7 @@ class SatelliteState:
     A_i: int = 1
     _injected_failure: bool = False
     _compute_rate_multiplier: float = 1.0
+    _thermal_rate_multiplier: float = 1.0
 
     def __post_init__(self):
         self.C_i = self.params.compute_rate_flops_per_s
@@ -127,12 +128,12 @@ class SatelliteState:
             self.A_i = 1
 
     def _effective_compute_rate(self) -> float:
-        """Scheduler capacity after injected software straggler faults.
-
-        Thermal throttling is intentionally absent here; Basilisk owns that
-        physical state.  This multiplier represents only an ORDI fault event.
-        """
-        return self.params.compute_rate_flops_per_s * self._compute_rate_multiplier
+        """Scheduler capacity after software and thermal rate multipliers."""
+        return (
+            self.params.compute_rate_flops_per_s
+            * self._compute_rate_multiplier
+            * self._thermal_rate_multiplier
+        )
 
     def inject_failure(self):
         self._injected_failure = True

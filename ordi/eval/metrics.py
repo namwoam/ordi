@@ -85,8 +85,9 @@ def compute_metrics(
     physical_energy_j: float = 0.0,
 ) -> EpochMetrics:
     m = EpochMetrics(epoch=result.epoch)
-    # Energy is measured from the workload power nodes integrated by Basilisk.
-    # Decision metadata is intentionally not an energy authority.
+    # Space-segment energy is measured from workload power nodes integrated by
+    # Basilisk. Ground inference is outside Basilisk, so its H100 profile adds
+    # the corresponding active energy below.
     m.energy_joules = max(0.0, float(physical_energy_j))
 
     tile_lookup: Dict[tuple, EOTask] = {}
@@ -111,6 +112,9 @@ def compute_metrics(
         if key not in tile_lookup:
             continue
         task_obj, tile = tile_lookup[key]
+        m.energy_joules += max(0.0, float(
+            assignment.metadata.get("ground_compute_energy_j", 0.0)
+        ))
         task_total[task_obj.task_id] = task_total.get(task_obj.task_id, 0) + 1
 
         reliability = float(assignment.metadata.get(

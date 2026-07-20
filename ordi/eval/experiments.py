@@ -13,10 +13,11 @@ Shared realistic LEO-EO simulation setup (all experiments unless overridden):
     for an EO system whose camera covers a finite swath.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
-  - Tasks: mean 16 requests/orbit in a clustered hot-source process. Half of
-    parent events generate 2–4 same-source requests within 60 s.
-  - E1 amplifies one clustered same-area burst to 16× inference work while
-    preserving its data volume and deadlines, creating explicit compute pressure.
+  - E1 tasks: mean 20 requests/orbit in a clustered hot-source process. Sixty
+    percent of parent events generate 3–6 same-source requests within 60 s.
+  - E1 expands one same-area burst to eight requests within 30 s and amplifies
+    it to 16× inference work while preserving per-request data volume and the
+    deadline model, creating explicit compute pressure.
   - Each request is a 4096×4096 scene split into sixteen 1024×1024 tiles.
   - Deadlines are log-normal (σ=0.6), with medians wildfire 600 s, ship
     900 s, change 1800 s, and cloud_filter 5760 s (one orbit).
@@ -39,7 +40,7 @@ from ordi.orbit.contacts import (
     compute_sat_groundtracks, DEFAULT_GROUND_STATIONS,
 )
 from ordi.orbit.graph import build_epoch_graphs
-from ordi.sim.satellite import make_constellation_states
+from ordi.sim.satellite import SatelliteParams, make_constellation_states
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import generate_tasks
 from ordi.algorithms import (
@@ -80,8 +81,14 @@ def _worker_count(n_jobs: int) -> int:
 
 # ── simulation bootstrap ──────────────────────────────────────────────────────
 
-def _intensify_one_area_burst(tasks, compute_multiplier):
-    """Amplify one clustered same-area request burst for compute contention."""
+def _intensify_one_area_burst(tasks, compute_multiplier,
+                              request_count=None, window_s=None):
+    """Expand and amplify one same-area burst for compute contention.
+
+    Any added requests copy an existing request's tiles, preserving data sizes,
+    task type, source satellite, and deadline slack.  Only compute demand is
+    multiplied.  Release times can optionally be compressed into ``window_s``.
+    """
     if compute_multiplier <= 1.0 or not tasks:
         return None
     grouped = {}
@@ -104,6 +111,35 @@ def _intensify_one_area_burst(tasks, compute_multiplier):
             pressure(group), len(group), -group[0].burst_id
         ),
     )
+
+    if request_count is not None:
+        if request_count < len(selected):
+            raise ValueError(
+                "intense_area_request_count cannot shrink the selected burst"
+            )
+        next_task_id = max(task.task_id for task in tasks) + 1
+        templates = list(selected)
+        while len(selected) < request_count:
+            template = templates[(len(selected) - len(templates))
+                                 % len(templates)]
+            clone = deepcopy(template)
+            clone.task_id = next_task_id
+            for tile in clone.tiles:
+                tile.task_id = next_task_id
+            tasks.append(clone)
+            selected.append(clone)
+            next_task_id += 1
+
+    if window_s is not None:
+        if window_s < 0.0:
+            raise ValueError("intense_area_window_s must be non-negative")
+        release_start = min(task.release_time for task in selected)
+        denominator = max(len(selected) - 1, 1)
+        for index, task in enumerate(selected):
+            deadline_slack = task.deadline_slack
+            task.release_time = release_start + window_s * index / denominator
+            task.deadline = task.release_time + deadline_slack
+
     for task in selected:
         for tile in task.tiles:
             tile.compute_ops *= compute_multiplier
@@ -118,6 +154,8 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                burst_probability=0.5, burst_size_range=(2, 4),
                burst_window_s=60.0,
                intense_area_compute_multiplier=1.0,
+               intense_area_request_count=None,
+               intense_area_window_s=None,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=25.0, satellite_params_factory=None,
                n_replicas_max=2):
@@ -130,6 +168,9 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     intense_area_compute_multiplier:
                             multiplier applied to one highest-pressure clustered
                             burst; 1.0 disables the compute hotspot.
+    intense_area_request_count:
+                            optional exact request count for the selected hotspot.
+    intense_area_window_s:  optional release-time spread for the selected hotspot.
     deadline_slack        : global deadline scale (reference = 600 s).  Per-type medians
                             (wildfire 600 s, ship 900 s, change 1800 s,
                             cloud_filter 5760 s)
@@ -199,7 +240,9 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         n_replicas_max=n_replicas_max,
     )
     intense = _intensify_one_area_burst(
-        tasks, intense_area_compute_multiplier
+        tasks, intense_area_compute_multiplier,
+        request_count=intense_area_request_count,
+        window_s=intense_area_window_s,
     )
     if intense is not None:
         burst_id, request_count = intense
@@ -214,11 +257,22 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
 
 # ── stateful rolling-horizon helpers ──────────────────────────────────────────
 
-def _assignment_viable(a: Assignment, states) -> bool:
+def _assignment_viable(a: Assignment, states, sim_time=None) -> bool:
     """In-flight tile survives if any replica's helper+aggregator are both alive
-    (a surviving backup avoids re-transmission). No-helper assignments never replan."""
-    if not a.helpers:
+    (a surviving backup avoids re-transmission). Completed deliveries are final;
+    an unfinished direct downlink still depends on its source satellite."""
+    delivery_time = float(a.metadata.get("delivery_time", math.inf))
+    if sim_time is not None and delivery_time <= sim_time + 1e-9:
         return True
+    if not a.helpers:
+        source_release_time = float(a.metadata.get(
+            "source_release_time", delivery_time
+        ))
+        if (sim_time is not None
+                and source_release_time <= sim_time + 1e-9):
+            return True
+        source = states.get(a.source)
+        return source is not None and bool(source.A_i)
     viable = []
     for helper, aggregator in zip(a.helpers, a.aggregators):
         h = states.get(helper)
@@ -431,7 +485,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                 sat_cap[sat_id] += state.C_i * cfg.epoch_length
         # Drop committed tiles whose every replica lost a node → re-planned.
         for key in list(committed.keys()):
-            if not _assignment_viable(committed[key], states):
+            if not _assignment_viable(committed[key], states, ep_start):
                 del committed[key]
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
@@ -796,15 +850,24 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
 
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
-# The stressed reference scenario: a sparser Walker and
-# higher task load. All benchmarks use the same 25° GS elevation mask.
+# The compute-stressed reference scenario uses a contact-relaxed ground segment,
+# sustained (rather than marketing-peak) accelerator throughput, and one dense
+# same-area hotspot.  Data sizes and deadlines remain unchanged.
+def _e1_satellite_params(sat_id):
+    return SatelliteParams(sat_id=sat_id, compute_rate_gflops=5.0)
+
+
 _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
-                        arrival_rate=16.0, deadline_slack=600.0,
+                        arrival_rate=20.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6,
-                        burst_probability=0.5,
-                        burst_size_range=(2, 4), burst_window_s=60.0,
+                        burst_probability=0.6,
+                        burst_size_range=(3, 6), burst_window_s=60.0,
+                        intense_area_request_count=8,
                         intense_area_compute_multiplier=16.0,
-                        min_elevation_deg=25.0)
+                        intense_area_window_s=30.0,
+                        ground_stations=DEFAULT_GROUND_STATIONS,
+                        min_elevation_deg=10.0,
+                        satellite_params_factory=_e1_satellite_params)
 
 E1_METRIC_KEYS = [
     "realized_miss_ratio",
@@ -825,41 +888,51 @@ E1_METRIC_KEYS = [
     "state_age_p95_s",
 ]
 
-def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=8,
+           fault_rate=0.25) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
     Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
-    with a mean of 16 requests per orbit. Half of parent events create 2–4
-    same-source requests within 60 s, producing realistic hot-source queues
+    with a mean of 20 requests per orbit. Sixty percent of parent events create
+    3–6 same-source requests within 60 s, producing realistic hot-source queues
     while preserving the requested mean rate.
 
-    One same-area burst is amplified to 16× inference work without changing
-    its input/output volume or deadlines. This creates a localized compute
-    hotspot while leaving the rest of the workload unchanged.
+    One same-area burst is expanded to eight requests within 30 s and amplified
+    to 16× inference work without changing its input/output volume or deadline
+    model. This creates a localized compute hotspot while leaving the rest of
+    the workload unchanged. Satellites use 5 GFLOP/s sustained throughput.
 
-    All experiments use six globally distributed ground stations and a 25°
-    minimum elevation angle. Relay policies must therefore improve on a
-    credible direct ground segment rather than a sparse two-station network.
+    All experiments use ten globally distributed ground stations and a 10°
+    minimum elevation angle, relaxing contact availability without changing
+    ISL or downlink rates.
 
-    B1 (DirectDownlink) is a direct-only baseline: it must wait for the source
-    satellite itself to enter a GS contact window. ORDI and cooperative
-    controls may route compact products through an ISL-connected satellite.
+    B1 (DirectDownlink) is an end-to-end ground-processing baseline: it waits
+    for the source satellite to enter a GS contact, downlinks the raw tile, and
+    completes inference on that station's queued H100 SXM. ORDI and cooperative
+    controls may instead compute in orbit and route compact products through an
+    ISL-connected satellite.
 
     Deadline distribution: log-normal σ=0.6, with medians wildfire→600 s,
     ship→900 s, change→1800 s, and cloud_filter→5760 s (one orbit).
 
     Each seed rebuilds the full environment (orbital phasing, ground targets,
-    task arrivals, deadline draws); the CSV reports across-seed mean and std.
+    task arrivals, deadline draws) and draws a deterministic random fault
+    schedule shared by every policy in that seed. The default 0.25 per-epoch
+    fault probability matches E2's moderate fault-intensity setting. The CSV
+    reports across-seed mean and std.
     """
-    print(f"E1: Core performance (6×4 Walker, 6 global GS, lognormal deadlines, "
-          f"25° GS elevation, {n_seeds} seeds)")
+    print(f"E1: Core performance (6×4 Walker, 10 global GS, 5 GFLOP/s, "
+          f"10° GS elevation, 8-request 16× hotspot, "
+          f"fault rate {fault_rate:.2f}, {n_seeds} seeds)")
     build_kwargs = dict(_E1_BUILD_KWARGS)
     alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in CORE_BASELINES]
 
     config_args = []
     for s in range(n_seeds):
-        jobs = [(f"{alg}#s{s}", alg, cls) for alg, cls in alg_classes]
+        fault_specs = [("random_schedule", fault_rate, seed + s)]
+        jobs = [(f"{alg}#s{s}", alg, cls, fault_specs)
+                for alg, cls in alg_classes]
         config_args.append((build_kwargs, jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E1 seeds")

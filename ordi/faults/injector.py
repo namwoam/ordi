@@ -23,6 +23,13 @@ from ordi.orbit.contacts import ContactEvent
 from ordi.orbit.graph import EpochContactGraph
 
 
+RANDOM_FAULT_TYPES = (
+    "helper_failure", "straggler", "battery_shortage",
+    "thermal_throttle", "isl_disruption", "ground_contact_miss",
+    "downlink_adverse",
+)
+
+
 @dataclass
 class FaultEvent:
     fault_type: str
@@ -63,6 +70,7 @@ class FaultInjector:
         self._removed_edges: Dict[int, Dict[int, list]] = {}
         # Maps fault id → {sat_id: rate multiplier} for straggler restoration.
         self._compute_snapshots: Dict[int, Dict[str, float]] = {}
+        self._thermal_snapshots: Dict[int, Dict[str, float]] = {}
 
     def schedule(self, fault: FaultEvent):
         """Register a fault to be applied at its start_epoch."""
@@ -177,9 +185,13 @@ class FaultInjector:
                     s._update_availability()
 
         elif ft == "thermal_throttle":
+            factor = fault.params.get("factor", 0.5)
+            snapshot = self._thermal_snapshots.setdefault(id(fault), {})
             for sat_id in fault.targets:
                 if sat_id in self.states:
                     s = self.states[sat_id]
+                    snapshot[sat_id] = s._thermal_rate_multiplier
+                    s._thermal_rate_multiplier *= factor
                     s.Theta_i = s.params.thermal_max_c + 5.0
                     s.C_i = s._effective_compute_rate()
                     s._update_availability()
@@ -231,10 +243,13 @@ class FaultInjector:
                     s.recover()
 
         elif ft == "thermal_throttle":
+            snapshot = self._thermal_snapshots.pop(id(fault), {})
             for sat_id in fault.targets:
                 if sat_id in self.states:
                     s = self.states[sat_id]
                     # Restore temperature below throttle threshold.
+                    if sat_id in snapshot:
+                        s._thermal_rate_multiplier = snapshot[sat_id]
                     s.Theta_i = s.params.thermal_ambient_c
                     s.C_i = s._effective_compute_rate()
                     s.recover()
@@ -336,14 +351,10 @@ def random_fault_schedule(
     Used for E2 (fault intensity sweep).
     """
     rng = random.Random(seed)
-    fault_types = [
-        "helper_failure", "straggler", "battery_shortage",
-        "thermal_throttle", "isl_disruption",
-    ]
     faults = []
     for epoch in range(n_epochs):
         if rng.random() < fault_rate:
-            ft = rng.choice(fault_types)
+            ft = rng.choice(RANDOM_FAULT_TYPES)
             target = rng.choice(sat_ids)
             if ft == "isl_disruption":
                 other = rng.choice([s for s in sat_ids if s != target])

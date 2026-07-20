@@ -3,7 +3,9 @@ import unittest
 from unittest.mock import patch
 
 from ordi.eval.experiments import _advance_synthetic_states, _simulate_stateful
-from ordi.faults.injector import FaultEvent, FaultInjector
+from ordi.faults.injector import (
+    RANDOM_FAULT_TYPES, FaultEvent, FaultInjector,
+)
 from ordi.algorithms import Assignment, Decision, ExperimentConfig
 from ordi.sim.reliability import ReliabilityModel
 from ordi.sim.satellite import SatelliteParams, SatelliteState
@@ -56,6 +58,31 @@ class StateTransitionTests(unittest.TestCase):
         self.assertAlmostEqual(state.C_i, 0.1e9)
         injector.withdraw_epoch(2)
         self.assertAlmostEqual(state.C_i, 1e9)
+
+    def test_thermal_fault_reduces_and_restores_compute_rate(self):
+        state = _state("sat")
+        injector = FaultInjector(
+            {"sat": state}, ReliabilityModel(), [], rng_seed=0
+        )
+        fault = FaultEvent(
+            "thermal_throttle", 0, 2, ["sat"], {"factor": 0.25}
+        )
+        injector.schedule(fault)
+
+        injector.apply_epoch(0)
+        self.assertAlmostEqual(state.C_i, 0.25e9)
+        injector.refresh_active_state()
+        self.assertAlmostEqual(state.C_i, 0.25e9)
+
+        injector.withdraw_epoch(2)
+        self.assertAlmostEqual(state.C_i, 1e9)
+
+    def test_random_fault_mix_covers_compute_network_and_ground_domains(self):
+        assert set(RANDOM_FAULT_TYPES) == {
+            "helper_failure", "straggler", "battery_shortage",
+            "thermal_throttle", "isl_disruption", "ground_contact_miss",
+            "downlink_adverse",
+        }
 
     def test_assignment_load_advances_all_participating_satellites(self):
         states = {name: _state(name) for name in ("src", "helper", "agg")}

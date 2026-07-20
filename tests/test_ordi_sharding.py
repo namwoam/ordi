@@ -158,6 +158,17 @@ def test_fault_viability_accepts_any_two_of_three_coded_shards():
     assert not _assignment_viable(assignment, states)
 
 
+def test_direct_downlink_requires_source_only_until_delivery():
+    assignment = SimpleNamespace(
+        source="src", helpers=(), aggregators=(),
+        metadata={"source_release_time": 100.0, "delivery_time": 120.0},
+    )
+    states = {"src": SimpleNamespace(A_i=False)}
+
+    assert not _assignment_viable(assignment, states, sim_time=60.0)
+    assert _assignment_viable(assignment, states, sim_time=100.0)
+
+
 def test_ordi_can_select_two_of_three_coded_fanout():
     states = {
         "src": _view("src"),

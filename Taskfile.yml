@@ -8,7 +8,7 @@ tasks:
 
   # ── individual experiments ─────────────────────────────────────────────────
   e1:
-    desc: "E1 - Core performance: ORDI vs five baselines (no faults)"
+    desc: "E1 - Core performance under matched moderate random faults"
     cmds:
       - uv run python -m ordi.main run E1
 
