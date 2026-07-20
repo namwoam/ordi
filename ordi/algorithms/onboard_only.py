@@ -19,7 +19,6 @@ class OnboardOnly:
                         assignment=Assignment(task.task_id,tile.tile_id,task.source_sat,
                             (p.helper,),(p.aggregator,),metadata={"latency":p.latency,
                             "reliability":p.reliability*state.reliability,
-                            "energy_j":p.energy_j,
                             "state_observer":task.source_sat,
                             "known_state_nodes":1,"max_state_age_s":0.0},
                             routes=((p.route_in,p.route_out,p.route_down),))

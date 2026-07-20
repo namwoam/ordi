@@ -26,7 +26,6 @@ class _LocalPlan:
     output_fraction: float
     latency: float
     reliability: float
-    energy_j: float
     communication_bits: float
     value: float
 
@@ -126,7 +125,6 @@ class ORDI:
         return (
             tile.utility * source_p * placement.reliability
             * math.exp(-weights.freshness * placement.latency)
-            - weights.energy * placement.energy_j
             - weights.communication * placement.communication_bits
         )
 
@@ -193,12 +191,10 @@ class ORDI:
         reliability = source_p * self._at_least_k_probability(
             [p.reliability for p in placements], shard_count
         )
-        energy = sum(p.energy_j for p in placements)
         communication = sum(p.communication_bits for p in placements)
         value = (
             tile.utility * reliability
             * math.exp(-request.weights.freshness * latency)
-            - request.weights.energy * energy
             - request.weights.communication * communication
             - request.weights.replication
             * (fanout_count / shard_count - 1.0)
@@ -206,7 +202,7 @@ class ORDI:
         return _LocalPlan(
             shard_count, fanout_count, placements,
             work_fraction, input_fraction,
-            output_fraction, latency, reliability, energy, communication,
+            output_fraction, latency, reliability, communication,
             value,
         )
 
@@ -309,7 +305,6 @@ class ORDI:
             * math.exp(-request.weights.freshness * min(
                 primary.latency, max(p.latency for p in backup)
             ))
-            - request.weights.energy * sum(p.energy_j for p in backup)
             - request.weights.communication
             * sum(p.communication_bits for p in backup)
             - request.weights.replication
@@ -420,7 +415,6 @@ class ORDI:
                     self._group_latency(group, primary.shard_count)
                     for group in groups
                 )
-                energy = sum(p.energy_j for p in selected)
                 communication = sum(p.communication_bits for p in selected)
                 redundancy_factor = (
                     sum(len(group) for group in groups)
@@ -429,7 +423,6 @@ class ORDI:
                 objective = (
                     tile.utility * reliability
                     * math.exp(-request.weights.freshness * latency)
-                    - request.weights.energy * energy
                     - request.weights.communication * communication
                     - request.weights.replication
                     * (redundancy_factor - 1.0)
@@ -452,7 +445,6 @@ class ORDI:
                         ),
                         "shard_groups": group_labels,
                         "effective_replicas": redundancy_factor,
-                        "energy_j": energy,
                         "objective": objective,
                         "state_observer": task.source_sat,
                         "known_state_nodes": len(local_request.satellites),

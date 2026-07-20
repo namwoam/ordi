@@ -7,12 +7,12 @@ ground route to minimize completion time.  Unlike ORDI it uses no utility or
 reliability term and creates no replicas.
 
 The extension over SECO's nominal processing model is explicit feasibility
-against satellite availability, battery reserve, time-varying contacts, and
-residual link/compute capacity.
+against satellite availability, time-varying contacts, and residual
+link/compute capacity. Basilisk alone evolves physical energy state.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 import heapq
 import math
 
@@ -39,7 +39,6 @@ class ResourceLedger:
     compute_ready_at: dict[str, float]
     contact_ready_at: dict[int, float]
     contact_residual_bits: dict[int, float]
-    energy_committed_j: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_request(cls, request):
@@ -64,7 +63,6 @@ class ResourceLedger:
             self.compute_ready_at.copy(),
             self.contact_ready_at.copy(),
             self.contact_residual_bits.copy(),
-            self.energy_committed_j.copy(),
         )
 
 
@@ -77,7 +75,6 @@ class PartPlacement:
     route_down: ReservedRoute
     completion: float
     reliability: float
-    energy_j: float
 
 
 @dataclass(frozen=True)
@@ -145,40 +142,14 @@ def _reserve_route(request, ledger, route):
         ledger.contact_ready_at[index] = finish
 
 
-def _route_energy_by_node(request, route):
-    energy: dict[str, float] = {}
-    for index in route.contact_indices:
-        contact = request.contacts[index]
-        airtime = route.bits / max(contact.rate_bps, 1.0)
-        # Charge both spacecraft radios on an ISL; a ground receiver is outside
-        # the modeled satellite energy budget.
-        for node in (contact.source, contact.target):
-            state = request.satellites.get(node)
-            if state is not None:
-                energy[node] = energy.get(node, 0.0) + (
-                    state.comms_power_w * airtime
-                )
-    return energy
-
-
-def _merge_energy(*items):
-    merged: dict[str, float] = {}
-    for item in items:
-        for node, amount in item.items():
-            merged[node] = merged.get(node, 0.0) + amount
-    return merged
-
-
 class SECOAdapted:
     """Queue-aware, capacity-aware non-redundant shard placement."""
 
     name = "seco_adapted"
 
-    def __init__(self, split_options=(1, 2, 4), halo_fraction=0.05,
-                 battery_reserve_frac=0.15):
+    def __init__(self, split_options=(1, 2, 4), halo_fraction=0.05):
         self.split_options = tuple(sorted(set(split_options)))
         self.halo_fraction = halo_fraction
-        self.battery_reserve_frac = battery_reserve_frac
         self.messages = MessageSimulator()
 
     def _part_candidate(self, request, task, tile, ledger, work_fraction,
@@ -243,32 +214,6 @@ class SECOAdapted:
                 compute_done, 1.0, (helper,), (), (), output_bits
             )
 
-            compute_energy = {
-                helper: hstate.compute_power_w * work
-                / max(hstate.compute_rate, 1.0)
-            }
-            energy_by_node = _merge_energy(
-                compute_energy,
-                _route_energy_by_node(request, split_request),
-                _route_energy_by_node(request, split_response),
-                _route_energy_by_node(request, route_in),
-                _route_energy_by_node(request, route_down),
-            )
-            physically_feasible = True
-            for node, energy in energy_by_node.items():
-                state = request.satellites[node]
-                already = trial.energy_committed_j.get(node, 0.0)
-                reserve = self.battery_reserve_frac * state.battery_capacity_j
-                if state.battery_j - already - energy < reserve:
-                    physically_feasible = False
-                    break
-            if not physically_feasible:
-                continue
-            for node, energy in energy_by_node.items():
-                trial.energy_committed_j[node] = (
-                    trial.energy_committed_j.get(node, 0.0) + energy
-                )
-
             participating = {helper, aggregator} - {task.source_sat}
             node_reliability = math.prod(
                 request.satellites[node].reliability
@@ -279,7 +224,6 @@ class SECOAdapted:
                 route_down.arrival,
                 route_in.reliability * route_down.reliability
                 * node_reliability,
-                sum(energy_by_node.values()),
             )
             if best is None or part.completion < best[0].completion:
                 best = (part, trial)
@@ -379,14 +323,9 @@ class SECOAdapted:
                         "split_count": q,
                         "partitioned": q > 1,
                         "effective_replicas": 1.0,
-                        "energy_j": sum(
-                            part.energy_j for part in plan.parts
-                        ),
-                        "includes_downlink_energy": True,
                         "time_objective": plan.completion - request.sim_time,
                         "helper_handshake": True,
                         "helper_request_kind": "split",
-                        "battery_reserve_frac": self.battery_reserve_frac,
                         "state_observer": source,
                         "known_state_nodes": len(local.satellites),
                         "max_state_age_s": max(

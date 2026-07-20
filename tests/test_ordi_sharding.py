@@ -13,7 +13,7 @@ from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 def _view(name):
     return SatelliteView(
         name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-        compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        reliability=0.99,
     )
 
 

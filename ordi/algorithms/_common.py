@@ -18,7 +18,6 @@ class Placement:
     aggregator: str
     latency: float
     reliability: float
-    energy_j: float
     communication_bits: float
     route_in: tuple[str, ...]
     route_out: tuple[str, ...]
@@ -128,18 +127,14 @@ def enumerate_placements(request, task, tile, allow_source=True,
                                       for node in participating)
             p=(route_in.reliability*route_out.reliability*down.reliability
                *node_reliability)
-            compute_e=(hstate.compute_power_w * work
-                       / max(hstate.compute_rate, 1.0))
             isl_bits=(input_transfer_bits*max(len(route_in.path)-1,0)
                       + output_transfer_bits*max(len(route_out.path)-1,0))
             comm_bits=(
                 isl_bits
                 + output_transfer_bits*max(len(down.path)-1,0)
             )
-            # Ground transmit energy is accounted once by the evaluator.
-            comm_e=hstate.comms_power_w*isl_bits/200e6
             out.append(Placement(helper,agg,down.arrival-request.sim_time,p,
-                compute_e+comm_e,comm_bits,route_in.path,route_out.path,down.path))
+                comm_bits,route_in.path,route_out.path,down.path))
     return out
 
 def independent_success(placements):

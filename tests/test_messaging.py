@@ -16,7 +16,7 @@ def _request(*, link_rate=1_000.0, link_close=10.0, include_helper=True):
     states = {
         name: SatelliteView(
             name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+            reliability=0.99,
         )
         for name in names
     }
@@ -193,7 +193,7 @@ def test_local_view_preserves_contacts_through_unknown_relays():
     states = {
         name: SatelliteView(
             name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+            reliability=0.99,
         )
         for name in ("src", "helper")
     }
@@ -233,7 +233,7 @@ def test_local_view_preserves_contacts_through_unknown_relays():
 def test_ordi_waits_until_next_epoch_before_retrying():
     state = SatelliteView(
         "src", True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-        compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        reliability=0.99,
     )
     tile = SimpleNamespace(
         tile_id=0, n_replicas_max=1, d_in_bits=100.0,
@@ -269,11 +269,11 @@ def test_ordi_planning_uses_residual_contact_capacity():
     states = {
         "src": SatelliteView(
             "src", True, 1.0, 9_000.0, 10_000.0, 25.0, 0.0,
-            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+            reliability=0.99,
         ),
         "helper": SatelliteView(
             "helper", True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+            reliability=0.99,
         ),
     }
     contacts = (

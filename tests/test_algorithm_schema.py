@@ -31,7 +31,7 @@ def test_controls_encode_distinct_replication_rules():
     tile=SimpleNamespace(tile_id=0,n_replicas_max=2,d_in_bits=1000.0,
                          d_out_bits=100.0,compute_ops=1e6,utility=1.0)
     task=SimpleNamespace(task_id=1,source_sat="SAT_00_00",deadline=120.0,tiles=[tile])
-    states={sid:SatelliteView(sid,True,1e9,9000,10000,25,0,10,5,0.98)
+    states={sid:SatelliteView(sid,True,1e9,9000,10000,25,0,reliability=0.98)
             for sid in ("SAT_00_00","SAT_01_00")}
     contacts=(ContactWindow("SAT_00_00","SAT_01_00",0,60,1e6,"isl",0.97),
               ContactWindow("SAT_01_00","SAT_00_00",0,60,1e6,"isl",0.97),

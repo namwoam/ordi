@@ -7,6 +7,9 @@ from ordi.faults.injector import FaultEvent, FaultInjector
 from ordi.algorithms import Assignment, Decision, ExperimentConfig
 from ordi.sim.reliability import ReliabilityModel
 from ordi.sim.satellite import SatelliteParams, SatelliteState
+from ordi.sim.basilisk_backend import Workload, _communication_power_w
+from ordi.orbit._contact_types import DOWNLINK_RATE_BPS, ISL_RATE_BPS
+from ordi.sim.basilisk_backend import BasiliskBackend, Workload
 
 
 def _state(sat_id: str, rate_gflops: float = 1.0) -> SatelliteState:
@@ -26,6 +29,21 @@ def _state(sat_id: str, rate_gflops: float = 1.0) -> SatelliteState:
 
 
 class StateTransitionTests(unittest.TestCase):
+    def test_packet_workload_drives_basilisk_communication_power(self):
+        params = _state("sat").params
+        workload = Workload(
+            tx_bits=2.0 * ISL_RATE_BPS,
+            rx_bits=3.0 * ISL_RATE_BPS,
+            downlink_bits=1.0 * DOWNLINK_RATE_BPS,
+        )
+
+        power_w = _communication_power_w(workload, params, 10.0)
+
+        expected_active_seconds = 3.0 + params.rx_power_fraction * 3.0
+        self.assertAlmostEqual(
+            power_w, params.comms_power_w * expected_active_seconds / 10.0
+        )
+
     def test_straggler_multiplier_is_applied_to_projected_state(self):
         state = _state("sat")
         injector = FaultInjector(
@@ -61,6 +79,55 @@ class StateTransitionTests(unittest.TestCase):
         self.assertEqual(
             {name: state.B_i for name, state in states.items()}, batteries_before
         )
+
+    def test_backend_compute_queue_persists_and_drives_later_epoch_power(self):
+        state = _state("sat", rate_gflops=1.0)
+        compute_sink = SimpleNamespace(nodePowerOut=0.0, powerStatus=0)
+        communication_sink = SimpleNamespace(
+            nodePowerOut=0.0, powerStatus=0,
+        )
+        thermal_sensor = SimpleNamespace(
+            sensorPowerDraw=0.0, sensorPowerStatus=0,
+        )
+        dynamics = SimpleNamespace(
+            computeSink=compute_sink,
+            communicationSink=communication_sink,
+            thermalSensor=thermal_sensor,
+            battery_charge=state.B_i,
+            temperature_c=state.Theta_i,
+        )
+
+        class FakeSatellite:
+            name = "sat"
+
+            def __init__(self):
+                self.dynamics = dynamics
+
+            @staticmethod
+            def is_alive():
+                return True
+
+        fake_satellite = FakeSatellite()
+        backend = BasiliskBackend.__new__(BasiliskBackend)
+        backend.epoch_length_s = 60.0
+        backend.states = {"sat": state}
+        backend.sat_ids = ["sat"]
+        backend._work = {"sat": Workload()}
+        backend.env = SimpleNamespace(
+            satellites=[fake_satellite], step=lambda _actions: None,
+        )
+
+        backend.submit({"sat": Workload(compute_flops=90e9)})
+
+        self.assertAlmostEqual(state.Q_i, 30e9)
+        self.assertAlmostEqual(compute_sink.nodePowerOut, -10.0)
+        self.assertAlmostEqual(thermal_sensor.sensorPowerDraw, 10.0)
+
+        backend.submit({})
+
+        self.assertAlmostEqual(state.Q_i, 0.0)
+        self.assertAlmostEqual(compute_sink.nodePowerOut, -5.0)
+        self.assertAlmostEqual(thermal_sensor.sensorPowerDraw, 5.0)
 
     def test_synthetic_experiment_loop_calls_state_transition(self):
         state = _state("sat")

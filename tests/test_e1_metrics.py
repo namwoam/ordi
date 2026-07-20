@@ -35,7 +35,7 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
             1, index, "src", helpers=(helper,), aggregators=(helper,),
             metadata={
                 "reliability": 1.0, "latency": latency,
-                "energy_j": 10.0, "protocol_header_bits": 10.0,
+                "protocol_header_bits": 10.0,
                 "protocol_message_count": 4,
                 "protocol_ground_bits": 30.0,
                 "handshake_control_bits": 20.0,
@@ -57,7 +57,7 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
     metrics = compute_metrics(
         decision, [task], 0.0,
         {"src": 10_000.0, "h1": 10_000.0, "h2": 10_000.0},
-        downlink_power_w=0.0,
+        physical_energy_j=20.0,
     )
 
     assert metrics.delivery_latency_p50_s == pytest.approx(20.0)

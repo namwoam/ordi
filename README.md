@@ -14,7 +14,7 @@ ORDI schedules each image tile over a rolling horizon. For every epoch it:
 
 1. Builds feasible source-helper-aggregator routes from a time-expanded orbital contact graph.
 2. Accounts for compute rate, battery, temperature, queue state, availability, latency, and link reliability.
-3. Selects a primary assignment by marginal utility after energy and communication costs.
+3. Selects a primary assignment by marginal utility and communication congestion; policies do not estimate joules.
 4. Adds backups up to a configurable cap only while their marginal reliability gain exceeds their replication cost, while keeping replicas fault-disjoint. The default cap is one.
 5. Replans work affected by helper failures, missed contacts, or stragglers.
 
@@ -97,7 +97,9 @@ Orbit, eclipse, power, battery, thermal, and spacecraft availability state are
 simulated by Basilisk 2.11 through the BSK-RL multi-satellite environment. ORDI
 is an ordinary scheduling policy: it consumes BSK-RL/Basilisk state and owns
 tile placement, redundancy, bandwidth allocation, and store-and-forward
-routing. Skyfield/SGP4 remains only as an optional independent contact-window
+routing. Compute, ISL transmit/receive, and downlink workloads drive Basilisk
+power nodes; reported workload energy comes from those nodes rather than from
+policy metadata. Skyfield/SGP4 remains only as an optional independent contact-window
 cross-check, not as the mission simulator.
 
 On first use Basilisk downloads its official support data (gravity and SPICE

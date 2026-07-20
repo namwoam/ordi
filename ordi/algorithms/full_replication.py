@@ -45,7 +45,6 @@ class FullReplication:
                     metadata={
                         "latency": min(p.latency for p in unique),
                         "reliability": tile_success(local, task, unique),
-                        "energy_j": sum(p.energy_j for p in unique),
                         "replication": "full",
                         "data_shards": 1,
                         "shard_groups": tuple(range(len(unique))),
@@ -94,7 +93,6 @@ class FullReplication:
                 metadata.update({
                     "latency": execution.delivery_time - request.sim_time,
                     "reliability": tile_success(local, task, accepted),
-                    "energy_j": sum(p.energy_j for p in accepted),
                     "shard_groups": tuple(range(len(accepted))),
                     "effective_replicas": len(accepted),
                     "protocol_header_bits": self.messages.header_bits,

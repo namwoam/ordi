@@ -404,6 +404,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     # Basilisk/BSK-RL is the sole owner of orbit, eclipse, power, battery,
     # thermal, availability, and data-state evolution for synthetic runs.
     physical_backend = None
+    physical_energy_j = 0.0
     if state_driver is None:
         from ordi.sim.basilisk_backend import BasiliskBackend
         physical_backend = BasiliskBackend(
@@ -451,10 +452,11 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                 committed[(a.task_id, a.tile_id)] = a
                 newly_committed.append(a)
         if state_driver is None:
-            physical_backend.submit(_advance_synthetic_states(
+            epoch_energy_j = physical_backend.submit(_advance_synthetic_states(
                 newly_committed, tasks, states, cfg.epoch_length,
                 protocol_events=result.message_events,
             ))
+            physical_energy_j += float(epoch_energy_j or 0.0)
         if injector:
             injector.withdraw_epoch(epoch + 1)
 
@@ -469,13 +471,9 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             "advertisement_control_bits": protocol_control_bits,
         },
     )
-    # Use the actual constellation radio profile (measurement-backed when the
-    # Atlas params factory is used) rather than the synthetic 5 W default.
-    downlink_power_w = (sum(s.params.comms_power_w for s in states.values())
-                        / len(states) if states else 0.0)
     m = compute_metrics(
         res, tasks, 0.0, sat_cap, cfg.alpha,
-        downlink_power_w=downlink_power_w,
+        physical_energy_j=physical_energy_j,
     )
     r_total = sum(max(0, float(a.metadata.get(
         "effective_replicas", len(a.helpers))) - 1) for a in final)
@@ -514,7 +512,6 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     views = {sid: SatelliteView(
         sid, bool(state.A_i), state.C_i, state.B_i,
         state.params.battery_j, state.Theta_i, state.Q_i,
-        state.params.compute_power_w, state.params.comms_power_w,
         reliability.node_pi(sid),
     ) for sid, state in states.items()}
     contacts = []
@@ -617,7 +614,6 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         sched = scheduler_class(
             split_options=cfg.seco_split_options,
             halo_fraction=cfg.split_halo_fraction,
-            battery_reserve_frac=cfg.battery_reserve_frac,
         )
     else:
         try:

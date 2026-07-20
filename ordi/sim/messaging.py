@@ -423,17 +423,7 @@ class MessageSimulator:
                     compute_done = compute_start + work / max(
                         state.compute_rate, 1.0
                     )
-                    compute_energy = (
-                        state.compute_power_w * work
-                        / max(state.compute_rate, 1.0)
-                    )
-                    reserve = float(assignment.metadata.get(
-                        "battery_reserve_frac", 0.0
-                    )) * state.battery_capacity_j
-                    accepted = (
-                        compute_done <= task.deadline + 1e-9
-                        and state.battery_j - compute_energy >= reserve
-                    )
+                    accepted = compute_done <= task.deadline + 1e-9
                 from ordi.algorithms._common import earliest_route
                 response_route = earliest_route(
                     request, message.receiver, {task.source_sat},

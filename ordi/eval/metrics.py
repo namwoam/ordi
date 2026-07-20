@@ -21,7 +21,6 @@ from typing import Dict, List, Set, Tuple
 from ordi.algorithms import Decision
 from ordi.sim.reliability import ReliabilityModel
 from ordi.tasks.generator import EOTask
-from ordi.sim.satellite import DEFAULT_COMMS_POWER_W, DEFAULT_DOWNLINK_RATE_BPS
 
 
 @dataclass
@@ -83,10 +82,12 @@ def compute_metrics(
     epoch_start: float,
     sat_compute_capacity: Dict[str, float],   # sat_id → FLOP budget (C_i·epoch length, summed over the horizon for lifetime records)
     alpha: float = 0.002,
-    downlink_power_w: float = DEFAULT_COMMS_POWER_W,
-    downlink_rate_bps: float = DEFAULT_DOWNLINK_RATE_BPS,
+    physical_energy_j: float = 0.0,
 ) -> EpochMetrics:
     m = EpochMetrics(epoch=result.epoch)
+    # Energy is measured from the workload power nodes integrated by Basilisk.
+    # Decision metadata is intentionally not an energy authority.
+    m.energy_joules = max(0.0, float(physical_energy_j))
 
     tile_lookup: Dict[tuple, EOTask] = {}
     for task in tasks:
@@ -163,7 +164,6 @@ def compute_metrics(
                     m.isl_traffic_bits += tile.d_in_bits * input_fraction
                 if helper != aggregator:
                     m.isl_traffic_bits += tile.d_out_bits * output_fraction
-        m.energy_joules += float(assignment.metadata.get("energy_j", 0.0))
         advertisement_bits = float(
             assignment.metadata.get("advertisement_control_bits", 0.0)
         )
@@ -185,9 +185,9 @@ def compute_metrics(
                     and event.kind in {"split_accept", "replica_accept"}):
                 helper_accepts += 1
 
-        # Every delivered tile incurs spacecraft-to-ground transmit energy.
         # Normal inference schedulers downlink the compact result; direct and
         # compression baselines record their raw/compressed size explicitly.
+        # Basilisk accounts for the corresponding transmitter power.
         if reliability > 0.0 and not math.isinf(latency):
             downlink_bits = float(assignment.metadata.get(
                 "protocol_ground_bits",
@@ -197,10 +197,6 @@ def compute_metrics(
                 ),
             ))
             m.downlink_volume_bits += downlink_bits
-            if not assignment.metadata.get("includes_downlink_energy", False):
-                m.energy_joules += (
-                    downlink_power_w * downlink_bits / downlink_rate_bps
-                )
 
     # Partial coverage per task
     for tid, total in task_total.items():

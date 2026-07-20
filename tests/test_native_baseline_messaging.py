@@ -14,7 +14,7 @@ def _request(epoch=0, sim_time=0.0, helper_available=True):
         name: SatelliteView(
             name, helper_available if name == "helper" else True,
             1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
-            compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+            reliability=0.99,
         )
         for name in ("src", "helper")
     }

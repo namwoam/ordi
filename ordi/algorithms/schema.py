@@ -12,15 +12,13 @@ class SatelliteView:
     battery_capacity_j: float
     temperature_c: float
     queued_flops: float
-    compute_power_w: float = 0.0
-    comms_power_w: float = 0.0
     reliability: float = 0.99
 
     @classmethod
     def from_state(cls, sat_id, state):
         return cls(sat_id, bool(state.A_i), state.C_i, state.B_i,
                    state.params.battery_j, state.Theta_i, state.Q_i,
-                   state.params.compute_power_w, state.params.comms_power_w)
+                   reliability=0.99)
 
 @dataclass(frozen=True)
 class ContactWindow:
@@ -61,7 +59,6 @@ class ExperimentConfig:
     # every internal boundary, so total input and compute grow with the split.
     seco_split_options: tuple[int, ...] = (1, 2, 4)
     split_halo_fraction: float = 0.05
-    battery_reserve_frac: float = 0.15
 
 @dataclass(frozen=True)
 class EpochInput:

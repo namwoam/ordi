@@ -42,7 +42,6 @@ class RandomReplication:
                     metadata={
                         "latency": min(p.latency for p in selected),
                         "reliability": tile_success(local, task, selected),
-                        "energy_j": sum(p.energy_j for p in selected),
                         "replication": "random",
                         "data_shards": 1,
                         "shard_groups": tuple(range(len(selected))),
@@ -91,7 +90,6 @@ class RandomReplication:
                 metadata.update({
                     "latency": execution.delivery_time - request.sim_time,
                     "reliability": tile_success(local, task, accepted),
-                    "energy_j": sum(p.energy_j for p in accepted),
                     "shard_groups": tuple(range(len(accepted))),
                     "effective_replicas": len(accepted),
                     "protocol_header_bits": self.messages.header_bits,

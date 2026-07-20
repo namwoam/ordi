@@ -11,7 +11,7 @@ from ordi.eval.experiments import _advance_synthetic_states
 def _state(name, rate=1e9, battery=10_000.0):
     return SatelliteView(
         name, True, rate, battery, 10_000.0, 25.0, 0.0,
-        compute_power_w=10.0, comms_power_w=5.0, reliability=0.99,
+        reliability=0.99,
     )
 
 

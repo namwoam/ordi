@@ -11,21 +11,48 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
 
-# ── default hardware parameters (Jetson Orin NX class) ───────────────────────
-DEFAULT_COMPUTE_RATE_GFLOPS = 20.0       # nominal TOPS (FP16)
-DEFAULT_BATTERY_WH          = 25.0       # 25 Wh typical 3U cubesat
-DEFAULT_BATTERY_MIN_FRAC    = 0.15       # keep 15% reserve
-DEFAULT_THERMAL_INIT_C      = 25.0       # initial chip temperature
-DEFAULT_THERMAL_MAX_C       = 80.0       # throttle threshold
-DEFAULT_SOLAR_POWER_W       = 8.0        # average harvested power (sunlit fraction ~55%)
-DEFAULT_IDLE_POWER_W        = 3.0        # platform power when not computing
-DEFAULT_COMPUTE_POWER_W     = 15.0       # incremental power during full compute
-DEFAULT_COMMS_POWER_W       = 5.0        # incremental ISL/downlink Tx power
-DEFAULT_DOWNLINK_RATE_BPS   = 100e6      # 100 Mbps RF ground downlink
-DEFAULT_THERMAL_AMBIENT_C   = 20.0       # effective ambient (radiative sink)
-DEFAULT_THERMAL_AREA_M2     = 0.01       # exposed payload radiator area
+# ── default hardware parameters ──────────────────────────────────────────────
+# Workload-level sustained throughput assumption, not device nameplate TOPS.
+# Individual experiments should override it with workload measurements.
+DEFAULT_COMPUTE_RATE_GFLOPS = 20.0
+# Representative small-CubeSat capacity between EnduroSat's 20.8 Wh flight
+# pack and AAC Clyde Space's 30 Wh smallest OPTIMUS configuration.
+# https://one.endurosat.com/
+# https://www.aac-clyde.space/what-we-do/space-products-components/cubesat-batteries
+DEFAULT_BATTERY_WH          = 25.0
+# Explicit ORDI operational-reserve policy; not a battery hardware limit.
+DEFAULT_BATTERY_MIN_FRAC    = 0.15
+# Controlled initial condition used before Basilisk evolves thermal state.
+DEFAULT_THERMAL_INIT_C      = 25.0
+# Conservative design limit below NVIDIA's 99 C software throttle point.
+# https://docs.nvidia.com/jetson/archives/r36.2/DeveloperGuide/SD/PlatformPowerAndPerformance/JetsonOrinNanoSeriesJetsonOrinNxSeriesAndJetsonAgxOrinSeries.html
+DEFAULT_THERMAL_MAX_C       = 80.0
+# EnduroSat 3U body panel specifies up to 8.4 W in LEO.
+# https://www.endurosat.com/products/3u-solar-panel/
+DEFAULT_SOLAR_POWER_W       = 8.0
+# Representative 3U platform load; Alen Space specifies 0.5--5.9 W average.
+# https://www.cubesatshop.com/wp-content/uploads/2023/05/Alen-Space_Platforms-1U-6U.pdf
+DEFAULT_IDLE_POWER_W        = 3.0
+# NVIDIA Orin NX supports a documented 15 W reference power mode.
+# https://developer.nvidia.com/blog/nvidia-jetpack-6-2-brings-super-mode-to-nvidia-jetson-orin-nano-and-jetson-orin-nx-modules/
+DEFAULT_COMPUTE_POWER_W     = 15.0
+# DLR OSIRIS4CubeSat: 8.5 W operating power at 100 Mbit/s.
+# https://elib.dlr.de/187010/1/2022_ICSOS_CubeSat.pdf
+DEFAULT_COMMS_POWER_W       = 8.5        # active optical terminal / Tx power
+# O4C does not publish a mode-separated Rx value; use the ESA COPINS S-band
+# ISL reference (1 W Rx versus 3 W Tx) as an explicit cross-technology proxy.
+# https://www.esa.int/Enabling_Support/Preparing_for_the_Future/Discovery_and_Preparation/Announcement_of_opportunity_3_AIM_CubeSat_opportunity_payloads_COPINS
+DEFAULT_RX_POWER_FRACTION   = 1.0 / 3.0  # receive power relative to Tx power
+# DLR OSIRIS4CubeSat specifies 100 Mbit/s optical downlink operation.
+# https://elib.dlr.de/187010/1/2022_ICSOS_CubeSat.pdf
+DEFAULT_DOWNLINK_RATE_BPS   = 100e6
+# The following three are explicit lumped-thermal-model assumptions.
+DEFAULT_THERMAL_AMBIENT_C   = 20.0       # effective radiative sink
+DEFAULT_THERMAL_AREA_M2     = 0.01       # 10 cm x 10 cm radiator
 DEFAULT_THERMAL_MASS_KG     = 0.5        # thermally active payload mass
-DEFAULT_SPECIFIC_HEAT       = 900.0      # aluminium-like heat capacity (J/kg/K)
+# NIST room-temperature aluminum specific heat is about 900 J/(kg K).
+# https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=101567
+DEFAULT_SPECIFIC_HEAT       = 900.0
 
 
 @dataclass
@@ -40,8 +67,10 @@ class SatelliteParams:
     idle_power_w: float = DEFAULT_IDLE_POWER_W
     compute_power_w: float = DEFAULT_COMPUTE_POWER_W
     comms_power_w: float = DEFAULT_COMMS_POWER_W
+    rx_power_fraction: float = DEFAULT_RX_POWER_FRACTION
     thermal_ambient_c: float = DEFAULT_THERMAL_AMBIENT_C
     thermal_area_m2: float = DEFAULT_THERMAL_AREA_M2
+    # Assumed surface properties; these must be replaced for a known coating.
     thermal_absorptivity: float = 0.2
     thermal_emissivity: float = 0.8
     thermal_mass_kg: float = DEFAULT_THERMAL_MASS_KG
