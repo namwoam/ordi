@@ -60,6 +60,29 @@ Or invoke the Python entry point directly:
 uv run python -m ordi.main run E1
 ```
 
+To measure scheduler headroom without changing the production algorithms, run
+the exact reduced-instance oracle:
+
+```bash
+uv run python -m ordi.eval.oracle --seeds 8
+```
+
+It exhaustively searches admission, ordering, and the six best unsplit routes
+for four requests under the shared compute/contact feasibility model. Results
+are written to `results/oracle_gap.csv`; the bound is exact for this declared
+reduced action space, not for full E1.
+
+The more comprehensive stochastic oracle adds multiple release epochs,
+persistent resource ledgers, optional fault-disjoint backups, and matched
+plane/helper/ISL fault scenarios:
+
+```bash
+uv run python -m ordi.eval.stochastic_oracle --seeds 8
+```
+
+Its expected-utility and deadline-miss gaps are written to
+`results/stochastic_oracle_gap.csv`.
+
 Available evaluations are:
 
 | ID | Evaluation |
