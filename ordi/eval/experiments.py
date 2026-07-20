@@ -15,6 +15,8 @@ Shared realistic LEO-EO simulation setup (all experiments unless overridden):
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
   - Tasks: mean 16 requests/orbit in a clustered hot-source process. Half of
     parent events generate 2–4 same-source requests within 60 s.
+  - E1 amplifies one clustered same-area burst to 16× inference work while
+    preserving its data volume and deadlines, creating explicit compute pressure.
   - Each request is a 4096×4096 scene split into sixteen 1024×1024 tiles.
   - Deadlines are log-normal (σ=0.6), with medians wildfire 600 s, ship
     900 s, change 1800 s, and cloud_filter 5760 s (one orbit).
@@ -78,12 +80,44 @@ def _worker_count(n_jobs: int) -> int:
 
 # ── simulation bootstrap ──────────────────────────────────────────────────────
 
+def _intensify_one_area_burst(tasks, compute_multiplier):
+    """Amplify one clustered same-area request burst for compute contention."""
+    if compute_multiplier <= 1.0 or not tasks:
+        return None
+    grouped = {}
+    for task in tasks:
+        grouped.setdefault(task.burst_id, []).append(task)
+    candidates = [
+        group for group in grouped.values() if len(group) > 1
+    ] or list(grouped.values())
+
+    def pressure(group):
+        work = sum(
+            tile.compute_ops for task in group for tile in task.tiles
+        )
+        slack = min(max(task.deadline_slack, 60.0) for task in group)
+        return work / slack
+
+    selected = max(
+        candidates,
+        key=lambda group: (
+            pressure(group), len(group), -group[0].burst_id
+        ),
+    )
+    for task in selected:
+        for tile in task.tiles:
+            tile.compute_ops *= compute_multiplier
+        task.intense_area = True
+    return selected[0].burst_id, len(selected)
+
+
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                deadline_lognorm_sigma=0.6,
                arrival_rate=16.0, ground_stations=None,
                orbit_period_s=5760.0,
                burst_probability=0.5, burst_size_range=(2, 4),
                burst_window_s=60.0,
+               intense_area_compute_multiplier=1.0,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=25.0, satellite_params_factory=None,
                n_replicas_max=2):
@@ -93,6 +127,9 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     burst_probability     : share of parent events that create hot-source bursts.
     burst_size_range      : inclusive request-count range for a burst.
     burst_window_s        : release-time spread within a burst.
+    intense_area_compute_multiplier:
+                            multiplier applied to one highest-pressure clustered
+                            burst; 1.0 disables the compute hotspot.
     deadline_slack        : global deadline scale (reference = 600 s).  Per-type medians
                             (wildfire 600 s, ship 900 s, change 1800 s,
                             cloud_filter 5760 s)
@@ -161,6 +198,15 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         fov_range_km=fov_range_km,
         n_replicas_max=n_replicas_max,
     )
+    intense = _intensify_one_area_burst(
+        tasks, intense_area_compute_multiplier
+    )
+    if intense is not None:
+        burst_id, request_count = intense
+        print(
+            f"  Intensified area burst {burst_id}: {request_count} requests "
+            f"at {intense_area_compute_multiplier:.1f}× compute"
+        )
     cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
 
     return sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg
@@ -191,7 +237,7 @@ def _assignment_viable(a: Assignment, states) -> bool:
     for label, alive in zip(shard_groups, viable):
         grouped.setdefault(label, []).append(alive)
     return any(
-        len(group) == required and all(group)
+        len(group) >= required and sum(group) >= required
         for group in grouped.values()
     )
 
@@ -564,6 +610,7 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         sched = scheduler_class(
             max_replicas=cfg.max_backups + 1,
             split_options=cfg.ordi_split_options,
+            coded_options=cfg.ordi_coded_options,
             halo_fraction=cfg.split_halo_fraction,
         )
     elif scheduler_class is SECOAdapted:
@@ -760,6 +807,7 @@ _E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
                         deadline_lognorm_sigma=0.6,
                         burst_probability=0.5,
                         burst_size_range=(2, 4), burst_window_s=60.0,
+                        intense_area_compute_multiplier=16.0,
                         min_elevation_deg=25.0)
 
 E1_METRIC_KEYS = [
@@ -789,6 +837,10 @@ def run_E1(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     with a mean of 16 requests per orbit. Half of parent events create 2–4
     same-source requests within 60 s, producing realistic hot-source queues
     while preserving the requested mean rate.
+
+    One same-area burst is amplified to 16× inference work without changing
+    its input/output volume or deadlines. This creates a localized compute
+    hotspot while leaving the rest of the workload unchanged.
 
     All experiments use six globally distributed ground stations and a 25°
     minimum elevation angle. Relay policies must therefore improve on a

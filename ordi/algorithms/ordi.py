@@ -19,6 +19,7 @@ from ordi.sim.messaging import MessageSimulator
 @dataclass(frozen=True)
 class _LocalPlan:
     shard_count: int
+    fanout_count: int
     placements: tuple
     work_fraction: float
     input_fraction: float
@@ -41,7 +42,7 @@ class ORDI:
     name = "ordi"
 
     def __init__(self, max_replicas=2, split_options=(1, 2, 4),
-                 halo_fraction=0.05, shard_count=None):
+                 coded_options=(), halo_fraction=0.05, shard_count=None):
         # shard_count is retained as a compatibility hook for controlled tests
         # and ablations. Normal evaluation uses dynamic split_options.
         if shard_count is not None:
@@ -49,6 +50,11 @@ class ORDI:
         self.max_replicas = max(1, max_replicas)
         self.split_options = tuple(sorted({
             max(1, int(count)) for count in split_options
+        }))
+        self.coded_options = tuple(sorted({
+            (int(required), int(fanout))
+            for required, fanout in coded_options
+            if 1 <= int(required) < int(fanout)
         }))
         self.halo_fraction = max(0.0, halo_fraction)
         self.resources = DecisionFeasibilityModel()
@@ -124,8 +130,29 @@ class ORDI:
             - weights.communication * placement.communication_bits
         )
 
-    def _local_plan(self, request, task, tile, shard_count):
-        """Let the receiving source node assess one local split action."""
+    @staticmethod
+    def _at_least_k_probability(probabilities, required):
+        """Probability that at least ``required`` independent shards succeed."""
+        distribution = [1.0] + [0.0] * len(probabilities)
+        completed = 0
+        for probability in probabilities:
+            completed += 1
+            for successes in range(completed, 0, -1):
+                distribution[successes] = (
+                    distribution[successes] * (1.0 - probability)
+                    + distribution[successes - 1] * probability
+                )
+            distribution[0] *= 1.0 - probability
+        return sum(distribution[required:])
+
+    @staticmethod
+    def _group_latency(placements, required):
+        return sorted(p.latency for p in placements)[required - 1]
+
+    def _local_plan(self, request, task, tile, shard_count,
+                    fanout_count=None):
+        """Assess an ordinary split or an any-k-of-n coded fan-out."""
+        fanout_count = shard_count if fanout_count is None else fanout_count
         input_fraction = (
             1.0 + self.halo_fraction * (shard_count - 1)
         ) / shard_count
@@ -157,14 +184,14 @@ class ORDI:
             ),
             reverse=True,
         )
-        if len(ranked) < shard_count:
+        if len(ranked) < fanout_count:
             return None
 
-        placements = tuple(ranked[:shard_count])
-        latency = max(p.latency for p in placements)
+        placements = tuple(ranked[:fanout_count])
+        latency = self._group_latency(placements, shard_count)
         source_p = request.satellites[task.source_sat].reliability
-        reliability = source_p * math.prod(
-            p.reliability for p in placements
+        reliability = source_p * self._at_least_k_probability(
+            [p.reliability for p in placements], shard_count
         )
         energy = sum(p.energy_j for p in placements)
         communication = sum(p.communication_bits for p in placements)
@@ -173,9 +200,12 @@ class ORDI:
             * math.exp(-request.weights.freshness * latency)
             - request.weights.energy * energy
             - request.weights.communication * communication
+            - request.weights.replication
+            * (fanout_count / shard_count - 1.0)
         )
         return _LocalPlan(
-            shard_count, placements, work_fraction, input_fraction,
+            shard_count, fanout_count, placements,
+            work_fraction, input_fraction,
             output_fraction, latency, reliability, energy, communication,
             value,
         )
@@ -186,6 +216,12 @@ class ORDI:
             self._local_plan(request, task, tile, count)
             for count in self.split_options
         ]
+        candidates.extend(
+            self._local_plan(
+                request, task, tile, required, fanout
+            )
+            for required, fanout in self.coded_options
+        )
         feasible = [plan for plan in candidates if plan is not None]
         if not feasible:
             return None
@@ -193,11 +229,32 @@ class ORDI:
         return plan if plan.value > 0 else None
 
     @staticmethod
-    def _group_probability(placements):
-        return math.prod(p.reliability for p in placements)
+    def _group_probability(placements, required=None):
+        required = len(placements) if required is None else required
+        return ORDI._at_least_k_probability(
+            [p.reliability for p in placements], required
+        )
+
+    @staticmethod
+    def _route_satellite_nodes(placement, source, ground_stations):
+        """Satellites whose failure can couple this placement to a backup."""
+        return {
+            node
+            for path in (
+                placement.route_in,
+                placement.route_out,
+                placement.route_down,
+            )
+            for node in path
+            if node != source and node not in ground_stations
+        }
 
     def _decide_backup(self, request, task, tile, primary):
         """Let the receiving node optionally create a full redundant group."""
+        # A coded primary already carries intra-group redundancy. Avoid adding
+        # another complete coded group in the same scheduling pass.
+        if primary.fanout_count > primary.shard_count:
+            return None
         if min(self.max_replicas,
                getattr(tile, "n_replicas_max", 1)) <= 1:
             return None
@@ -212,17 +269,20 @@ class ORDI:
         used_helpers = {p.helper for p in primary.placements}
         used_planes = {plane(p.helper) for p in primary.placements}
         used_nodes = {
-            node for p in primary.placements
-            for node in p.route_in + p.route_out
+            node
+            for placement in primary.placements
+            for node in self._route_satellite_nodes(
+                placement, task.source_sat, request.ground_stations
+            )
         }
         best_by_helper = {}
         for candidate in choices:
-            candidate_nodes = set(candidate.route_in + candidate.route_out)
+            candidate_nodes = self._route_satellite_nodes(
+                candidate, task.source_sat, request.ground_stations
+            )
             if (candidate.helper in used_helpers
                     or plane(candidate.helper) in used_planes
-                    or used_nodes.intersection(
-                        candidate_nodes - {task.source_sat}
-                    )):
+                    or used_nodes.intersection(candidate_nodes)):
                 continue
             current = best_by_helper.get(candidate.helper)
             if (current is None
@@ -239,8 +299,10 @@ class ORDI:
             return None
         backup = tuple(ranked[:q])
         source_p = request.satellites[task.source_sat].reliability
-        primary_p = self._group_probability(primary.placements)
-        backup_p = self._group_probability(backup)
+        primary_p = self._group_probability(
+            primary.placements, primary.shard_count
+        )
+        backup_p = self._group_probability(backup, primary.shard_count)
         reliability_gain = source_p * (1.0 - primary_p) * backup_p
         gain = (
             tile.utility * reliability_gain
@@ -343,7 +405,10 @@ class ORDI:
                     for _ in group
                 )
                 group_probabilities = [
-                    self._group_probability(group) for group in groups
+                    self._group_probability(
+                        group, primary.shard_count
+                    )
+                    for group in groups
                 ]
                 source_p = local_request.satellites[
                     task.source_sat
@@ -351,15 +416,23 @@ class ORDI:
                 reliability = source_p * (
                     1.0 - math.prod(1.0 - p for p in group_probabilities)
                 )
-                latency = min(max(p.latency for p in group) for group in groups)
+                latency = min(
+                    self._group_latency(group, primary.shard_count)
+                    for group in groups
+                )
                 energy = sum(p.energy_j for p in selected)
                 communication = sum(p.communication_bits for p in selected)
+                redundancy_factor = (
+                    sum(len(group) for group in groups)
+                    / primary.shard_count
+                )
                 objective = (
                     tile.utility * reliability
                     * math.exp(-request.weights.freshness * latency)
                     - request.weights.energy * energy
                     - request.weights.communication * communication
-                    - request.weights.replication * (len(groups) - 1)
+                    - request.weights.replication
+                    * (redundancy_factor - 1.0)
                 )
                 assignment = Assignment(
                     task.task_id, tile.tile_id, task.source_sat,
@@ -373,8 +446,12 @@ class ORDI:
                         "partitioned": primary.shard_count > 1,
                         "data_shards": primary.shard_count,
                         "split_count": primary.shard_count,
+                        "fanout_shards": primary.fanout_count,
+                        "coded": (
+                            primary.fanout_count > primary.shard_count
+                        ),
                         "shard_groups": group_labels,
-                        "effective_replicas": len(groups),
+                        "effective_replicas": redundancy_factor,
                         "energy_j": energy,
                         "objective": objective,
                         "state_observer": task.source_sat,

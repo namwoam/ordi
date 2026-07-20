@@ -255,6 +255,7 @@ class MessageSimulator:
         control_bits = 0.0
         ground_bits = 0.0
         executed_shards = set()
+        required = int(assignment.metadata.get("data_shards", 1))
 
         terminal = [
             local for local in assignment.node_decisions
@@ -354,6 +355,11 @@ class MessageSimulator:
         while event_queue:
             now, _order, event, message, _path = heapq.heappop(event_queue)
             if now > task.deadline + 1e-9:
+                if any(
+                    len(times) >= required
+                    for times in completed.values()
+                ):
+                    continue
                 raise InvalidDecisionError(
                     f"protocol message {message.message_id} misses deadline"
                 )
@@ -488,10 +494,10 @@ class MessageSimulator:
             elif message.kind == "result_shard":
                 completed.setdefault(message.group_id, []).append(now)
 
-        required = int(assignment.metadata.get("data_shards", 1))
         complete_groups = [
-            max(times) for times in completed.values()
-            if len(times) == required
+            sorted(times)[required - 1]
+            for times in completed.values()
+            if len(times) >= required
         ]
         if not complete_groups:
             raise InvalidDecisionError(

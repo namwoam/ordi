@@ -51,6 +51,10 @@ class ExperimentConfig:
     # A receiving ORDI node chooses the number of compute shards per tile.
     # Redundancy, when selected, creates another complete shard group.
     ordi_split_options: tuple[int, ...] = (1, 2, 4)
+    # Optional MDS-style coded fan-out: (k, n) completes after any k of n
+    # distinct helper results. Disabled by default until a workload benefits
+    # enough to offset the additional compute and communication.
+    ordi_coded_options: tuple[tuple[int, int], ...] = ()
     plane_disjoint_backup: bool = False
     # SECO-aligned processing model.  A captured image tile may be split into
     # this many parallel shards.  Spatial splitting duplicates a small halo at

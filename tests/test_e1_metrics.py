@@ -85,8 +85,15 @@ def test_e1_exports_reliability_latency_cost_and_decentralization_metrics():
     assert required <= set(E1_METRIC_KEYS)
 
 
-def test_e1_plot_uses_exported_normalized_isl_traffic():
+def test_e1_plot_exposes_important_operational_metrics():
     plotted = {metric for metric, _scale, _title in E1_PLOT_METRICS}
 
-    assert "isl_traffic_bits_per_delivered_tile" in plotted
+    assert plotted == {
+        "realized_miss_ratio",
+        "delivery_latency_p95_s",
+        "isl_traffic_bits_per_delivered_tile",
+        "downlink_bits_per_delivered_tile",
+        "energy_j_per_delivered_tile",
+        "compute_load_balance",
+    }
     assert "isl_traffic_bits" not in plotted

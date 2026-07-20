@@ -38,9 +38,29 @@ ALG_LABELS = {
 E1_PLOT_METRICS = (
     ("realized_miss_ratio", 1.0, "Deadline Miss Ratio (↓)"),
     (
+        "delivery_latency_p95_s",
+        60.0,
+        "P95 Delivery Latency (min) (↓)",
+    ),
+    (
         "isl_traffic_bits_per_delivered_tile",
         1e6,
         "ISL Traffic / Delivered Tile (Mbit) (↓)",
+    ),
+    (
+        "downlink_bits_per_delivered_tile",
+        1e6,
+        "Downlink / Delivered Tile (Mbit) (↓)",
+    ),
+    (
+        "energy_j_per_delivered_tile",
+        1.0,
+        "Energy / Delivered Tile (J) (↓)",
+    ),
+    (
+        "compute_load_balance",
+        1.0,
+        "Compute Load Balance (Jain Index) (↑)",
     ),
 )
 
@@ -82,7 +102,8 @@ def plot_E1():
     colors = [ALG_COLORS.get(a, "#888") for a in algs]
     labels = [ALG_LABELS.get(a, a) for a in algs]
 
-    fig, axes = plt.subplots(1, len(E1_PLOT_METRICS), figsize=(10, 4))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes = axes.ravel()
 
     for ax, (metric, scale, title) in zip(axes, E1_PLOT_METRICS):
         vals = [_float(r, metric) / scale for r in rows]
@@ -92,13 +113,34 @@ def plot_E1():
         ax.set_title(title, fontsize=9)
         ax.set_xticks(range(len(algs)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+        if metric in {"realized_miss_ratio", "compute_load_balance"}:
+            ax.set_ylim(0.0, 1.05)
+        else:
+            upper = max(
+                (value + error for value, error in zip(vals, errs)),
+                default=0.0,
+            )
+            ax.set_ylim(0.0, max(1.0, upper * 1.18))
+        value_labels = [
+            "0" if abs(value) < 1e-12
+            else f"{value:.2f}" if value < 10.0
+            else f"{value:.1f}" if value < 100.0
+            else f"{value:.0f}"
+            for value in vals
+        ]
+        ax.bar_label(bars, labels=value_labels, padding=2, fontsize=6)
         # Highlight ORDI bar
         for bar, alg in zip(bars, algs):
             if alg == "ORDI":
                 bar.set_edgecolor("black")
                 bar.set_linewidth(2)
 
-    plt.tight_layout()
+    fig.suptitle(
+        "E1 Core Performance: Reliability, Latency, and Resource Cost",
+        fontsize=12,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     path = os.path.join(FIGURES_DIR, "E1_core.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()

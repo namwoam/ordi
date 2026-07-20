@@ -378,7 +378,8 @@ def compute_realized_metrics(
     if n_tiles == 0:
         return base
 
-    scored = []  # (task_id, tile, latency, alternative shard groups, source)
+    # (task_id, tile, latency, [(components, required), ...], source)
+    scored = []
     for a in result.assignments:
         key = (a.task_id, a.tile_id)
         if key not in tile_lookup:
@@ -395,7 +396,7 @@ def compute_realized_metrics(
             if reliability_estimate > 0 and not math.isinf(latency):
                 aggregator = a.aggregators[0] if a.aggregators else a.source
                 scored.append((task_obj.task_id, tile, latency,
-                               [[(("__none__",), (), aggregator)]],
+                               [([(("__none__",), (), aggregator)], 1)],
                                task_obj.source_sat))
             else:
                 scored.append((task_obj.task_id, tile, latency, [],
@@ -412,13 +413,13 @@ def compute_realized_metrics(
             for label, component in zip(shard_labels, comps):
                 by_group.setdefault(label, []).append(component)
             groups = [
-                group for group in by_group.values()
-                if len(group) == required
+                (group, required) for group in by_group.values()
+                if len(group) >= required
             ]
         elif required > 1:
-            groups = [comps] if len(comps) == required else []
+            groups = [(comps, required)] if len(comps) >= required else []
         else:
-            groups = [[component] for component in comps]
+            groups = [([component], 1) for component in comps]
         scored.append((task_obj.task_id, tile, latency, groups,
                        task_obj.source_sat))
 
@@ -458,12 +459,15 @@ def compute_realized_metrics(
             task_total[tid] = task_total.get(tid, 0) + 1
             delivered = False
             if groups and node_ok(src):
-                delivered = any(all(
-                    all(node_ok(n) for n in nodes)
-                    and all(link_ok(link) for link in isl_links)
-                    and down_ok(agg)
-                    for nodes, isl_links, agg in group
-                ) for group in groups)
+                delivered = any(
+                    sum(
+                        all(node_ok(n) for n in nodes)
+                        and all(link_ok(link) for link in isl_links)
+                        and down_ok(agg)
+                        for nodes, isl_links, agg in group
+                    ) >= required
+                    for group, required in groups
+                )
             if delivered:
                 util += tile.utility * math.exp(-alpha * L_hat)
                 task_delivered[tid] = task_delivered.get(tid, 0) + 1

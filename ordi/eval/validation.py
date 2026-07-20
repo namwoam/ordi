@@ -273,11 +273,6 @@ class DecisionFeasibilityModel:
                 raise InvalidDecisionError(
                     f"assignment {key} performs neither compute nor downlink"
                 )
-            if any(finish > task.deadline + 1e-9 for finish in finishes):
-                raise InvalidDecisionError(
-                    f"assignment {key} finishes after deadline "
-                    f"t={task.deadline:.6f}"
-                )
 
             required = int(assignment.metadata.get("data_shards", 1))
             required = max(1, required)
@@ -299,16 +294,22 @@ class DecisionFeasibilityModel:
                 grouped = {}
                 for label, finish in zip(shard_groups, finishes):
                     grouped.setdefault(label, []).append(finish)
-                if any(len(group) != required for group in grouped.values()):
+                if any(len(group) < required for group in grouped.values()):
                     raise InvalidDecisionError(
-                        f"assignment {key} must provide exactly {required} "
+                        f"assignment {key} must provide at least {required} "
                         "shards in every reconstruction group"
                     )
                 feasible_delivery = min(
-                    max(group) for group in grouped.values()
+                    sorted(group)[required - 1]
+                    for group in grouped.values()
                 )
             else:
                 feasible_delivery = sorted(finishes)[required - 1]
+            if feasible_delivery > task.deadline + 1e-9:
+                raise InvalidDecisionError(
+                    f"assignment {key} finishes after deadline "
+                    f"t={task.deadline:.6f}"
+                )
             if not retime and feasible_delivery > modeled_finish + 1e-6:
                 raise InvalidDecisionError(
                     f"assignment {key} reports delivery at "
