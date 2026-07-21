@@ -353,6 +353,7 @@ def compute_realized_metrics(
     alpha: float = 0.002,
     n_trials: int = 200,
     seed: int = 0,
+    reliability_epoch_s: float = 60.0,
 ) -> EpochMetrics:
     """Monte Carlo realized-outcome scoring.
 
@@ -367,9 +368,11 @@ def compute_realized_metrics(
     can be compared directly. Deterministic cost metrics (ISL, downlink,
     energy, replicas) come from compute_metrics.
 
-    Shared draws across replicas make correlated structural failures (a plane
-    or a shared aggregator taking down several replicas at once) show up in the
-    realized numbers instead of being hidden by the independence assumption.
+    Node survival is sampled once per reliability epoch, not once for the whole
+    experiment. Link and downlink outcomes are sampled once per scheduled
+    transfer, keyed by its completion epoch. Draws remain shared by replicas
+    using the same component in the same epoch, preserving structural
+    correlation without turning a three-orbit run into one Bernoulli event.
     """
     # Deterministic cost metrics + structure come from the modeled pass.
     base = compute_metrics(result, tasks, 0.0, {}, alpha)
@@ -383,7 +386,10 @@ def compute_realized_metrics(
     if n_tiles == 0:
         return base
 
-    # (task_id, tile, latency, [(components, required), ...], source)
+    if reliability_epoch_s <= 0.0:
+        raise ValueError("reliability_epoch_s must be positive")
+
+    # (task_id, tile, latency, groups, source, active_start, active_end)
     scored = []
     for a in result.assignments:
         key = (a.task_id, a.tile_id)
@@ -391,6 +397,12 @@ def compute_realized_metrics(
             continue
         task_obj, tile = tile_lookup[key]
         latency = float(a.metadata.get("latency", math.inf))
+        active_start = float(a.metadata.get("scheduled_at", 0.0))
+        active_end = float(a.metadata.get(
+            "delivery_time", active_start + latency
+        ))
+        if not math.isfinite(active_end):
+            active_end = active_start
         reliability_estimate = float(a.metadata.get(
             "reliability", a.metadata.get("reconstruction_probability", 0.0)
         ))
@@ -402,10 +414,10 @@ def compute_realized_metrics(
                 aggregator = a.aggregators[0] if a.aggregators else a.source
                 scored.append((task_obj.task_id, tile, latency,
                                [([(("__none__",), (), aggregator)], 1)],
-                               task_obj.source_sat))
+                               task_obj.source_sat, active_start, active_end))
             else:
                 scored.append((task_obj.task_id, tile, latency, [],
-                               task_obj.source_sat))
+                               task_obj.source_sat, active_start, active_end))
             continue
         comps = [_replica_components(
             h, g, task_obj.source_sat,
@@ -426,7 +438,7 @@ def compute_realized_metrics(
         else:
             groups = [([component], 1) for component in comps]
         scored.append((task_obj.task_id, tile, latency, groups,
-                       task_obj.source_sat))
+                       task_obj.source_sat, active_start, active_end))
 
     rng = random.Random(seed)
     miss_trials = []
@@ -434,41 +446,58 @@ def compute_realized_metrics(
     cvg_trials = []
 
     for _ in range(n_trials):
-        node_alive: Dict[str, bool] = {}
-        link_alive: Dict[Tuple[str, str], bool] = {}
-        down_alive: Dict[str, bool] = {}
+        node_alive: Dict[Tuple[str, int], bool] = {}
+        link_alive: Dict[Tuple[Tuple[str, str], int], bool] = {}
+        down_alive: Dict[Tuple[str, int], bool] = {}
 
-        def node_ok(nid: str) -> bool:
+        def period_at(timestamp: float) -> int:
+            return int(math.floor(max(0.0, timestamp) / reliability_epoch_s))
+
+        def active_periods(start: float, end: float):
+            first = period_at(start)
+            last = period_at(max(start, end - 1e-9))
+            return range(first, last + 1)
+
+        def node_ok(nid: str, period: int) -> bool:
             if nid == "__none__":
                 return True
-            if nid not in node_alive:
-                node_alive[nid] = rng.random() < reliability.node_pi(nid)
-            return node_alive[nid]
+            key = (nid, period)
+            if key not in node_alive:
+                node_alive[key] = rng.random() < reliability.node_pi(nid)
+            return node_alive[key]
 
-        def link_ok(pair: Tuple[str, str]) -> bool:
-            if pair not in link_alive:
-                link_alive[pair] = rng.random() < reliability.link_pi(pair[0], pair[1], "isl")
-            return link_alive[pair]
+        def link_ok(pair: Tuple[str, str], period: int) -> bool:
+            key = (pair, period)
+            if key not in link_alive:
+                link_alive[key] = (
+                    rng.random() < reliability.link_pi(pair[0], pair[1], "isl")
+                )
+            return link_alive[key]
 
-        def down_ok(nid: str) -> bool:
-            if nid not in down_alive:
-                down_alive[nid] = rng.random() < reliability.downlink_pi(nid)
-            return down_alive[nid]
+        def down_ok(nid: str, period: int) -> bool:
+            key = (nid, period)
+            if key not in down_alive:
+                down_alive[key] = rng.random() < reliability.downlink_pi(nid)
+            return down_alive[key]
 
         n_miss = 0
         util = 0.0
         task_delivered: Dict[int, int] = {}
         task_total: Dict[int, int] = {}
 
-        for tid, tile, L_hat, groups, src in scored:
+        for tid, tile, L_hat, groups, src, active_start, active_end in scored:
             task_total[tid] = task_total.get(tid, 0) + 1
             delivered = False
-            if groups and node_ok(src):
+            periods = tuple(active_periods(active_start, active_end))
+            transfer_period = periods[-1]
+            if groups and all(node_ok(src, period) for period in periods):
                 delivered = any(
                     sum(
-                        all(node_ok(n) for n in nodes)
-                        and all(link_ok(link) for link in isl_links)
-                        and down_ok(agg)
+                        all(node_ok(n, period) for n in nodes
+                            for period in periods)
+                        and all(link_ok(link, transfer_period)
+                                for link in isl_links)
+                        and down_ok(agg, transfer_period)
                         for nodes, isl_links, agg in group
                     ) >= required
                     for group, required in groups

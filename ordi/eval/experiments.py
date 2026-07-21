@@ -365,6 +365,12 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     cfg = ORDIConfig(
         epoch_length=EPOCH_LENGTH_S,
         background_compute_utilization=background_compute_utilization,
+        n_planes=n_planes,
+        sats_per_plane=sats_per_plane,
+        orbit_altitude_km=orbit_altitude_km,
+        orbit_inclination_deg=orbit_inclination_deg,
+        min_elevation_deg=min_elevation_deg,
+        ground_stations=tuple(ground_stations),
     )
 
     return sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg
@@ -372,18 +378,90 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
 
 # ── stateful rolling-horizon helpers ──────────────────────────────────────────
 
-def _assignment_group_viability(a: Assignment, states):
-    """Return reconstruction-group viability before delivery completes."""
+def _path_viable(path, states, disrupted_links):
+    """Whether every satellite and directed ISL edge on a path is usable."""
+    for node in path:
+        state = states.get(node)
+        if state is not None and not state.A_i:
+            return False
+    return not any(
+        (source, target) in disrupted_links
+        for source, target in zip(path, path[1:])
+        if source in states and target in states
+    )
+
+
+def _assignment_group_viability(a: Assignment, states, injector=None,
+                                sim_time=None):
+    """Return reconstruction-group viability under current route faults.
+
+    Shared validation records the end of input, compute, result-forwarding, and
+    downlink phases. A fault only invalidates phases that have not completed;
+    older assignments without phase metadata use the conservative whole-route
+    fallback.
+    """
+    disrupted = injector.disrupted_links() if injector else set()
+    missed_downlinks = (
+        injector.missed_downlink_satellites() if injector else set()
+    )
     if not a.helpers:
         source = states.get(a.source)
-        alive = source is not None and bool(source.A_i)
+        source_release = float(a.metadata.get(
+            "source_release_time", a.metadata.get("delivery_time", math.inf)
+        ))
+        source_needed = sim_time is None or sim_time < source_release - 1e-9
+        path = tuple(a.metadata.get("path", ()))
+        downlink_source = path[-2] if len(path) >= 2 else a.source
+        alive = (
+            not source_needed
+            or (
+                source is not None and bool(source.A_i)
+                and _path_viable(path, states, disrupted)
+                and downlink_source not in missed_downlinks
+            )
+        )
         return {0: alive}
     viable = []
-    for helper, aggregator in zip(a.helpers, a.aggregators):
+    phase_ends = a.metadata.get("replica_phase_ends", ())
+    routes = getattr(a, "routes", ())
+    assignment_source = getattr(a, "source", "")
+    for index, (helper, aggregator) in enumerate(
+            zip(a.helpers, a.aggregators)):
         h = states.get(helper)
         g = states.get(aggregator)
+        if index < len(routes):
+            route_in, route_out, route_down = routes[index]
+        else:
+            route_in = (assignment_source, helper)
+            route_out = (helper, aggregator)
+            route_down = (aggregator,)
+        if index < len(phase_ends) and sim_time is not None:
+            input_done, compute_done, output_done, delivery_done = phase_ends[index]
+            check_in = sim_time < input_done - 1e-9
+            check_compute = (
+                sim_time >= input_done - 1e-9
+                and sim_time < compute_done - 1e-9
+            )
+            check_out = (
+                sim_time >= compute_done - 1e-9
+                and sim_time < output_done - 1e-9
+            )
+            check_down = (
+                sim_time >= output_done - 1e-9
+                and sim_time < delivery_done - 1e-9
+            )
+        else:
+            check_in = check_compute = check_out = check_down = True
+        downlink_source = route_down[-2] if len(route_down) >= 2 else aggregator
         viable.append(bool(
-            h is not None and g is not None and h.A_i and g.A_i
+            (not check_in or _path_viable(route_in, states, disrupted))
+            and (not check_compute or (h is not None and h.A_i))
+            and (not check_out or _path_viable(route_out, states, disrupted))
+            and (not check_down or (
+                g is not None and g.A_i
+                and _path_viable(route_down, states, disrupted)
+                and downlink_source not in missed_downlinks
+            ))
         ))
     required = max(1, int(a.metadata.get("data_shards", 1)))
     shard_groups = a.metadata.get("shard_groups")
@@ -400,7 +478,7 @@ def _assignment_group_viability(a: Assignment, states):
     }
 
 
-def _assignment_viable(a: Assignment, states, sim_time=None) -> bool:
+def _assignment_viable(a: Assignment, states, sim_time=None, injector=None) -> bool:
     """In-flight tile survives if any replica's helper+aggregator are both alive
     (a surviving backup avoids re-transmission). Completed deliveries are final;
     an unfinished direct downlink still depends on its source satellite."""
@@ -416,7 +494,9 @@ def _assignment_viable(a: Assignment, states, sim_time=None) -> bool:
             return True
         source = states.get(a.source)
         return source is not None and bool(source.A_i)
-    return any(_assignment_group_viability(a, states).values())
+    return any(_assignment_group_viability(
+        a, states, injector=injector, sim_time=sim_time
+    ).values())
 
 
 def _uncommitted_tasks(pending, committed):
@@ -454,12 +534,25 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
     isl_tx_bits = {sat_id: 0.0 for sat_id in states}
     rx_bits = {sat_id: 0.0 for sat_id in states}
     downlink_bits = {sat_id: 0.0 for sat_id in states}
+    tx_intervals = {sat_id: [] for sat_id in states}
+    rx_intervals = {sat_id: [] for sat_id in states}
+
+    def add_interval(sender, receiver, start, finish):
+        if sender in tx_intervals:
+            tx_intervals[sender].append((float(start), float(finish)))
+        if receiver in rx_intervals:
+            rx_intervals[receiver].append((float(start), float(finish)))
 
     for assignment in assignments:
         source_and_tile = tile_by_key.get((assignment.task_id, assignment.tile_id))
         if source_and_tile is None:
             continue
         source, tile = source_and_tile
+        timed_communication = tuple(
+            assignment.metadata.get("communication_intervals", ())
+        )
+        for sender, receiver, start, finish, _kind in timed_communication:
+            add_interval(sender, receiver, start, finish)
 
         # Direct-downlink assignments have no compute replica.
         if not assignment.helpers:
@@ -529,6 +622,23 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
                 if aggregator in downlink_bits:
                     downlink_bits[aggregator] += bits
 
+        # Older/unvalidated assignments have no shared-ledger trace. Preserve
+        # timing from their protocol events instead of collapsing it to bits.
+        if not timed_communication:
+            from ordi.orbit._contact_types import (
+                DOWNLINK_RATE_BPS, ISL_RATE_BPS,
+            )
+            for event in assignment.message_events:
+                if event.event != "hop_sent":
+                    continue
+                rate = (
+                    ISL_RATE_BPS if event.peer in states
+                    else DOWNLINK_RATE_BPS
+                )
+                add_interval(
+                    event.node, event.peer, event.time,
+                    event.time + event.bits / max(rate, 1.0),
+                )
         for event in assignment.message_events:
             if (event.event == "hop_sent"
                     and event.kind in {
@@ -549,13 +659,20 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
                 isl_tx_bits[event.node] += event.bits
             if event.peer in rx_bits:
                 rx_bits[event.peer] += event.bits
+            from ordi.orbit._contact_types import ISL_RATE_BPS
+            add_interval(
+                event.node, event.peer, event.time,
+                event.time + event.bits / max(ISL_RATE_BPS, 1.0),
+            )
 
     # Physical evolution is deliberately delegated to Basilisk/BSK-RL.  Keep
     # this function as a workload translator for callers that own a backend.
     from ordi.sim.basilisk_backend import Workload
     return {
         sid: Workload(compute_flops=compute_work[sid], tx_bits=isl_tx_bits[sid],
-                      rx_bits=rx_bits[sid], downlink_bits=downlink_bits[sid])
+                      rx_bits=rx_bits[sid], downlink_bits=downlink_bits[sid],
+                      tx_intervals=tuple(tx_intervals[sid]),
+                      rx_intervals=tuple(rx_intervals[sid]))
         for sid in states
     }
 
@@ -578,14 +695,21 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     # keeps helper utilization consistent with thermal/straggler rate changes
     # and excludes epochs in which a satellite is unavailable.
     sat_cap = {s: 0.0 for s in sat_ids}
-    # Basilisk/BSK-RL is the sole owner of orbit, eclipse, power, battery,
-    # thermal, availability, and data-state evolution for synthetic runs.
+    # Basilisk/BSK-RL owns eclipse, power, battery, thermal, availability, and
+    # data-state evolution. Its Walker elements and epoch are synchronized with
+    # the Skyfield contact/acquisition orbit built above.
     physical_backend = None
     physical_energy_j = 0.0
     if state_driver is None:
         from ordi.sim.basilisk_backend import BasiliskBackend
         physical_backend = BasiliskBackend(
-            sat_ids, states, cfg.epoch_length, seed=realized_seed
+            sat_ids, states, cfg.epoch_length, seed=realized_seed,
+            n_planes=cfg.n_planes,
+            sats_per_plane=cfg.sats_per_plane,
+            orbit_altitude_km=cfg.orbit_altitude_km,
+            orbit_inclination_deg=cfg.orbit_inclination_deg,
+            min_elevation_deg=cfg.min_elevation_deg,
+            ground_stations=cfg.ground_stations,
         )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], Assignment] = {}
@@ -635,7 +759,9 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                     )
                     feedback_reported.add(key)
                 continue
-            groups = _assignment_group_viability(assignment, states)
+            groups = _assignment_group_viability(
+                assignment, states, injector=injector, sim_time=ep_start
+            )
             primary_alive = groups.get(0, next(iter(groups.values()), False))
             any_alive = any(groups.values())
             if not primary_alive and any_alive:
@@ -981,7 +1107,8 @@ def _run_parallel(shared: Tuple, job_args: List[Tuple],
     return {args[0]: results[args[0]] for args in job_args}
 
 
-def _resolve_fault_specs(fault_specs, sat_ids, tasks) -> List[FaultEvent]:
+def _resolve_fault_specs(fault_specs, sat_ids, tasks,
+                         graphs=None) -> List[FaultEvent]:
     """Translate declarative fault specs into FaultEvents post-build.
 
     Spec forms (build-dependent targets cannot be resolved by the caller):
@@ -998,8 +1125,10 @@ def _resolve_fault_specs(fault_specs, sat_ids, tasks) -> List[FaultEvent]:
     for spec in fault_specs:
         if spec[0] == "random_schedule":
             _tag, rate, rng_seed = spec
-            faults.extend(random_fault_schedule(sat_ids, N_EPOCHS,
-                                                fault_rate=rate, seed=rng_seed))
+            faults.extend(random_fault_schedule(
+                sat_ids, N_EPOCHS, fault_rate=rate, seed=rng_seed,
+                graphs=graphs,
+            ))
             continue
         ft, start, dur, targets = spec[:4]
         params = spec[4] if len(spec) > 4 else {}
@@ -1034,7 +1163,9 @@ def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
     for job in jobs:
         key, alg_name, cls, fault_specs, cfg_overrides = (tuple(job) + (None, None))[:5]
         faults = (None if fault_specs is None
-                  else _resolve_fault_specs(fault_specs, sat_ids, tasks))
+                  else _resolve_fault_specs(
+                      fault_specs, sat_ids, tasks, graphs=graphs
+                  ))
         job_cfg = cfg
         if cfg_overrides:
             job_cfg = deepcopy(cfg)

@@ -41,7 +41,7 @@ class DecisionFeasibilityModel:
             self.ground_compute_ready_at.copy(),
         )
 
-    def _reserve_hop(self, request, source, target, bits, start):
+    def _reserve_hop(self, request, source, target, bits, start, trace=None):
         candidates = sorted(
             (contact for contact in request.contacts
              if contact.source == source and contact.target == target),
@@ -64,17 +64,21 @@ class DecisionFeasibilityModel:
                 continue
             self.contact_residual_bits[key] = residual - bits
             self.contact_ready_at[key] = finish
+            if trace is not None:
+                trace.append(
+                    (source, target, depart, finish, contact.kind)
+                )
             return finish
         raise InvalidDecisionError(
             f"no residual contact capacity for {source}->{target} "
             f"({bits:.3f} bits after t={start:.6f})"
         )
 
-    def _reserve_path(self, request, path, bits, start):
+    def _reserve_path(self, request, path, bits, start, trace=None):
         now = start
         for source, target in zip(path, path[1:]):
             now = self._reserve_hop(
-                request, source, target, bits, now
+                request, source, target, bits, now, trace=trace
             )
         return now
 
@@ -124,14 +128,17 @@ class DecisionFeasibilityModel:
         # algorithm sees identical residual contact capacity.
         reserved_advertisements = set()
         for event in decision.message_events:
+            reservation_key = (
+                event.message_id, event.node, event.peer, event.time
+            )
             if (event.kind != "state_advertisement"
                     or event.event != "hop_sent"
-                    or event.message_id in reserved_advertisements):
+                    or reservation_key in reserved_advertisements):
                 continue
             trial._reserve_hop(
                 request, event.node, event.peer, event.bits, event.time
             )
-            reserved_advertisements.add(event.message_id)
+            reserved_advertisements.add(reservation_key)
 
         for assignment in decision.assignments:
             key = (assignment.task_id, assignment.tile_id)
@@ -142,22 +149,28 @@ class DecisionFeasibilityModel:
                     f"assignment references unknown task/tile {key}"
                 )
 
+            communication_intervals = []
             reserved_handshakes = set()
             for event in assignment.message_events:
+                reservation_key = (
+                    event.message_id, event.node, event.peer, event.time
+                )
                 if (event.event != "hop_sent"
                         or event.kind not in {
                             "split_request", "split_accept", "split_reject",
                             "replica_request", "replica_accept",
                             "replica_reject",
                         }
-                        or event.message_id in reserved_handshakes):
+                        or reservation_key in reserved_handshakes):
                     continue
                 trial._reserve_hop(
-                    request, event.node, event.peer, event.bits, event.time
+                    request, event.node, event.peer, event.bits, event.time,
+                    trace=communication_intervals,
                 )
-                reserved_handshakes.add(event.message_id)
+                reserved_handshakes.add(reservation_key)
 
             finishes = []
+            replica_phase_ends = []
             source_release_time = None
             if assignment.downlink_only:
                 path = tuple(assignment.metadata.get("path", ()))
@@ -169,7 +182,8 @@ class DecisionFeasibilityModel:
                     "downlink_bits", tile.d_in_bits
                 ))
                 downlink_finish = trial._reserve_path(
-                    request, path, bits, request.sim_time
+                    request, path, bits, request.sim_time,
+                    trace=communication_intervals,
                 )
                 source_release_time = downlink_finish
                 ground_work = float(assignment.metadata.get(
@@ -286,23 +300,31 @@ class DecisionFeasibilityModel:
                         request, route_in,
                         tile.d_in_bits * input_fraction
                         + protocol_header_bits,
-                        request.sim_time,
+                        request.sim_time, trace=communication_intervals,
                     )
+                    input_done = now
                     now = trial._reserve_compute(
                         request, helper,
                         tile.compute_ops * work_fraction, now,
                     )
+                    compute_done = now
                     now = trial._reserve_path(
                         request, route_out,
                         tile.d_out_bits * output_fraction
                         + protocol_header_bits, now,
+                        trace=communication_intervals,
                     )
+                    output_done = now
                     now = trial._reserve_path(
                         request, route_down,
                         tile.d_out_bits * output_fraction
                         + protocol_header_bits, now,
+                        trace=communication_intervals,
                     )
                     finishes.append(now)
+                    replica_phase_ends.append(
+                        (input_done, compute_done, output_done, now)
+                    )
 
             if not finishes:
                 raise InvalidDecisionError(
@@ -357,6 +379,11 @@ class DecisionFeasibilityModel:
                 metadata["delivery_time"] = feasible_delivery
                 if source_release_time is not None:
                     metadata["source_release_time"] = source_release_time
+                if replica_phase_ends:
+                    metadata["replica_phase_ends"] = tuple(replica_phase_ends)
+                metadata["communication_intervals"] = tuple(
+                    communication_intervals
+                )
                 ground_work = float(metadata.get("ground_compute_flops", 0.0))
                 ground_rate = float(metadata.get(
                     "ground_compute_rate_flops_per_s", 0.0

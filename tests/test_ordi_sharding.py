@@ -8,6 +8,8 @@ from ordi.algorithms import (
 )
 from ordi.algorithms._common import plane
 from ordi.eval.experiments import _advance_synthetic_states, _assignment_viable
+from ordi.faults.injector import FaultEvent, FaultInjector
+from ordi.sim.reliability import ReliabilityModel
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 
@@ -165,6 +167,38 @@ def test_direct_downlink_requires_source_only_until_delivery():
 
     assert not _assignment_viable(assignment, states, sim_time=60.0)
     assert _assignment_viable(assignment, states, sim_time=100.0)
+
+
+def test_inflight_route_fault_invalidates_only_unfinished_phase():
+    assignment = SimpleNamespace(
+        source="src", helpers=("helper",), aggregators=("helper",),
+        routes=((
+            ("src", "relay", "helper"),
+            ("helper",),
+            ("helper", "ground"),
+        ),),
+        metadata={
+            "delivery_time": 240.0,
+            "replica_phase_ends": ((120.0, 180.0, 180.0, 240.0),),
+            "data_shards": 1, "shard_groups": (0,),
+        },
+    )
+    states = {
+        name: SimpleNamespace(A_i=True)
+        for name in ("src", "relay", "helper")
+    }
+    injector = FaultInjector(states, ReliabilityModel(), [])
+    injector.schedule(FaultEvent(
+        "isl_disruption", 0, 2, ["src:relay"]
+    ))
+    injector.apply_epoch(0)
+
+    assert not _assignment_viable(
+        assignment, states, sim_time=60.0, injector=injector
+    )
+    assert _assignment_viable(
+        assignment, states, sim_time=130.0, injector=injector
+    )
 
 
 def test_backup_disjointness_includes_downlink_relays():

@@ -58,6 +58,15 @@ class ExperimentConfig:
     # Recurring non-ORDI accelerator demand. The physical queue receives this
     # fraction of one epoch's capacity before each scheduling round.
     background_compute_utilization: float = 0.0
+    # Physical-environment configuration.  These values are populated by the
+    # experiment builder and passed unchanged to Basilisk so its eclipse/power
+    # orbit is the same Walker shell used to generate contacts and acquisitions.
+    n_planes: int = 6
+    sats_per_plane: int = 6
+    orbit_altitude_km: float = 550.0
+    orbit_inclination_deg: float = 53.0
+    min_elevation_deg: float = 25.0
+    ground_stations: tuple[tuple[str, float, float], ...] = ()
 
 @dataclass(frozen=True)
 class EpochInput:

@@ -76,6 +76,26 @@ class FaultInjector:
         """Register a fault to be applied at its start_epoch."""
         self._scheduled.append(fault)
 
+    def disrupted_links(self) -> Set[Tuple[str, str]]:
+        """Directed ISL edges disabled by currently active hard faults."""
+        links = set()
+        for fault in self._active:
+            if fault.fault_type != "isl_disruption":
+                continue
+            for link_str in fault.targets:
+                a, b = link_str.split(":")
+                links.update(((a, b), (b, a)))
+        return links
+
+    def missed_downlink_satellites(self) -> Set[str]:
+        """Satellites whose ground contact is currently unavailable."""
+        return {
+            sat_id
+            for fault in self._active
+            if fault.fault_type == "ground_contact_miss"
+            for sat_id in fault.targets
+        }
+
     def apply_epoch(self, epoch: int):
         """Apply all faults that start at this epoch."""
         for fault in self._scheduled:
@@ -109,7 +129,13 @@ class FaultInjector:
                 for sat_id in fault.targets:
                     if sat_id in self.states:
                         state = self.states[sat_id]
-                        state.Theta_i = state.params.thermal_max_c + 5.0
+                        factor = max(
+                            0.0, min(1.0, fault.params.get("factor", 0.5))
+                        )
+                        state._environment_thermal_multiplier = factor
+                        state.Theta_i = (
+                            state.params.thermal_max_c - 10.0 * factor
+                        )
                         state.C_i = state._effective_compute_rate()
                         state._update_availability()
             elif fault.fault_type == "straggler":
@@ -190,9 +216,14 @@ class FaultInjector:
             for sat_id in fault.targets:
                 if sat_id in self.states:
                     s = self.states[sat_id]
-                    snapshot[sat_id] = s._thermal_rate_multiplier
-                    s._thermal_rate_multiplier *= factor
-                    s.Theta_i = s.params.thermal_max_c + 5.0
+                    snapshot[sat_id] = s._environment_thermal_multiplier
+                    s._environment_thermal_multiplier = max(
+                        0.0, min(1.0, factor)
+                    )
+                    s.Theta_i = (
+                        s.params.thermal_max_c
+                        - 10.0 * s._environment_thermal_multiplier
+                    )
                     s.C_i = s._effective_compute_rate()
                     s._update_availability()
 
@@ -247,9 +278,8 @@ class FaultInjector:
             for sat_id in fault.targets:
                 if sat_id in self.states:
                     s = self.states[sat_id]
-                    # Restore temperature below throttle threshold.
                     if sat_id in snapshot:
-                        s._thermal_rate_multiplier = snapshot[sat_id]
+                        s._environment_thermal_multiplier = snapshot[sat_id]
                     s.Theta_i = s.params.thermal_ambient_c
                     s.C_i = s._effective_compute_rate()
                     s.recover()
@@ -345,6 +375,7 @@ def random_fault_schedule(
     n_epochs: int,
     fault_rate: float = 0.05,   # probability of a fault occurring per epoch
     seed: int = 42,
+    graphs: Optional[List[EpochContactGraph]] = None,
 ) -> List[FaultEvent]:
     """
     Generate a randomized fault schedule at a given fault_rate.
@@ -357,8 +388,27 @@ def random_fault_schedule(
             ft = rng.choice(RANDOM_FAULT_TYPES)
             target = rng.choice(sat_ids)
             if ft == "isl_disruption":
-                other = rng.choice([s for s in sat_ids if s != target])
+                active_edges = []
+                if graphs and epoch < len(graphs):
+                    active_edges = [
+                        (a, b) for a, b, _rate, _cap, kind in graphs[epoch].edges
+                        if kind == "isl" and a in sat_ids and b in sat_ids
+                    ]
+                if active_edges:
+                    target, other = rng.choice(active_edges)
+                else:
+                    other = rng.choice([s for s in sat_ids if s != target])
                 faults.append(FaultEvent(ft, epoch, 2, [f"{target}:{other}"]))
+            elif ft == "ground_contact_miss":
+                active_sources = []
+                if graphs and epoch < len(graphs):
+                    active_sources = [
+                        a for a, _b, _rate, _cap, kind in graphs[epoch].edges
+                        if kind == "downlink" and a in sat_ids
+                    ]
+                if active_sources:
+                    target = rng.choice(active_sources)
+                faults.append(FaultEvent(ft, epoch, rng.randint(1, 3), [target]))
             else:
                 faults.append(FaultEvent(ft, epoch, rng.randint(1, 3), [target]))
     return faults

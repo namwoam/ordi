@@ -77,6 +77,19 @@ def test_retiming_preserves_decision_metadata_and_events():
     assert accepted.message_events == decision.message_events
 
 
+def test_retiming_records_exact_communication_intervals():
+    accepted = DecisionFeasibilityModel().validate_and_reserve(
+        _request(contact_bits=200.0), _replicated_decision(), retime=True
+    )
+
+    intervals = accepted.assignments[0].metadata["communication_intervals"]
+    assert len(intervals) == 6
+    assert {kind for _src, _dst, _start, _finish, kind in intervals} == {
+        "isl", "downlink",
+    }
+    assert all(finish > start for _src, _dst, start, finish, _kind in intervals)
+
+
 def test_model_side_admission_drops_only_invalid_assignments():
     decision = replace(
         _replicated_decision(),

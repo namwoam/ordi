@@ -135,14 +135,21 @@ Experiment CSV files are written to `results/`. Generated plots are written to `
 
 ## Orbit Propagation
 
-Orbit, eclipse, power, battery, thermal, and spacecraft availability state are
-simulated by Basilisk 2.11 through the BSK-RL multi-satellite environment. ORDI
-is an ordinary scheduling policy: it consumes BSK-RL/Basilisk state and owns
-tile placement, redundancy, bandwidth allocation, and store-and-forward
-routing. Compute, ISL transmit/receive, and downlink workloads drive Basilisk
-power nodes; reported workload energy comes from those nodes rather than from
-policy metadata. Skyfield/SGP4 remains only as an optional independent contact-window
-cross-check, not as the mission simulator.
+Eclipse, power, battery, thermal, and spacecraft availability state are
+simulated by Basilisk 2.11 through the BSK-RL multi-satellite environment.
+Skyfield/SGP4 generates the contact and acquisition windows from the same
+Walker elements, epoch, ground stations, and elevation mask passed to Basilisk;
+the two backends therefore describe one synchronized constellation. ORDI is an
+ordinary scheduling policy: it consumes BSK-RL/Basilisk state and owns tile
+placement, redundancy, bandwidth allocation, and store-and-forward routing.
+Compute, ISL transmit/receive, and downlink workloads drive Basilisk power
+nodes; reported workload energy comes from those nodes rather than from policy
+metadata. Communication loads retain the shared contact ledger's absolute
+start/end times, so future and multi-epoch transfers draw power only while
+their reserved hops operate. Basilisk's measured temperature is projected to
+accelerator capacity with a pre-throttle region over the final 10 C below the
+configured safety limit, while the battery reserve and temperature limit
+control availability.
 
 On first use Basilisk downloads its official support data (gravity and SPICE
 ephemerides) through `pooch`; set `BSK_SUPPORT_DATA_CACHE` to a writable shared

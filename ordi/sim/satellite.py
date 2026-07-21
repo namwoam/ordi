@@ -110,6 +110,8 @@ class SatelliteState:
     _injected_failure: bool = False
     _compute_rate_multiplier: float = 1.0
     _thermal_rate_multiplier: float = 1.0
+    _environment_thermal_multiplier: float = 1.0
+    _platform_alive: bool = True
 
     def __post_init__(self):
         self.C_i = self.params.compute_rate_flops_per_s
@@ -119,13 +121,39 @@ class SatelliteState:
     # ── availability ─────────────────────────────────────────────────────────
 
     def _update_availability(self):
-        if self._injected_failure:
+        if self._injected_failure or not self._platform_alive:
             self.A_i = 0
             return
-        if self.B_i < self.params.battery_min_j:
+        if (self.B_i < self.params.battery_min_j
+                or self.Theta_i >= self.params.thermal_max_c):
             self.A_i = 0
         else:
             self.A_i = 1
+
+    def project_environment(self, battery_j: float, temperature_c: float,
+                            platform_alive: bool = True):
+        """Project physical telemetry into scheduler capacity and availability.
+
+        The final 10 C below the payload limit is a linear pre-throttle region;
+        reaching the configured limit is a safety shutdown.  This makes the
+        scheduler react to measured thermal headroom instead of merely carrying
+        temperature as unused metadata.
+        """
+        self.B_i = float(battery_j)
+        self.Theta_i = float(temperature_c)
+        self._platform_alive = bool(platform_alive)
+        throttle_start = self.params.thermal_max_c - 10.0
+        if self.Theta_i <= throttle_start:
+            self._environment_thermal_multiplier = 1.0
+        elif self.Theta_i >= self.params.thermal_max_c:
+            self._environment_thermal_multiplier = 0.0
+        else:
+            self._environment_thermal_multiplier = max(
+                0.1,
+                (self.params.thermal_max_c - self.Theta_i) / 10.0,
+            )
+        self.C_i = self._effective_compute_rate()
+        self._update_availability()
 
     def _effective_compute_rate(self) -> float:
         """Scheduler capacity after software and thermal rate multipliers."""
@@ -133,6 +161,7 @@ class SatelliteState:
             self.params.compute_rate_flops_per_s
             * self._compute_rate_multiplier
             * self._thermal_rate_multiplier
+            * self._environment_thermal_multiplier
         )
 
     def inject_failure(self):

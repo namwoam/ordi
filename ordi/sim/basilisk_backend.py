@@ -105,6 +105,10 @@ class Workload:
     rx_bits: float = 0.0
     downlink_bits: float = 0.0
     stored_bits: float = 0.0
+    # Absolute simulation-time intervals reserved by the shared contact ledger.
+    # They remain pending in BasiliskBackend until their epoch is simulated.
+    tx_intervals: tuple[tuple[float, float], ...] = ()
+    rx_intervals: tuple[tuple[float, float], ...] = ()
 
 
 def _service_compute_queue(queued_flops: float, incoming_flops: float,
@@ -127,21 +131,55 @@ def _service_compute_queue(queued_flops: float, incoming_flops: float,
     return max(0.0, backlog - completed), completed / rate
 
 
+def _interval_active_seconds(intervals, start: float, end: float) -> float:
+    """Union length of intervals overlapping [start, end)."""
+    clipped = sorted(
+        (max(start, begin), min(end, finish))
+        for begin, finish in intervals
+        if finish > start and begin < end
+    )
+    total = 0.0
+    cursor_start = cursor_end = None
+    for begin, finish in clipped:
+        if finish <= begin:
+            continue
+        if cursor_end is None or begin > cursor_end:
+            if cursor_end is not None:
+                total += cursor_end - cursor_start
+            cursor_start, cursor_end = begin, finish
+        else:
+            cursor_end = max(cursor_end, finish)
+    if cursor_end is not None:
+        total += cursor_end - cursor_start
+    return total
+
+
 def _communication_power_w(workload: Workload, params,
-                           epoch_length_s: float) -> float:
+                           epoch_length_s: float,
+                           epoch_start_s: float = 0.0) -> float:
     """Average radio/terminal load presented to Basilisk for one epoch."""
     duration = max(0.0, epoch_length_s)
     if duration == 0.0:
         return 0.0
-    tx_time = min(
-        duration,
-        max(0.0, workload.tx_bits) / ISL_RATE_BPS
-        + max(0.0, workload.downlink_bits) / DOWNLINK_RATE_BPS,
-    )
-    rx_time = min(
-        duration,
-        max(0.0, workload.rx_bits) / ISL_RATE_BPS,
-    )
+    epoch_end = epoch_start_s + duration
+    if workload.tx_intervals or workload.rx_intervals:
+        tx_time = _interval_active_seconds(
+            workload.tx_intervals, epoch_start_s, epoch_end
+        )
+        rx_time = _interval_active_seconds(
+            workload.rx_intervals, epoch_start_s, epoch_end
+        )
+    else:
+        # Compatibility path for callers without contact-ledger timings.
+        tx_time = min(
+            duration,
+            max(0.0, workload.tx_bits) / ISL_RATE_BPS
+            + max(0.0, workload.downlink_bits) / DOWNLINK_RATE_BPS,
+        )
+        rx_time = min(
+            duration,
+            max(0.0, workload.rx_bits) / ISL_RATE_BPS,
+        )
     return params.comms_power_w * (
         tx_time + params.rx_power_fraction * rx_time
     ) / duration
@@ -152,24 +190,48 @@ class BasiliskBackend:
 
     def __init__(self, sat_ids: Iterable[str], states: Dict[str, SatelliteState],
                  epoch_length_s: float = 60.0, seed: int = 0,
-                 ground_stations: list[dict] | None = None):
+                 ground_stations=None, n_planes: int = 6,
+                 sats_per_plane: int = 6, orbit_altitude_km: float = 550.0,
+                 orbit_inclination_deg: float = 53.0,
+                 min_elevation_deg: float = 25.0):
         self.epoch_length_s = float(epoch_length_s)
         self.states = states
         self.sat_ids = list(sat_ids)
         self._work = {sid: Workload() for sid in self.sat_ids}
-        stations = ground_stations or [
-            dict(name="fairbanks", lat=64.8378, long=-147.7164, elev=138),
-            dict(name="greenwich", lat=51.4769, long=0.0, elev=46),
-        ]
+        self._communication_schedule = {
+            sid: {"tx": [], "rx": []} for sid in self.sat_ids
+        }
+        self._sim_time_s = 0.0
+        if ground_stations:
+            stations = [
+                dict(name=name, lat=lat, long=lon, elev=0.0)
+                for name, lat, lon in ground_stations
+            ]
+        else:
+            stations = [
+                dict(name="fairbanks", lat=64.8378, long=-147.7164, elev=138),
+                dict(name="greenwich", lat=51.4769, long=0.0, elev=46),
+            ]
         satellites = []
+        total = max(1, n_planes * sats_per_plane)
         for index, sid in enumerate(self.sat_ids):
+            try:
+                _prefix, plane_text, slot_text = sid.rsplit("_", 2)
+                plane = int(plane_text)
+                slot = int(slot_text)
+            except (TypeError, ValueError):
+                plane = index // max(1, sats_per_plane)
+                slot = index % max(1, sats_per_plane)
             oe = orbitalMotion.ClassicElements()
-            oe.a = (6371.0 + 550.0) * 1e3
+            oe.a = (6371.0 + orbit_altitude_km) * 1e3
             oe.e = 0.001
-            oe.i = np.radians(53.0)
-            oe.Omega = 2 * np.pi * (index % max(1, len(self.sat_ids))) / max(1, len(self.sat_ids))
+            oe.i = np.radians(orbit_inclination_deg)
+            oe.Omega = 2 * np.pi * plane / max(1, n_planes)
             oe.omega = 0.0
-            oe.f = 2 * np.pi * index / max(1, len(self.sat_ids))
+            oe.f = np.radians(
+                (360.0 * slot / max(1, sats_per_plane)
+                 + 360.0 * plane / total) % 360.0
+            )
             p = states[sid].params
             sat = OrdiSatellite(sid, sat_args={
                 "oe": oe, "batteryStorageCapacity": p.battery_j,
@@ -195,8 +257,13 @@ class BasiliskBackend:
             satellites, world_type=(world.GroundStationWorldModel,
                                     world.EclipseWorldModel,
                                     world.AtmosphereWorldModel),
-            world_args={"groundStationsData": stations,
-                        "gsMinimumElevation": np.radians(25.0)},
+            world_args={
+                "groundStationsData": stations,
+                "gsMinimumElevation": np.radians(min_elevation_deg),
+                # Contact generation uses Unix t=0 and a matching deterministic
+                # SGP4 epoch; fixing Basilisk's epoch aligns eclipse/solar phase.
+                "utc_init": "1970 JAN 01 00:00:00.000 (UTC)",
+            },
             sim_rate=min(1.0, self.epoch_length_s),
             max_step_duration=self.epoch_length_s,
             # BSK-RL precomputes access opportunities through the time limit;
@@ -217,10 +284,9 @@ class BasiliskBackend:
         for sid, sat in self.satellites.items():
             st = self.states[sid]
             d = sat.dynamics
-            st.B_i = float(d.battery_charge)
-            st.Theta_i = float(d.temperature_c)
-            st.C_i = st.params.compute_rate_flops_per_s
-            st.A_i = int(sat.is_alive())
+            st.project_environment(
+                float(d.battery_charge), float(d.temperature_c), sat.is_alive()
+            )
 
     def submit(self, workload: Mapping[str, Workload]) -> float:
         """Enqueue one epoch of work, advance BSK-RL, and return load energy.
@@ -229,10 +295,17 @@ class BasiliskBackend:
         ``SatelliteState.Q_i``.  Later epochs continue servicing that backlog
         even when they admit no new work, so battery and thermal state reflect
         sustained accelerator duty rather than only the newest assignments.
-        Packet bit counts drive a Basilisk power node; no scheduling policy
-        estimates communication or compute joules.
+        Contact-ledger intervals drive a persistent Basilisk communication
+        power node; untimed compatibility workloads are queued by duration.
+        No scheduling policy estimates communication or compute joules.
         """
         workload_energy_j = 0.0
+        if not hasattr(self, "_communication_schedule"):
+            self._communication_schedule = {
+                sid: {"tx": [], "rx": []} for sid in self.sat_ids
+            }
+        epoch_start = getattr(self, "_sim_time_s", 0.0)
+        epoch_end = epoch_start + self.epoch_length_s
         for sid in self.sat_ids:
             w = workload.get(sid, Workload())
             self._work[sid] = w
@@ -254,8 +327,44 @@ class BasiliskBackend:
                 -state.params.compute_power_w * duty_cycle
             )
             d.computeSink.powerStatus = int(compute_time > 0.0)
+            schedule = self._communication_schedule[sid]
+            if w.tx_intervals or w.rx_intervals:
+                schedule["tx"].extend(w.tx_intervals)
+                schedule["rx"].extend(w.rx_intervals)
+            else:
+                # Untimed callers still get persistent service instead of
+                # losing traffic beyond the current epoch.
+                cursor = max(
+                    epoch_start,
+                    max((finish for _begin, finish in schedule["tx"]),
+                        default=epoch_start),
+                )
+                tx_seconds = max(0.0, w.tx_bits) / ISL_RATE_BPS
+                if tx_seconds:
+                    schedule["tx"].append((cursor, cursor + tx_seconds))
+                    cursor += tx_seconds
+                down_seconds = (
+                    max(0.0, w.downlink_bits) / DOWNLINK_RATE_BPS
+                )
+                if down_seconds:
+                    schedule["tx"].append((cursor, cursor + down_seconds))
+                rx_seconds = max(0.0, w.rx_bits) / ISL_RATE_BPS
+                if rx_seconds:
+                    rx_start = max(
+                        epoch_start,
+                        max((finish for _begin, finish in schedule["rx"]),
+                            default=epoch_start),
+                    )
+                    schedule["rx"].append(
+                        (rx_start, rx_start + rx_seconds)
+                    )
+            scheduled_work = Workload(
+                tx_intervals=tuple(schedule["tx"]),
+                rx_intervals=tuple(schedule["rx"]),
+            )
             communication_power = _communication_power_w(
-                w, state.params, self.epoch_length_s
+                scheduled_work, state.params, self.epoch_length_s,
+                epoch_start_s=epoch_start,
             )
             d.communicationSink.nodePowerOut = -communication_power
             d.communicationSink.powerStatus = int(communication_power > 0.0)
@@ -265,8 +374,17 @@ class BasiliskBackend:
             d.thermalSensor.sensorPowerDraw = payload_power
             d.thermalSensor.sensorPowerStatus = int(payload_power > 0.0)
             workload_energy_j += payload_power * self.epoch_length_s
+            schedule["tx"] = [
+                interval for interval in schedule["tx"]
+                if interval[1] > epoch_end + 1e-9
+            ]
+            schedule["rx"] = [
+                interval for interval in schedule["rx"]
+                if interval[1] > epoch_end + 1e-9
+            ]
         # Charge is an ordinary BSK-RL action; ORDI itself remains the policy.
         self.env.step(tuple(0 for _ in self.sat_ids))
+        self._sim_time_s = epoch_end
         self._sync_projection()
         return workload_energy_j
 
