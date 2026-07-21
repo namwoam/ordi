@@ -10,20 +10,17 @@ workload with Kepler-class optical edge compute, an SDA-PWSA-inspired
 fault-tolerant transport topology, and the autonomous scheduling direction
 represented by ESA TASCNET.
 
-Shared realistic LEO-EO simulation setup (all experiments unless overridden):
-  - Synthetic Walker constellation: 6 planes × 6 sats = 36 sats (default).
-    E1 uses a 3 × 12 scaled near-polar mesh so fore/aft neighbors remain
-    mutually visible at the modeled optical-terminal range.
-  - 6 geographically distributed ground stations: Fairbanks, Greenwich,
-    Singapore, Nairobi, Hawaii, and Punta Arenas.
-  - E1 acquisition events construct feasible near-nadir PlanetScope-class
-    regions along sampled ground tracks. Other experiments retain the legacy
-    fixed-target access generator.
-  - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
+Shared realistic LEO-EO simulation setup (all experiments):
+  - Synthetic 3 × 12 Walker constellation at 475 km and 97.4° inclination.
+    E4 alone varies satellites per plane to measure constellation scalability.
+  - 10 globally distributed ground stations at a 10° minimum elevation.
+  - Acquisition events construct feasible near-nadir PlanetScope-class
+    regions along sampled ground tracks.
+  - Orbital period: 5670 s.
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
-  - E1 tasks: mean 20 requests/orbit in a clustered hot-source process. Sixty
+  - Tasks: mean 20 requests/orbit in a clustered hot-source process. Sixty
     percent of parent events generate 3–6 same-source requests within 60 s.
-  - E1 expands one same-area burst per orbit to ten requests within 30 s and
+  - One same-area burst per orbit expands to ten requests within 30 s and
     adds 15% recurring background accelerator demand.
   - Each request is a 4096×4096 PlanetScope-class inference ROI split into
     sixteen 1024×1024 tiles, with workload-specific spectral band counts.
@@ -1156,6 +1153,8 @@ _E1_BUILD_KWARGS = dict(n_planes=3, sats_per_plane=12,
                         satellite_params_factory=_e1_satellite_params,
                         reliability_model_factory=_e1_reliability_model)
 
+_E1_FAULT_RATE = 0.02
+
 E1_METRIC_KEYS = [
     "realized_miss_ratio",
     "contact_miss_ratio",
@@ -1181,7 +1180,7 @@ E1_METRIC_KEYS = [
 ]
 
 def run_E1(seed=0, n_seeds=8,
-           fault_rate=0.02) -> Dict[str, List[EpochMetrics]]:
+           fault_rate=_E1_FAULT_RATE) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -1271,7 +1270,7 @@ def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
             for alg_name, cls in alg_classes:
                 jobs.append((f"{alg_name}@fault={rate:.2f}#s{s}",
                              alg_name, cls, specs))
-        config_args.append(({}, jobs, seed + s))
+        config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E2 seeds")
 
@@ -1294,8 +1293,8 @@ def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
 
 _E4_CONFIGS = {
     12: (3, 4),   # 3 planes × 4 sats: enough inter-plane contact density
-    24: (4, 6),   # 4 planes × 6 sats
-    36: (6, 6),   # 6 planes × 6 sats (matches E1 baseline)
+    24: (3, 8),   # 3 planes × 8 sats
+    36: (3, 12),  # 3 planes × 12 sats: exact E1 control setup
 }
 
 
@@ -1311,10 +1310,14 @@ def run_E4(seed=0, n_seeds=1) -> Dict[str, List[EpochMetrics]]:
     for n_sats in sizes:
         planes, per_plane = _E4_CONFIGS[n_sats]
         for s in range(n_seeds):
-            jobs = [(f"{alg_name}@n={n_sats}#s{s}", alg_name, cls)
+            fault_specs = [("random_schedule", _E1_FAULT_RATE, seed + s)]
+            jobs = [(f"{alg_name}@n={n_sats}#s{s}", alg_name, cls,
+                     fault_specs)
                     for alg_name, cls in alg_classes]
+            build_kwargs = dict(_E1_BUILD_KWARGS)
+            build_kwargs.update(n_planes=planes, sats_per_plane=per_plane)
             config_args.append(
-                ({"n_planes": planes, "sats_per_plane": per_plane}, jobs, seed + s))
+                (build_kwargs, jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E4 size×seed")
 
@@ -1343,9 +1346,7 @@ def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
 
     Algorithms: ORDI, full replication, and random replication.
     Differences isolate how much backup placement and count buy under
-    correlated failure.  (Measured property, stated rather than ablated:
-    ORDI's greedy scoring already places 100% of backups in a different
-    orbital plane than the primary in this constellation.)
+    correlated failure. The policy configuration is unchanged from E1.
     """
     print(f"E3: Correlated plane outages (placement quality, {n_seeds} seeds)")
     alg_classes = [("ORDI", ORDI),
@@ -1367,12 +1368,8 @@ def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
                 spec = [("plane_outage", 10, 40, planes)]
                 for alg_name, cls in alg_classes:
                     key = f"{alg_name}@{label}#p{planes[0]}s{s}"
-                    # ORDI enforces plane-disjoint backups under this
-                    # correlated-failure threat model (matches the abstract).
-                    overrides = ({"plane_disjoint_backup": True}
-                                 if alg_name == "ORDI" else None)
-                    jobs.append((key, alg_name, cls, spec, overrides))
-        config_args.append(({}, jobs, seed + s))
+                    jobs.append((key, alg_name, cls, spec))
+        config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
 
     raw = _run_configs_parallel(config_args, desc="E3 seeds")
 

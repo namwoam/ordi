@@ -1,8 +1,10 @@
 from collections import defaultdict
 from inspect import signature
 
+from ordi.eval import experiments
 from ordi.eval.experiments import (
-    _E1_BUILD_KWARGS, _EVALUATION_GS, _four_neighbor_walker_pairs,
+    _E1_BUILD_KWARGS, _E1_FAULT_RATE, _E4_CONFIGS, _EVALUATION_GS,
+    _four_neighbor_walker_pairs,
     _intensify_one_area_burst, _intensify_repeated_area_bursts, run_E1,
 )
 from ordi.orbit.contacts import DEFAULT_GROUND_STATIONS
@@ -61,6 +63,61 @@ def test_evaluation_deadlines_and_request_rate_match_workload_design():
         "change": 1800.0,
         "cloud_filter": 5760.0,
     }
+
+
+def _capture_experiment_configs(monkeypatch, runner):
+    captured = []
+
+    def fake_run(config_args, desc=""):
+        captured.extend(config_args)
+        return {
+            job[0]: []
+            for _build_kwargs, jobs, _seed in config_args
+            for job in jobs
+        }
+
+    monkeypatch.setattr(experiments, "_run_configs_parallel", fake_run)
+    monkeypatch.setattr(experiments, "_save_csv", lambda *args, **kwargs: None)
+    runner(seed=7, n_seeds=1)
+    return captured
+
+
+def test_e2_changes_fault_rate_from_the_e1_setup(monkeypatch):
+    configs = _capture_experiment_configs(monkeypatch, experiments.run_E2)
+
+    assert len(configs) == 1
+    build_kwargs, jobs, seed = configs[0]
+    assert build_kwargs == _E1_BUILD_KWARGS
+    assert seed == 7
+    assert {job[3][0][1] for job in jobs} == {0.0, 0.25, 0.50}
+
+
+def test_e3_changes_only_the_fault_scenario_from_the_e1_setup(monkeypatch):
+    configs = _capture_experiment_configs(monkeypatch, experiments.run_E3)
+
+    assert len(configs) == 1
+    build_kwargs, jobs, seed = configs[0]
+    assert build_kwargs == _E1_BUILD_KWARGS
+    assert seed == 7
+    assert all(len(job) == 4 for job in jobs)
+    assert {job[3][0][0] for job in jobs} == {"plane_outage"}
+
+
+def test_e4_changes_only_constellation_size_from_the_e1_setup(monkeypatch):
+    configs = _capture_experiment_configs(monkeypatch, experiments.run_E4)
+
+    assert _E4_CONFIGS == {12: (3, 4), 24: (3, 8), 36: (3, 12)}
+    assert len(configs) == 3
+    for build_kwargs, jobs, seed in configs:
+        changed = {
+            key: value for key, value in build_kwargs.items()
+            if _E1_BUILD_KWARGS[key] != value
+        }
+        assert set(changed) <= {"sats_per_plane"}
+        assert build_kwargs["n_planes"] == _E1_BUILD_KWARGS["n_planes"]
+        assert all(job[3] == [("random_schedule", _E1_FAULT_RATE, 7)]
+                   for job in jobs)
+        assert seed == 7
 
 
 def test_scene_is_4096_square_with_area_scaled_work():

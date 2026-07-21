@@ -108,9 +108,9 @@ Available evaluations are:
 | ID | Evaluation |
 | --- | --- |
 | E1 | PlanetScope-class ROI placement on a scaled 3×12 optical compute mesh with 10 GS and 2% matched random faults |
-| E2 | Random-fault intensity sweep |
-| E3 | Correlated orbital-plane failures |
-| E4 | Constellation scalability |
+| E2 | E1 setup with random-fault intensity swept |
+| E3 | E1 setup with random faults replaced by correlated orbital-plane failures |
+| E4 | E1 setup with constellation size swept across 3×4, 3×8, and 3×12 |
 
 The former real-data case is excluded until its removed Skyfield/TLE path is
 replaced by Basilisk propagation; it is not advertised as runnable in the
