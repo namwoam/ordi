@@ -36,12 +36,23 @@ class EpochContactGraph:
     t_end: float
     edges: List[Tuple[str, str, float, float, str]]  # (a, b, rate, capacity, type)
     nodes: set
+    # Exact overlap represented by each edge.  Keeping this parallel to ``edges``
+    # preserves the public edge tuple while avoiding the old lossy reconstruction
+    # that moved every partial contact to the start of its epoch.
+    edge_windows: List[Tuple[float, float]] = field(default_factory=list)
     # Adjacency list (src → [(dst, rate, capacity)]) so earliest_arrival walks a
     # node's out-edges instead of scanning all edges per pop. Same result, faster.
     adj: Dict[str, List[Tuple[str, float, float]]] = field(
         default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self):
+        if not self.edge_windows:
+            self.edge_windows = [
+                (self.t_start, min(self.t_end, self.t_start + cap / max(rate, 1.0)))
+                for (_na, _nb, rate, cap, _t) in self.edges
+            ]
+        if len(self.edge_windows) != len(self.edges):
+            raise ValueError("edge_windows must have one entry per edge")
         adj: Dict[str, List[Tuple[str, float, float]]] = {}
         for (na, nb, rate, cap, _t) in self.edges:
             adj.setdefault(na, []).append((nb, rate, cap))
@@ -75,6 +86,7 @@ def build_epoch_graphs(
         ep_start = t_sim_start + ep * epoch_length
         ep_end   = ep_start + epoch_length
         edges = []
+        edge_windows = []
         nodes: set = set()
         for c in contacts:
             overlap_start = max(c.t_start, ep_start)
@@ -83,9 +95,12 @@ def build_epoch_graphs(
                 continue
             overlap_bits = (overlap_end - overlap_start) * c.rate_bps
             edges.append((c.node_a, c.node_b, c.rate_bps, overlap_bits, c.link_type))
+            edge_windows.append((overlap_start, overlap_end))
             nodes.add(c.node_a)
             nodes.add(c.node_b)
-        graphs.append(EpochContactGraph(ep, ep_start, ep_end, edges, nodes))
+        graphs.append(EpochContactGraph(
+            ep, ep_start, ep_end, edges, nodes, edge_windows
+        ))
     return graphs
 
 

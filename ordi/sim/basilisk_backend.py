@@ -146,6 +146,46 @@ def _service_compute_queue(queued_flops: float, incoming_flops: float,
     return max(0.0, backlog - completed), completed / rate
 
 
+def _service_timed_compute(schedule, start: float, end: float,
+                           rate: float, available: bool):
+    """Service released FIFO work using the *current* physical capacity.
+
+    The old implementation treated reservation wall time as completed work,
+    which silently retired FLOPs during outages or throttling.  Remaining work
+    now persists and its projected finish moves with the measured rate.
+    """
+    remaining = []
+    active_seconds = 0.0
+    cursor = start
+    capacity = max(0.0, rate) * max(0.0, end - start) if available else 0.0
+    for interval in sorted(schedule, key=lambda item: (item[0], item[1])):
+        release, planned_finish, flops = map(float, interval[:3])
+        owner = interval[3] if len(interval) > 3 else None
+        flops = max(0.0, flops)
+        service_start = max(start, release, cursor)
+        time_available = max(0.0, end - service_start)
+        service = min(flops, capacity, max(0.0, rate) * time_available)
+        if rate > 0.0:
+            service_time = service / rate
+        else:
+            service_time = 0.0
+        active_seconds += service_time
+        cursor = service_start + service_time
+        capacity -= service
+        left = flops - service
+        if left > 1e-6:
+            next_start = max(release, end if service_start < end else service_start)
+            next_finish = (
+                next_start + left / rate
+                if available and rate > 0.0 else max(planned_finish, next_start)
+            )
+            item = (next_start, next_finish, left)
+            if owner is not None:
+                item += (owner,)
+            remaining.append(item)
+    return remaining, active_seconds
+
+
 def _interval_active_seconds(intervals, start: float, end: float) -> float:
     """Union length of intervals overlapping [start, end)."""
     clipped = sorted(
@@ -217,7 +257,8 @@ class BasiliskBackend:
                  ground_stations=None, n_planes: int = 6,
                  sats_per_plane: int = 6, orbit_altitude_km: float = 550.0,
                  orbit_inclination_deg: float = 53.0,
-                 min_elevation_deg: float = 25.0):
+                 min_elevation_deg: float = 25.0,
+                 simulation_epochs: int = 512):
         self.epoch_length_s = float(epoch_length_s)
         self.states = states
         self.sat_ids = list(sat_ids)
@@ -294,7 +335,7 @@ class BasiliskBackend:
             max_step_duration=self.epoch_length_s,
             # BSK-RL precomputes access opportunities through the time limit;
             # keep this finite and aligned with ORDI's configured horizon.
-            time_limit=self.epoch_length_s * 512,
+            time_limit=self.epoch_length_s * max(1, simulation_epochs),
             terminate_on_time_limit=False,
             failure_penalty=0.0,
             log_level="ERROR",
@@ -358,25 +399,17 @@ class BasiliskBackend:
                 self.epoch_length_s,
                 available=bool(state.A_i),
             )
-            timed_compute_time = _interval_active_seconds(
-                compute_schedule, epoch_start, epoch_end
-            ) if state.A_i else 0.0
+            compute_schedule, timed_compute_time = _service_timed_compute(
+                compute_schedule, epoch_start + external_time, epoch_end, state.C_i,
+                bool(state.A_i),
+            )
             compute_time = min(
                 self.epoch_length_s, external_time + timed_compute_time
             )
-            remaining_schedule = []
-            scheduled_remaining = 0.0
-            for interval in compute_schedule:
-                start, finish, flops = interval[:3]
-                if finish <= epoch_end + 1e-9:
-                    continue
-                duration = max(finish - start, 1e-12)
-                remaining_fraction = max(
-                    0.0, min(1.0, (finish - max(epoch_end, start)) / duration)
-                )
-                remaining_schedule.append(interval)
-                scheduled_remaining += flops * remaining_fraction
-            self._compute_schedule[sid] = remaining_schedule
+            scheduled_remaining = sum(
+                max(0.0, float(interval[2])) for interval in compute_schedule
+            )
+            self._compute_schedule[sid] = compute_schedule
             self._scheduled_compute_remaining[sid] = scheduled_remaining
             state.Q_i = external_remaining + scheduled_remaining
             duty_cycle = (

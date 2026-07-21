@@ -44,6 +44,9 @@ class ExperimentConfig:
     lambda_R: float = 0.05
     alpha: float = 0.002
     epoch_length: float = 60.0
+    # Number of execution epochs, including the post-arrival drain period.
+    # ``None`` retains the legacy caller-selected/default horizon.
+    simulation_epochs: int | None = None
     isl_rate_bps: float = 200e6
     max_backups: int = 1
     # A receiving ORDI node chooses the number of compute shards per tile.

@@ -23,6 +23,11 @@ class Placement:
     route_in: tuple[str, ...]
     route_out: tuple[str, ...]
     route_down: tuple[str, ...]
+    active_start: float = 0.0
+    input_done: float = 0.0
+    compute_done: float = 0.0
+    output_done: float = 0.0
+    delivery_done: float = 0.0
 
 def available_candidates(request, source):
     reachable={source}
@@ -123,19 +128,27 @@ def enumerate_placements(request, task, tile, allow_source=True,
                 request,agg,output_transfer_bits,route_out.arrival
             )
             if down is None or down.arrival>deadline: continue
-            participating={helper,agg}-{task.source_sat}
-            node_reliability=math.prod(request.satellites[node].reliability
-                                      for node in participating)
-            p=(route_in.reliability*route_out.reliability*down.reliability
-               *node_reliability)
             isl_bits=(input_transfer_bits*max(len(route_in.path)-1,0)
                       + output_transfer_bits*max(len(route_out.path)-1,0))
             comm_bits=(
                 isl_bits
                 + output_transfer_bits*max(len(down.path)-1,0)
             )
-            out.append(Placement(helper,agg,down.arrival-request.sim_time,p,
-                comm_bits,route_in.path,route_out.path,down.path))
+            placement = Placement(
+                helper, agg, down.arrival-request.sim_time, 0.0,
+                comm_bits, route_in.path, route_out.path, down.path,
+                request.sim_time, route_in.arrival, compute_done,
+                route_out.arrival, down.arrival,
+            )
+            # Placement reliability excludes the shared source component for
+            # compatibility with callers that compare individual placements.
+            components = placement_components(request, task, placement)
+            p = math.prod(
+                probability for component, probability in components.items()
+                if not (component[0] == "node"
+                        and component[1] == task.source_sat)
+            )
+            out.append(replace(placement, reliability=p))
     return out
 
 def _edge_reliability(request, source, target, kind):
@@ -153,17 +166,35 @@ def placement_components(request, task, placement):
 
     Keys identify shared components, allowing a group of shards or replicas to
     count a shared node/link/downlink exactly once rather than once per path.
-    Source survival remains a tile-level component handled by callers.
+    Source survival is keyed by reliability epoch here so it is shared once
+    across replicas while still accumulating over the source's exposure time.
     """
     components = {}
-    for node in {placement.helper, placement.aggregator} - {task.source_sat}:
-        state = request.satellites.get(node)
-        if state is not None:
-            components[("node", node)] = state.reliability
+
+    epoch_length = max(float(request.epoch_length), 1e-9)
+
+    def periods(start, end):
+        first = int(math.floor(max(0.0, start) / epoch_length))
+        last = int(math.floor(max(start, end - 1e-9) / epoch_length))
+        return range(first, last + 1)
+
+    def add_nodes(path, start, end):
+        for node in path:
+            state = request.satellites.get(node)
+            if state is None:
+                continue
+            for period in periods(start, end):
+                components[("node", node, period)] = state.reliability
 
     route_in, route_out, route_down = (
         placement.route_in, placement.route_out, placement.route_down
     )
+    add_nodes(route_in, placement.active_start, placement.input_done)
+    add_nodes(
+        (placement.helper,), placement.input_done, placement.compute_done
+    )
+    add_nodes(route_out, placement.compute_done, placement.output_done)
+    add_nodes(route_down, placement.output_done, placement.delivery_done)
     for path in (route_in, route_out):
         for source, target in zip(path, path[1:]):
             components[("isl", source, target)] = _edge_reliability(
@@ -182,8 +213,7 @@ def group_success(request, task, placements):
     components = {}
     for placement in placements:
         components.update(placement_components(request, task, placement))
-    probability = request.satellites[task.source_sat].reliability
-    return probability * math.prod(components.values())
+    return math.prod(components.values())
 
 
 def groups_success(request, task, groups):
@@ -195,7 +225,6 @@ def groups_success(request, task, groups):
     groups = tuple(tuple(group) for group in groups if group)
     if not groups:
         return 0.0
-    source_probability = request.satellites[task.source_sat].reliability
     total = 0.0
     for count in range(1, len(groups) + 1):
         sign = 1.0 if count % 2 else -1.0
@@ -206,7 +235,7 @@ def groups_success(request, task, groups):
                     components.update(
                         placement_components(request, task, placement)
                     )
-            total += sign * source_probability * math.prod(components.values())
+            total += sign * math.prod(components.values())
     return max(0.0, min(1.0, total))
 
 

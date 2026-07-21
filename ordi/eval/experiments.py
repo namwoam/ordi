@@ -67,7 +67,7 @@ from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.algorithms._common import earliest_route
 
 RESULTS_DIR = "results"
-SIM_DURATION_S = 17_280       # 3 complete orbits at 550 km (3 × 5760 s)
+SIM_DURATION_S = 17_280       # task-arrival window; execution drains afterward
 EPOCH_LENGTH_S = 60.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
@@ -282,26 +282,12 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     sat_ids = [s.name for s in sats]
     gs_names = {gs[0] for gs in ground_stations}
 
-    print(f"  Computing contact windows for {len(sats)} sats × {len(ground_stations)} GS ...")
-    t0 = time.time()
     isl_pairs = (
         _four_neighbor_walker_pairs(n_planes, sats_per_plane)
         if isl_topology == "four_neighbor" else None
     )
     if isl_topology not in {"range", "four_neighbor"}:
         raise ValueError("isl_topology must be 'range' or 'four_neighbor'")
-    contacts = compute_contact_windows(
-        sats,
-        t_start_unix=0.0,
-        t_end_unix=SIM_DURATION_S,
-        dt_seconds=60.0,
-        ground_stations=ground_stations,
-        min_elevation_deg=min_elevation_deg,
-        isl_pairs=isl_pairs,
-    )
-    print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
-
-    graphs = build_epoch_graphs(contacts, T_SIM_START, EPOCH_LENGTH_S, N_EPOCHS)
     states = make_constellation_states(
         sat_ids, seed=seed, params_factory=satellite_params_factory
     )
@@ -363,8 +349,37 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
             f"{intense_area_request_count} requests each at "
             f"{intense_area_compute_multiplier:.1f}× compute"
         )
+    # Arrivals stop at SIM_DURATION_S, but every admitted task gets its complete
+    # deadline window.  This removes right-censoring of late releases and makes
+    # the final epochs a drain period rather than additional workload arrivals.
+    last_deadline = max(
+        (task.deadline for task in tasks), default=SIM_DURATION_S
+    )
+    simulation_epochs = max(
+        N_EPOCHS, int(math.ceil(last_deadline / EPOCH_LENGTH_S))
+    )
+    simulation_end = simulation_epochs * EPOCH_LENGTH_S
+    print(
+        f"  Computing contact windows for {len(sats)} sats × "
+        f"{len(ground_stations)} GS through t={simulation_end:.0f}s ..."
+    )
+    t0 = time.time()
+    contacts = compute_contact_windows(
+        sats,
+        t_start_unix=0.0,
+        t_end_unix=simulation_end,
+        dt_seconds=60.0,
+        ground_stations=ground_stations,
+        min_elevation_deg=min_elevation_deg,
+        isl_pairs=isl_pairs,
+    )
+    print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
+    graphs = build_epoch_graphs(
+        contacts, T_SIM_START, EPOCH_LENGTH_S, simulation_epochs
+    )
     cfg = ORDIConfig(
         epoch_length=EPOCH_LENGTH_S,
+        simulation_epochs=simulation_epochs,
         background_compute_utilization=background_compute_utilization,
         n_planes=n_planes,
         sats_per_plane=sats_per_plane,
@@ -424,6 +439,7 @@ def _assignment_group_viability(a: Assignment, states, injector=None,
         return {0: alive}
     viable = []
     phase_ends = a.metadata.get("replica_phase_ends", ())
+    planned_rates = a.metadata.get("replica_compute_rates", ())
     routes = getattr(a, "routes", ())
     assignment_source = getattr(a, "source", "")
     for index, (helper, aggregator) in enumerate(
@@ -453,10 +469,23 @@ def _assignment_group_viability(a: Assignment, states, injector=None,
             )
         else:
             check_in = check_compute = check_out = check_down = True
+            compute_done = math.inf
+        compute_rate_ok = (
+            sim_time is None
+            or sim_time >= compute_done - 1e-9
+            or index >= len(planned_rates)
+            or (
+                h is not None
+                and h.C_i + 1e-9 >= float(planned_rates[index])
+            )
+        )
         downlink_source = route_down[-2] if len(route_down) >= 2 else aggregator
         viable.append(bool(
             (not check_in or _path_viable(route_in, states, disrupted))
-            and (not check_compute or (h is not None and h.A_i))
+            and compute_rate_ok
+            and (not check_compute or (
+                h is not None and h.A_i
+            ))
             and (not check_out or _path_viable(route_out, states, disrupted))
             and (not check_down or (
                 g is not None and g.A_i
@@ -768,6 +797,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             orbit_inclination_deg=cfg.orbit_inclination_deg,
             min_elevation_deg=cfg.min_elevation_deg,
             ground_stations=cfg.ground_stations,
+            simulation_epochs=cfg.simulation_epochs or N_EPOCHS,
         )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], Assignment] = {}
@@ -778,7 +808,8 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     protocol_message_count = 0.0
     protocol_control_bits = 0.0
 
-    for epoch in range(N_EPOCHS):
+    simulation_epochs = cfg.simulation_epochs or N_EPOCHS
+    for epoch in range(simulation_epochs):
         ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
         if injector:
             injector.apply_epoch(epoch)
@@ -884,10 +915,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             if key not in committed and key not in feedback_reported:
                 _report_assignment_outcome(
                     outcome_callback, "nonfault_failure", final_by_key[key],
-                    N_EPOCHS,
+                    simulation_epochs,
                 )
     res = Decision(
-        N_EPOCHS - 1, tuple(final),
+        simulation_epochs - 1, tuple(final),
         metadata={
             "protocol_message_count": protocol_message_count,
             "advertisement_control_bits": protocol_control_bits,
@@ -971,10 +1002,10 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     for future in graphs[ep:]:
         if future.t_start > latest_deadline:
             break
-        for a, b, rate, capacity, kind in future.edges:
-            duration = capacity / max(rate, 1.0)
+        for edge_index, (a, b, rate, capacity, kind) in enumerate(future.edges):
+            opens, closes = future.edge_windows[edge_index]
             contacts.append(ContactWindow(
-                a, b, future.t_start, future.t_start + duration,
+                a, b, opens, closes,
                 rate, kind, reliability.link_pi(a, b, kind),
             ))
     return EpochInput(
@@ -1222,7 +1253,8 @@ def _resolve_fault_specs(fault_specs, sat_ids, tasks,
         if spec[0] == "random_schedule":
             _tag, rate, rng_seed = spec
             faults.extend(random_fault_schedule(
-                sat_ids, N_EPOCHS, fault_rate=rate, seed=rng_seed,
+                sat_ids, len(graphs) if graphs is not None else N_EPOCHS,
+                fault_rate=rate, seed=rng_seed,
                 graphs=graphs,
             ))
             continue

@@ -17,7 +17,9 @@ import heapq
 import math
 
 from .schema import Assignment, Decision
-from ._common import advertisement_metadata, protocol_trace
+from ._common import (
+    Placement, advertisement_metadata, group_success, protocol_trace,
+)
 from ordi.eval.validation import InvalidDecisionError
 from ordi.eval.validation import _terminal_slot
 from ordi.sim.messaging import MessageSimulator
@@ -81,6 +83,7 @@ class PartPlacement:
     route_down: ReservedRoute
     completion: float
     reliability: float
+    modeled_placement: Placement
 
 
 @dataclass(frozen=True)
@@ -237,16 +240,17 @@ class SECOAdapted:
                 compute_done, 1.0, (helper,), (), (), output_bits
             )
 
-            participating = {helper, aggregator} - {task.source_sat}
-            node_reliability = math.prod(
-                request.satellites[node].reliability
-                for node in participating
+            modeled = Placement(
+                helper, aggregator,
+                route_down.arrival - request.sim_time, 0.0, 0.0,
+                route_in.path, route_out.path, route_down.path,
+                request.sim_time, route_in.arrival, compute_done,
+                route_out.arrival, route_down.arrival,
             )
             part = PartPlacement(
                 helper, aggregator, route_in, route_out, route_down,
                 route_down.arrival,
-                route_in.reliability * route_down.reliability
-                * node_reliability,
+                group_success(request, task, (modeled,)), modeled,
             )
             if best is None or part.completion < best[0].completion:
                 best = (part, trial)
@@ -330,9 +334,9 @@ class SECOAdapted:
                 plan = self._best_plan(local, task, tile, ledger)
                 if plan is None:
                     continue
-                source_pi = local.satellites[source].reliability
-                reliability = source_pi * math.prod(
-                    part.reliability for part in plan.parts
+                reliability = group_success(
+                    local, task,
+                    tuple(part.modeled_placement for part in plan.parts),
                 )
                 q = plan.split_count
                 assignment = Assignment(

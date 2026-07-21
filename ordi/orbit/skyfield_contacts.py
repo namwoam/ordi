@@ -29,6 +29,10 @@ def compute_contact_windows(satellites,t_start_unix,t_end_unix,ground_stations=N
                 if code==0: rise=t.tt
                 elif code==2:
                     t0=_unix(rise if rise is not None else start.tt); t1=_unix(t.tt); events += [ContactEvent(t0,t1,sat.name,name,DOWNLINK_RATE_BPS,'downlink'),ContactEvent(t0,t1,name,sat.name,UPLINK_RATE_BPS,'uplink')]; rise=None
+            if rise is not None:
+                t0=_unix(rise); t1=t_end_unix
+                if t1 > t0:
+                    events += [ContactEvent(t0,t1,sat.name,name,DOWNLINK_RATE_BPS,'downlink'),ContactEvent(t0,t1,name,sat.name,UPLINK_RATE_BPS,'uplink')]
     nsteps=int((t_end_unix-t_start_unix)/dt_seconds)+1; tt=np.linspace(start.tt,end.tt,nsteps); times=np.array([_unix(x) for x in tt]); pos=np.array([sat.at(ts.tt_jd(tt)).position.km.T for sat in satellites])
     for i in range(len(satellites)):
         for j in range(i+1,len(satellites)):

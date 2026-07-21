@@ -232,9 +232,8 @@ class ORDI:
     @staticmethod
     def _placement_utility(request, task, tile, placement):
         weights = request.weights
-        source_p = request.satellites[task.source_sat].reliability
         return (
-            tile.utility * source_p * placement.reliability
+            tile.utility * group_success(request, task, (placement,))
             * math.exp(-weights.freshness * placement.latency)
             - weights.communication * placement.communication_bits
         )

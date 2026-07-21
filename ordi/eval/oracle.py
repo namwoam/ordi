@@ -23,6 +23,7 @@ from ordi.algorithms import (
     SatelliteView, SECOAdapted,
 )
 from ordi.algorithms._common import enumerate_placements
+from ordi.algorithms._common import group_success
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.tasks.generator import EOTask, Tile
 from ordi.tasks.profiles import PROFILES
@@ -62,10 +63,7 @@ def _assignment_value(request: EpochInput, tile: Tile,
 
 def _candidate_assignment(request: EpochInput, task: EOTask, tile: Tile,
                           placement) -> Assignment:
-    reliability = (
-        request.satellites[task.source_sat].reliability
-        * placement.reliability
-    )
+    reliability = group_success(request, task, (placement,))
     return Assignment(
         task.task_id,
         tile.tile_id,

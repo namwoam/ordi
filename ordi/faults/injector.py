@@ -66,7 +66,7 @@ class FaultInjector:
         self.gs_names = gs_names or set()
         self._active: List[FaultEvent] = []
         self._scheduled: List[FaultEvent] = []
-        # Maps fault id → {ep_idx: [(a, b, rate, cap, ltype), ...]} for ground_contact_miss
+        # Maps fault id → {ep_idx: [(edge, exact_window), ...]}.
         self._removed_edges: Dict[int, Dict[int, list]] = {}
         # Maps fault id → {sat_id: rate multiplier} for straggler restoration.
         self._compute_snapshots: Dict[int, Dict[str, float]] = {}
@@ -327,15 +327,17 @@ class FaultInjector:
             if ep_idx >= len(self.graphs):
                 continue
             g = self.graphs[ep_idx]
-            kept, removed = [], []
-            for edge in g.edges:
+            kept, kept_windows, removed = [], [], []
+            for edge, window in zip(g.edges, g.edge_windows):
                 if drop(edge[0], edge[1]):
-                    removed.append(edge)
+                    removed.append((edge, window))
                 else:
                     kept.append(edge)
+                    kept_windows.append(window)
             if removed:
                 self._removed_edges[fault_id][ep_idx] = removed
                 g.edges = kept
+                g.edge_windows = kept_windows
                 adj: Dict[str, list] = {}
                 for (na, nb, rate, cap, _t) in kept:
                     adj.setdefault(na, []).append((nb, rate, cap))
@@ -345,10 +347,11 @@ class FaultInjector:
         """Replay the edges removed by _remove_edges for this fault and rebuild
         each affected graph's adjacency list."""
         removed_by_ep = self._removed_edges.pop(id(fault), {})
-        for ep_idx, edges in removed_by_ep.items():
+        for ep_idx, entries in removed_by_ep.items():
             if ep_idx < len(self.graphs):
                 g = self.graphs[ep_idx]
-                g.edges.extend(edges)
+                g.edges.extend(edge for edge, _window in entries)
+                g.edge_windows.extend(window for _edge, window in entries)
                 adj: Dict[str, list] = {}
                 for (na, nb, rate, cap, _t) in g.edges:
                     adj.setdefault(na, []).append((nb, rate, cap))

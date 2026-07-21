@@ -329,6 +329,18 @@ def _timed_replica_components(assignment, index, source, active_start,
         route_out = (helper, aggregator)
         route_down = (aggregator,)
     downlink_node = route_down[-2] if len(route_down) >= 2 else aggregator
+    # Every store-and-forward relay must survive while its phase is active.
+    # Previously only source/helper/aggregator nodes were sampled, even though
+    # an intermediate relay failure makes the selected path unusable.
+    node_windows.extend(
+        (node, active_start, input_done) for node in route_in
+    )
+    node_windows.extend(
+        (node, compute_done, output_done) for node in route_out
+    )
+    node_windows.extend(
+        (node, output_done, delivery_done) for node in route_down[:-1]
+    )
     node_windows.append((aggregator, output_done, delivery_done))
     if downlink_node != aggregator:
         node_windows.append((downlink_node, output_done, delivery_done))

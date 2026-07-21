@@ -277,6 +277,7 @@ class DecisionFeasibilityModel:
 
             finishes = []
             replica_phase_ends = []
+            replica_compute_rates = []
             source_release_time = None
             if assignment.downlink_only:
                 path = tuple(assignment.metadata.get("path", ()))
@@ -417,6 +418,9 @@ class DecisionFeasibilityModel:
                         trace=compute_intervals, owner=key,
                     )
                     compute_done = now
+                    replica_compute_rates.append(
+                        float(request.satellites[helper].compute_rate)
+                    )
                     now = trial._reserve_path(
                         request, route_out,
                         tile.d_out_bits * output_fraction
@@ -492,6 +496,43 @@ class DecisionFeasibilityModel:
                     metadata["source_release_time"] = source_release_time
                 if replica_phase_ends:
                     metadata["replica_phase_ends"] = tuple(replica_phase_ends)
+                    metadata["replica_compute_rates"] = tuple(
+                        replica_compute_rates
+                    )
+                    # Recompute reliability on the retimed physical exposure.
+                    # Resource contention can move a phase across reliability
+                    # epochs, so retaining the policy's pre-ledger estimate is
+                    # inconsistent with realized temporal scoring.
+                    from ordi.algorithms._common import Placement, groups_success
+                    placements = tuple(
+                        Placement(
+                            helper, aggregator,
+                            phases[3] - request.sim_time, 0.0, 0.0,
+                            *assignment.routes[index], request.sim_time,
+                            *phases,
+                        )
+                        for index, (helper, aggregator, phases) in enumerate(zip(
+                            assignment.helpers, assignment.aggregators,
+                            replica_phase_ends,
+                        ))
+                    )
+                    labels = metadata.get("shard_groups")
+                    if labels is not None and len(labels) == len(placements):
+                        grouped = {}
+                        for label, placement in zip(labels, placements):
+                            grouped.setdefault(label, []).append(placement)
+                        reliability_groups = tuple(
+                            tuple(group) for group in grouped.values()
+                        )
+                    elif required > 1:
+                        reliability_groups = (placements,)
+                    else:
+                        reliability_groups = tuple(
+                            (placement,) for placement in placements
+                        )
+                    metadata["reliability"] = groups_success(
+                        request, task, reliability_groups
+                    )
                 metadata["communication_intervals"] = tuple(
                     communication_intervals
                 )
