@@ -763,6 +763,66 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
     }
 
 
+def _consumed_attempt_costs(assignment: Assignment, cutoff: float) -> dict:
+    """Physical work consumed by an assignment before it was canceled."""
+    costs = {
+        "isl_traffic_bits": 0.0,
+        "downlink_volume_bits": 0.0,
+        "control_traffic_bits": 0.0,
+        "protocol_messages": 0.0,
+        "compute_by_helper": {},
+    }
+
+    def consumed_fraction(interval):
+        _source, _target, start, finish, _kind = interval
+        duration = max(float(finish) - float(start), 1e-12)
+        return max(
+            0.0, min(1.0, (float(cutoff) - float(start)) / duration)
+        )
+
+    for record in assignment.metadata.get("data_transfer_records", ()):
+        if len(record) == 3:
+            bits, header_bits, intervals = record
+        else:
+            # Compatibility with decisions validated before transfer records
+            # started carrying an explicit protocol-header component.
+            bits, intervals = record
+            header_bits = 0.0
+        for interval in intervals:
+            fraction = consumed_fraction(interval)
+            consumed = float(bits) * fraction
+            if interval[4] == "downlink":
+                costs["downlink_volume_bits"] += consumed
+            else:
+                costs["isl_traffic_bits"] += consumed
+            costs["control_traffic_bits"] += float(header_bits) * fraction
+
+    for bits, intervals in assignment.metadata.get(
+            "control_transfer_records", ()):
+        for interval in intervals:
+            consumed = float(bits) * consumed_fraction(interval)
+            costs["control_traffic_bits"] += consumed
+            costs["isl_traffic_bits"] += consumed
+
+    sent_messages = {
+        event.message_id for event in assignment.message_events
+        if event.event == "hop_sent" and event.time < cutoff - 1e-9
+    }
+    costs["protocol_messages"] = float(len(sent_messages))
+
+    compute_by_helper = costs["compute_by_helper"]
+    for helper, start, finish, work in assignment.metadata.get(
+            "compute_intervals", ()):
+        duration = max(float(finish) - float(start), 1e-12)
+        fraction = max(
+            0.0, min(1.0, (float(cutoff) - float(start)) / duration)
+        )
+        compute_by_helper[helper] = (
+            compute_by_helper.get(helper, 0.0) + float(work) * fraction
+        )
+    return costs
+
+
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                        reliability=None, realized_trials=500, realized_seed=0,
                        state_driver=None, outcome_callback=None,
@@ -807,6 +867,13 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     rejection_causes = {}
     protocol_message_count = 0.0
     protocol_control_bits = 0.0
+    abandoned_costs = {
+        "isl_traffic_bits": 0.0,
+        "downlink_volume_bits": 0.0,
+        "control_traffic_bits": 0.0,
+        "protocol_messages": 0.0,
+        "compute_by_helper": {},
+    }
 
     simulation_epochs = cfg.simulation_epochs or N_EPOCHS
     for epoch in range(simulation_epochs):
@@ -859,6 +926,15 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             if not primary_alive and any_alive:
                 backup_recovery.setdefault(key, epoch)
             if not any_alive:
+                consumed = _consumed_attempt_costs(assignment, ep_start)
+                for cost_key in (
+                    "isl_traffic_bits", "downlink_volume_bits",
+                    "control_traffic_bits", "protocol_messages",
+                ):
+                    abandoned_costs[cost_key] += consumed[cost_key]
+                for helper, work in consumed["compute_by_helper"].items():
+                    helper_costs = abandoned_costs["compute_by_helper"]
+                    helper_costs[helper] = helper_costs.get(helper, 0.0) + work
                 _report_assignment_outcome(
                     outcome_callback, "fault_failure", assignment, epoch
                 )
@@ -922,6 +998,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         metadata={
             "protocol_message_count": protocol_message_count,
             "advertisement_control_bits": protocol_control_bits,
+            "abandoned_costs": abandoned_costs,
         },
     )
     m = compute_metrics(
@@ -1004,9 +1081,14 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
             break
         for edge_index, (a, b, rate, capacity, kind) in enumerate(future.edges):
             opens, closes = future.edge_windows[edge_index]
+            contact_reliability = (
+                reliability.downlink_pi(a)
+                if kind == "downlink"
+                else reliability.link_pi(a, b, kind)
+            )
             contacts.append(ContactWindow(
                 a, b, opens, closes,
-                rate, kind, reliability.link_pi(a, b, kind),
+                rate, kind, contact_reliability,
             ))
     return EpochInput(
         ep, T_SIM_START + ep * cfg.epoch_length, tasks, views,

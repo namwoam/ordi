@@ -234,6 +234,8 @@ def compute_metrics(
     # so the ratio is dimensionless.
     total_capacity = sum(sat_compute_capacity.values())
     compute_by_helper = {sat_id: 0.0 for sat_id in sat_compute_capacity}
+    decision_metadata = getattr(result, "metadata", {})
+    abandoned_costs = decision_metadata.get("abandoned_costs", {})
     for assignment in result.assignments:
         key = (assignment.task_id, assignment.tile_id)
         if key not in tile_lookup:
@@ -248,6 +250,11 @@ def compute_metrics(
                 compute_by_helper.get(helper, 0.0)
                 + tile.compute_ops * fraction
             )
+    for helper, work in abandoned_costs.get(
+            "compute_by_helper", {}).items():
+        compute_by_helper[helper] = (
+            compute_by_helper.get(helper, 0.0) + max(0.0, float(work))
+        )
     compute_used = sum(compute_by_helper.values())
     m.helper_utilization = (min(1.0, compute_used / total_capacity)
                             if total_capacity > 0 else 0.0)
@@ -264,7 +271,6 @@ def compute_metrics(
         if constellation_size and squared_load > 0.0 else 0.0
     )
 
-    decision_metadata = getattr(result, "metadata", {})
     decision_advertisement_bits = float(
         decision_metadata.get("advertisement_control_bits", 0.0)
     )
@@ -273,6 +279,18 @@ def compute_metrics(
     )
     m.control_traffic_bits += decision_advertisement_bits
     m.isl_traffic_bits += decision_advertisement_bits
+    m.isl_traffic_bits += max(
+        0.0, float(abandoned_costs.get("isl_traffic_bits", 0.0))
+    )
+    m.downlink_volume_bits += max(
+        0.0, float(abandoned_costs.get("downlink_volume_bits", 0.0))
+    )
+    m.control_traffic_bits += max(
+        0.0, float(abandoned_costs.get("control_traffic_bits", 0.0))
+    )
+    m.protocol_messages += max(
+        0.0, float(abandoned_costs.get("protocol_messages", 0.0))
+    )
 
     delivered_tiles = len(recovery_lats)
     if delivered_tiles:

@@ -256,6 +256,8 @@ class DecisionFeasibilityModel:
 
             communication_intervals = []
             compute_intervals = []
+            data_transfer_records = []
+            control_transfer_records = []
             reserved_handshakes = set()
             for event in assignment.message_events:
                 reservation_key = (
@@ -269,9 +271,14 @@ class DecisionFeasibilityModel:
                         }
                         or reservation_key in reserved_handshakes):
                     continue
+                control_trace = []
                 trial._reserve_hop(
                     request, event.node, event.peer, event.bits, event.time,
-                    trace=communication_intervals, owner=key,
+                    trace=control_trace, owner=key,
+                )
+                communication_intervals.extend(control_trace)
+                control_transfer_records.append(
+                    (float(event.bits), tuple(control_trace))
                 )
                 reserved_handshakes.add(reservation_key)
 
@@ -288,9 +295,14 @@ class DecisionFeasibilityModel:
                 bits = float(assignment.metadata.get(
                     "downlink_bits", tile.d_in_bits
                 ))
+                transfer_trace = []
                 downlink_finish = trial._reserve_path(
                     request, path, bits, request.sim_time,
-                    trace=communication_intervals, owner=key,
+                    trace=transfer_trace, owner=key,
+                )
+                communication_intervals.extend(transfer_trace)
+                data_transfer_records.append(
+                    (bits, 0.0, tuple(transfer_trace))
                 )
                 source_release_time = downlink_finish
                 ground_work = float(assignment.metadata.get(
@@ -404,12 +416,19 @@ class DecisionFeasibilityModel:
                     protocol_header_bits = float(
                         assignment.metadata.get("protocol_header_bits", 0.0)
                     )
+                    input_bits = (
+                        tile.d_in_bits * input_fraction + protocol_header_bits
+                    )
+                    input_trace = []
                     now = trial._reserve_path(
                         request, route_in,
-                        tile.d_in_bits * input_fraction
-                        + protocol_header_bits,
-                        request.sim_time, trace=communication_intervals,
+                        input_bits,
+                        request.sim_time, trace=input_trace,
                         owner=key,
+                    )
+                    communication_intervals.extend(input_trace)
+                    data_transfer_records.append(
+                        (input_bits, protocol_header_bits, tuple(input_trace))
                     )
                     input_done = now
                     now = trial._reserve_compute(
@@ -421,20 +440,33 @@ class DecisionFeasibilityModel:
                     replica_compute_rates.append(
                         float(request.satellites[helper].compute_rate)
                     )
+                    output_bits = (
+                        tile.d_out_bits * output_fraction
+                        + protocol_header_bits
+                    )
+                    output_trace = []
                     now = trial._reserve_path(
                         request, route_out,
-                        tile.d_out_bits * output_fraction
-                        + protocol_header_bits, now,
-                        trace=communication_intervals,
+                        output_bits, now,
+                        trace=output_trace,
                         owner=key,
                     )
+                    communication_intervals.extend(output_trace)
+                    data_transfer_records.append(
+                        (output_bits, protocol_header_bits, tuple(output_trace))
+                    )
                     output_done = now
+                    downlink_trace = []
                     now = trial._reserve_path(
                         request, route_down,
-                        tile.d_out_bits * output_fraction
-                        + protocol_header_bits, now,
-                        trace=communication_intervals,
+                        output_bits, now,
+                        trace=downlink_trace,
                         owner=key,
+                    )
+                    communication_intervals.extend(downlink_trace)
+                    data_transfer_records.append(
+                        (output_bits, protocol_header_bits,
+                         tuple(downlink_trace))
                     )
                     finishes.append(now)
                     replica_phase_ends.append(
@@ -535,6 +567,12 @@ class DecisionFeasibilityModel:
                     )
                 metadata["communication_intervals"] = tuple(
                     communication_intervals
+                )
+                metadata["data_transfer_records"] = tuple(
+                    data_transfer_records
+                )
+                metadata["control_transfer_records"] = tuple(
+                    control_transfer_records
                 )
                 metadata["compute_intervals"] = tuple(compute_intervals)
                 ground_work = float(metadata.get("ground_compute_flops", 0.0))

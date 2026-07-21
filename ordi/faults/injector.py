@@ -66,11 +66,32 @@ class FaultInjector:
         self.gs_names = gs_names or set()
         self._active: List[FaultEvent] = []
         self._scheduled: List[FaultEvent] = []
-        # Maps fault id → {ep_idx: [(edge, exact_window), ...]}.
-        self._removed_edges: Dict[int, Dict[int, list]] = {}
-        # Maps fault id → {sat_id: rate multiplier} for straggler restoration.
-        self._compute_snapshots: Dict[int, Dict[str, float]] = {}
-        self._thermal_snapshots: Dict[int, Dict[str, float]] = {}
+        # Active effects are rebuilt from these baselines after every transition.
+        # This makes overlapping faults compositional: withdrawing one event can
+        # never restore a component still covered by another active event.
+        self._base_node_overrides = reliability._node_overrides.copy()
+        self._base_link_overrides = reliability._link_overrides.copy()
+        self._base_downlink_overrides = reliability._downlink_overrides.copy()
+        self._base_failures = {
+            sat_id: bool(getattr(state, "_injected_failure", False))
+            for sat_id, state in states.items()
+        }
+        self._base_availability = {
+            sat_id: int(bool(getattr(state, "A_i", 1)))
+            for sat_id, state in states.items()
+        }
+        self._base_compute_multipliers = {
+            sat_id: float(getattr(state, "_compute_rate_multiplier", 1.0))
+            for sat_id, state in states.items()
+        }
+        self._base_thermal_multipliers = {
+            sat_id: float(getattr(state, "_thermal_rate_multiplier", 1.0))
+            for sat_id, state in states.items()
+        }
+        self._base_graphs = [
+            (list(graph.edges), list(graph.edge_windows))
+            for graph in self.graphs
+        ]
 
     def schedule(self, fault: FaultEvent):
         """Register a fault to be applied at its start_epoch."""
@@ -102,13 +123,12 @@ class FaultInjector:
             if fault.start_epoch == epoch:
                 self._active.append(fault)
                 self._apply(fault)
+        self._refresh_active_effects(rebuild_graphs=True)
 
     def withdraw_epoch(self, epoch: int):
         """Withdraw faults whose duration has expired."""
-        expired = [f for f in self._active if f.end_epoch <= epoch]
-        for fault in expired:
-            self._withdraw(fault)
         self._active = [f for f in self._active if f.end_epoch > epoch]
+        self._refresh_active_effects(rebuild_graphs=True)
 
     def refresh_active_state(self):
         """Reassert state faults that a physical/telemetry update may overwrite.
@@ -118,21 +138,111 @@ class FaultInjector:
         keeps multi-epoch faults active without replaying graph mutations or
         taking duplicate straggler snapshots.
         """
+        self._refresh_active_effects(rebuild_graphs=False)
+
+    def _refresh_active_effects(self, rebuild_graphs: bool) -> None:
+        """Rebuild all reversible effects from the complete active-fault set."""
+        self.reliability._node_overrides = self._base_node_overrides.copy()
+        self.reliability._link_overrides = self._base_link_overrides.copy()
+        self.reliability._downlink_overrides = (
+            self._base_downlink_overrides.copy()
+        )
+
+        failed = set()
+        compute_factors = {sat_id: 1.0 for sat_id in self.states}
+        thermal_factors = {sat_id: 1.0 for sat_id in self.states}
         for fault in self._active:
-            if fault.fault_type == "thermal_throttle":
-                for sat_id in fault.targets:
-                    if sat_id in self.states:
-                        state = self.states[sat_id]
-                        factor = max(
-                            0.0, min(1.0, fault.params.get("factor", 0.5))
-                        )
-                        state._environment_thermal_multiplier = factor
-                        state.C_i = state._effective_compute_rate()
+            if fault.fault_type in {"plane_outage", "helper_failure"}:
+                failed.update(fault.targets)
             elif fault.fault_type == "straggler":
+                factor = max(0.0, float(fault.params.get("factor", 0.1)))
                 for sat_id in fault.targets:
-                    if sat_id in self.states:
-                        state = self.states[sat_id]
-                        state.C_i = state._effective_compute_rate()
+                    if sat_id in compute_factors:
+                        compute_factors[sat_id] *= factor
+            elif fault.fault_type == "thermal_throttle":
+                factor = max(
+                    0.0, min(1.0, float(fault.params.get("factor", 0.5)))
+                )
+                for sat_id in fault.targets:
+                    if sat_id in thermal_factors:
+                        thermal_factors[sat_id] *= factor
+            elif fault.fault_type == "isl_disruption":
+                for link_str in fault.targets:
+                    a, b = link_str.split(":")
+                    self.reliability._link_overrides[(a, b)] = 0.0
+                    self.reliability._link_overrides[(b, a)] = 0.0
+            elif fault.fault_type == "downlink_adverse":
+                probability = float(
+                    fault.params.get("pi", DEFAULT_DOWNLINK_ADV_PI)
+                )
+                for sat_id in fault.targets:
+                    current = self.reliability._downlink_overrides.get(
+                        sat_id, self.reliability.default_downlink_pi
+                    )
+                    self.reliability._downlink_overrides[sat_id] = min(
+                        current, probability
+                    )
+
+        for sat_id in failed:
+            self.reliability._node_overrides[sat_id] = 0.0
+        for sat_id, state in self.states.items():
+            state._injected_failure = (
+                self._base_failures.get(sat_id, False) or sat_id in failed
+            )
+            state._compute_rate_multiplier = (
+                self._base_compute_multipliers.get(sat_id, 1.0)
+                * compute_factors[sat_id]
+            )
+            state._thermal_rate_multiplier = (
+                self._base_thermal_multipliers.get(sat_id, 1.0)
+                * thermal_factors[sat_id]
+            )
+            if hasattr(state, "_effective_compute_rate"):
+                state.C_i = state._effective_compute_rate()
+            if hasattr(state, "_update_availability"):
+                state._update_availability()
+            else:
+                state.A_i = int(
+                    self._base_availability.get(sat_id, 1)
+                    and not state._injected_failure
+                )
+
+        if rebuild_graphs:
+            self._rebuild_graphs()
+
+    def _rebuild_graphs(self) -> None:
+        for graph, (base_edges, base_windows) in zip(
+                self.graphs, self._base_graphs):
+            disrupted = set()
+            missed = set()
+            for fault in self._active:
+                if not fault.start_epoch <= graph.epoch < fault.end_epoch:
+                    continue
+                if fault.fault_type == "isl_disruption":
+                    for link_str in fault.targets:
+                        a, b = link_str.split(":")
+                        disrupted.update(((a, b), (b, a)))
+                elif fault.fault_type == "ground_contact_miss":
+                    missed.update(fault.targets)
+            kept = []
+            windows = []
+            for edge, window in zip(base_edges, base_windows):
+                source, target = edge[:2]
+                if (source, target) in disrupted:
+                    continue
+                if ((source in missed and target in self.gs_names)
+                        or (target in missed and source in self.gs_names)):
+                    continue
+                kept.append(edge)
+                windows.append(window)
+            graph.edges = kept
+            graph.edge_windows = windows
+            adjacency: Dict[str, list] = {}
+            for source, target, rate, capacity, _kind in kept:
+                adjacency.setdefault(source, []).append(
+                    (target, rate, capacity)
+                )
+            graph.adj = adjacency
 
     def physical_workloads(self, epoch_length_s: float) -> Dict[str, dict]:
         """Return active fault loads for Basilisk's power/thermal nodes."""
@@ -179,54 +289,29 @@ class FaultInjector:
             # Zero the reliability (used by z_kv) AND drop the ISL edge from the
             # epoch graphs so earliest_arrival — which ignores reliability — can
             # no longer route the tile over the disrupted link at full latency.
-            disrupted = set()
             for link_str in fault.targets:
                 a, b = link_str.split(":")
-                self.reliability.disable_link(a, b)
-                self.reliability.disable_link(b, a)
                 for epoch in range(fault.start_epoch, fault.end_epoch):
                     self.reliability.record_link_pi(a, b, epoch, 0.0)
                     self.reliability.record_link_pi(b, a, epoch, 0.0)
-                disrupted.add((a, b))
-                disrupted.add((b, a))
-            self._remove_edges(fault, lambda na, nb: (na, nb) in disrupted)
 
         elif ft == "plane_outage":
             # targets: list of satellite IDs in the affected plane
             for sat_id in fault.targets:
-                if sat_id in self.states:
-                    self.states[sat_id].inject_failure()
-                self.reliability.set_node_pi(sat_id, 0.0)
                 for epoch in range(fault.start_epoch, fault.end_epoch):
                     self.reliability.record_node_pi(sat_id, epoch, 0.0)
 
         elif ft == "helper_failure":
             for sat_id in fault.targets:
-                if sat_id in self.states:
-                    self.states[sat_id].inject_failure()
-                self.reliability.set_node_pi(sat_id, 0.0)
                 for epoch in range(fault.start_epoch, fault.end_epoch):
                     self.reliability.record_node_pi(sat_id, epoch, 0.0)
 
         elif ft == "straggler":
-            factor = fault.params.get("factor", 0.1)
-            snapshot = self._compute_snapshots.setdefault(id(fault), {})
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    state = self.states[sat_id]
-                    snapshot[sat_id] = state._compute_rate_multiplier
-                    state._compute_rate_multiplier *= factor
-                    state.C_i = state._effective_compute_rate()
+            pass
 
         elif ft == "ground_contact_miss":
             # Remove sat→ground edges from epoch graphs for the fault duration
             # so both feasibility routing and the realized-MC layer see no downlink.
-            gs = self.gs_names
-            tgt = set(fault.targets)
-            self._remove_edges(
-                fault,
-                lambda na, nb: (na in tgt and nb in gs) or (nb in tgt and na in gs),
-            )
             for sat_id in fault.targets:
                 for epoch in range(fault.start_epoch, fault.end_epoch):
                     self.reliability.record_downlink_pi(
@@ -236,12 +321,14 @@ class FaultInjector:
         elif ft == "downlink_adverse":
             # Adverse weather / degraded ground contact: the aggregator can still
             # route (edge stays up) but its downlink succeeds with reduced π.
-            adv_pi = fault.params.get("pi", DEFAULT_DOWNLINK_ADV_PI)
+            adv_pi = float(fault.params.get("pi", DEFAULT_DOWNLINK_ADV_PI))
             for sat_id in fault.targets:
-                self.reliability.set_downlink_pi(sat_id, adv_pi)
                 for epoch in range(fault.start_epoch, fault.end_epoch):
+                    existing = self.reliability._downlink_history.get(
+                        (sat_id, epoch), self.reliability.default_downlink_pi
+                    )
                     self.reliability.record_downlink_pi(
-                        sat_id, epoch, adv_pi
+                        sat_id, epoch, min(existing, adv_pi)
                     )
 
         elif ft == "battery_shortage":
@@ -250,112 +337,7 @@ class FaultInjector:
             pass
 
         elif ft == "thermal_throttle":
-            factor = fault.params.get("factor", 0.5)
-            snapshot = self._thermal_snapshots.setdefault(id(fault), {})
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    s = self.states[sat_id]
-                    snapshot[sat_id] = s._environment_thermal_multiplier
-                    s._environment_thermal_multiplier = max(
-                        0.0, min(1.0, factor)
-                    )
-                    s.C_i = s._effective_compute_rate()
-
-    def _withdraw(self, fault: FaultEvent):
-        ft = fault.fault_type
-
-        if ft == "isl_disruption":
-            for link_str in fault.targets:
-                a, b = link_str.split(":")
-                # Restore to defaults
-                if (a, b) in self.reliability._link_overrides:
-                    del self.reliability._link_overrides[(a, b)]
-                if (b, a) in self.reliability._link_overrides:
-                    del self.reliability._link_overrides[(b, a)]
-            self._restore_edges(fault)
-
-        elif ft in ("plane_outage", "helper_failure"):
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    self.states[sat_id].recover()
-                if sat_id in self.reliability._node_overrides:
-                    del self.reliability._node_overrides[sat_id]
-
-        elif ft == "straggler":
-            # Restore the pre-fault multiplier, then recompute C_i from the
-            # current thermal state.  This keeps the straggler active across
-            # end-of-epoch thermal/rate updates.
-            snapshot = self._compute_snapshots.pop(id(fault), {})
-            for sat_id in fault.targets:
-                if sat_id in self.states and sat_id in snapshot:
-                    state = self.states[sat_id]
-                    state._compute_rate_multiplier = snapshot[sat_id]
-                    state.C_i = state._effective_compute_rate()
-
-        elif ft == "ground_contact_miss":
-            self._restore_edges(fault)
-
-        elif ft == "downlink_adverse":
-            for sat_id in fault.targets:
-                self.reliability._downlink_overrides.pop(sat_id, None)
-
-        elif ft == "battery_shortage":
-            # Removing the load does not manufacture charge; the Basilisk
-            # panel/battery model determines whether and when recovery occurs.
             pass
-
-        elif ft == "thermal_throttle":
-            snapshot = self._thermal_snapshots.pop(id(fault), {})
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    s = self.states[sat_id]
-                    if sat_id in snapshot:
-                        s._environment_thermal_multiplier = snapshot[sat_id]
-                    s.C_i = s._effective_compute_rate()
-                    s._update_availability()
-
-    # ── epoch-graph edge removal/restore (shared by graph-mutating faults) ─────
-
-    def _remove_edges(self, fault: FaultEvent, drop):
-        """Remove every edge (a→b) with drop(a, b) True from the epoch graphs in
-        [start_epoch, end_epoch), recording them so _restore_edges can replay.
-        `drop` is a predicate over ordered endpoints; pass a symmetric predicate
-        to remove both directions of a link."""
-        fault_id = id(fault)
-        self._removed_edges[fault_id] = {}
-        for ep_idx in range(fault.start_epoch, fault.end_epoch):
-            if ep_idx >= len(self.graphs):
-                continue
-            g = self.graphs[ep_idx]
-            kept, kept_windows, removed = [], [], []
-            for edge, window in zip(g.edges, g.edge_windows):
-                if drop(edge[0], edge[1]):
-                    removed.append((edge, window))
-                else:
-                    kept.append(edge)
-                    kept_windows.append(window)
-            if removed:
-                self._removed_edges[fault_id][ep_idx] = removed
-                g.edges = kept
-                g.edge_windows = kept_windows
-                adj: Dict[str, list] = {}
-                for (na, nb, rate, cap, _t) in kept:
-                    adj.setdefault(na, []).append((nb, rate, cap))
-                g.adj = adj
-
-    def _restore_edges(self, fault: FaultEvent):
-        """Replay the edges removed by _remove_edges for this fault and rebuild
-        each affected graph's adjacency list."""
-        removed_by_ep = self._removed_edges.pop(id(fault), {})
-        for ep_idx, entries in removed_by_ep.items():
-            if ep_idx < len(self.graphs):
-                g = self.graphs[ep_idx]
-                g.edges.extend(edge for edge, _window in entries)
-                g.edge_windows.extend(window for _edge, window in entries)
-                adj: Dict[str, list] = {}
-                for (na, nb, rate, cap, _t) in g.edges:
-                    adj.setdefault(na, []).append((nb, rate, cap))
-                g.adj = adj
 
     # ── convenience factory methods ───────────────────────────────────────────
 
