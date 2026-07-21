@@ -142,20 +142,17 @@ def test_fault_viability_cannot_mix_shards_from_different_groups():
     assert _assignment_viable(assignment, states)
 
 
-def test_fault_viability_accepts_any_two_of_three_coded_shards():
+def test_fault_viability_rejects_oversized_reconstruction_group():
     assignment = SimpleNamespace(
         helpers=("h0", "h1", "h2"),
         aggregators=("h0", "h1", "h2"),
         metadata={"data_shards": 2, "shard_groups": (0, 0, 0)},
     )
     states = {
-        "h0": SimpleNamespace(A_i=True),
-        "h1": SimpleNamespace(A_i=False),
-        "h2": SimpleNamespace(A_i=True),
+        name: SimpleNamespace(A_i=True)
+        for name in assignment.helpers
     }
 
-    assert _assignment_viable(assignment, states)
-    states["h2"].A_i = False
     assert not _assignment_viable(assignment, states)
 
 
@@ -168,59 +165,6 @@ def test_direct_downlink_requires_source_only_until_delivery():
 
     assert not _assignment_viable(assignment, states, sim_time=60.0)
     assert _assignment_viable(assignment, states, sim_time=100.0)
-
-
-def test_ordi_can_select_two_of_three_coded_fanout():
-    states = {
-        "src": _view("src"),
-        "h1": _view("h1"),
-        "h2": _view("h2"),
-    }
-    contacts = (
-        ContactWindow("src", "h1", 0.0, 10.0, 1e9, "data"),
-        ContactWindow("src", "h2", 0.0, 10.0, 1e9, "data"),
-        ContactWindow("src", "ground", 0.0, 10.0, 1e9, "downlink"),
-        ContactWindow("h1", "ground", 0.0, 10.0, 1e9, "downlink"),
-        ContactWindow("h2", "ground", 0.0, 10.0, 1e9, "downlink"),
-    )
-    tile = SimpleNamespace(
-        tile_id=0, n_replicas_max=1, d_in_bits=100.0,
-        d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
-    )
-    task = SimpleNamespace(
-        task_id=1, source_sat="src", deadline=10.0, tiles=[tile]
-    )
-    request = EpochInput(
-        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts,
-        weights=PolicyWeights(
-            freshness=0.0, energy=0.0, communication=0.0,
-            replication=0.0,
-        ),
-    )
-    scheduler = ORDI(
-        max_replicas=1,
-        split_options=(1,),
-        coded_options=((2, 3),),
-    )
-    scheduler.messages.seed_knowledge(
-        "src", states, generated_at=0.0, delivered_at=0.0
-    )
-
-    assignment = scheduler.schedule(request).assignments[0]
-
-    assert assignment.metadata["coded"]
-    assert assignment.metadata["data_shards"] == 2
-    assert assignment.metadata["fanout_shards"] == 3
-    assert assignment.metadata["shard_groups"] == (0, 0, 0)
-    assert assignment.metadata["effective_replicas"] == pytest.approx(1.5)
-    assert len(assignment.helpers) == 3
-    assert sum(assignment.work_fractions) == pytest.approx(1.575)
-
-
-def test_two_of_three_probability():
-    assert ORDI._at_least_k_probability(
-        [0.5, 0.5, 0.5], 2
-    ) == pytest.approx(0.5)
 
 
 def test_backup_disjointness_includes_downlink_relays():

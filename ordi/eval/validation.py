@@ -329,9 +329,9 @@ class DecisionFeasibilityModel:
                 grouped = {}
                 for label, finish in zip(shard_groups, finishes):
                     grouped.setdefault(label, []).append(finish)
-                if any(len(group) < required for group in grouped.values()):
+                if any(len(group) != required for group in grouped.values()):
                     raise InvalidDecisionError(
-                        f"assignment {key} must provide at least {required} "
+                        f"assignment {key} must provide exactly {required} "
                         "shards in every reconstruction group"
                     )
                 feasible_delivery = min(

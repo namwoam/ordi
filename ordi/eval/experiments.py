@@ -398,7 +398,7 @@ def _assignment_group_viability(a: Assignment, states):
     for label, alive in zip(shard_groups, viable):
         grouped.setdefault(label, []).append(alive)
     return {
-        label: len(group) >= required and sum(group) >= required
+        label: len(group) == required and all(group)
         for label, group in grouped.items()
     }
 
@@ -914,7 +914,6 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         sched = scheduler_class(
             max_replicas=cfg.max_backups + 1,
             split_options=cfg.ordi_split_options,
-            coded_options=cfg.ordi_coded_options,
             halo_fraction=cfg.split_halo_fraction,
             rng_seed=seed,
         )

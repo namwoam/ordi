@@ -256,6 +256,21 @@ class MessageSimulator:
         ground_bits = 0.0
         executed_shards = set()
         required = int(assignment.metadata.get("data_shards", 1))
+        shard_groups = assignment.metadata.get("shard_groups")
+        if shard_groups is not None:
+            group_sizes = {}
+            for label in shard_groups:
+                group_sizes[label] = group_sizes.get(label, 0) + 1
+            if (len(shard_groups) != len(assignment.helpers)
+                    or any(size != required for size in group_sizes.values())):
+                raise InvalidDecisionError(
+                    "every reconstruction group must contain exactly "
+                    f"{required} required shards"
+                )
+        elif len(assignment.helpers) != required:
+            raise InvalidDecisionError(
+                f"assignment must contain exactly {required} required shards"
+            )
 
         terminal = [
             local for local in assignment.node_decisions
@@ -355,10 +370,7 @@ class MessageSimulator:
         while event_queue:
             now, _order, event, message, _path = heapq.heappop(event_queue)
             if now > task.deadline + 1e-9:
-                if any(
-                    len(times) >= required
-                    for times in completed.values()
-                ):
+                if any(len(times) == required for times in completed.values()):
                     continue
                 raise InvalidDecisionError(
                     f"protocol message {message.message_id} misses deadline"
@@ -487,7 +499,7 @@ class MessageSimulator:
         complete_groups = [
             sorted(times)[required - 1]
             for times in completed.values()
-            if len(times) >= required
+            if len(times) == required
         ]
         if not complete_groups:
             raise InvalidDecisionError(
