@@ -52,6 +52,14 @@ class OrdiDynamics(dyn.GroundStationDynModel):
             self.communicationSink.nodePowerOutMsg
         )
 
+        self.faultSink = simplePowerSink.SimplePowerSink()
+        self.faultSink.ModelTag = "ordiFault" + self.satellite.name
+        self.faultSink.nodePowerOut = 0.0
+        self.simulator.AddModelToTask(
+            self.task_name, self.faultSink, ModelPriority=893
+        )
+        self.powerMonitor.addPowerNodeToModel(self.faultSink.nodePowerOutMsg)
+
         self.thermalSensor = sensorThermal.SensorThermal()
         self.thermalSensor.ModelTag = "ordiThermal" + self.satellite.name
         self.thermalSensor.T_0 = kwargs.get("thermal_init_c", 25.0)
@@ -69,7 +77,7 @@ class OrdiDynamics(dyn.GroundStationDynModel):
         self.thermalSensor.sunEclipseInMsg.subscribeTo(
             self.world.eclipseObject.eclipseOutMsgs[self.eclipse_index]
         )
-        self.simulator.AddModelToTask(self.task_name, self.thermalSensor, ModelPriority=893)
+        self.simulator.AddModelToTask(self.task_name, self.thermalSensor, ModelPriority=892)
 
     @property
     def temperature_c(self) -> float:
@@ -105,10 +113,17 @@ class Workload:
     rx_bits: float = 0.0
     downlink_bits: float = 0.0
     stored_bits: float = 0.0
+    fault_power_w: float = 0.0
+    fault_heat_w: float = 0.0
     # Absolute simulation-time intervals reserved by the shared contact ledger.
     # They remain pending in BasiliskBackend until their epoch is simulated.
     tx_intervals: tuple[tuple[float, float], ...] = ()
     rx_intervals: tuple[tuple[float, float], ...] = ()
+    tx_interval_owners: tuple[object, ...] = ()
+    rx_interval_owners: tuple[object, ...] = ()
+    # (start, finish, FLOPs, owner). Compute is not eligible before start,
+    # which is the shared ledger's input-delivery completion time.
+    compute_intervals: tuple[tuple[float, float, float, object], ...] = ()
 
 
 def _service_compute_queue(queued_flops: float, incoming_flops: float,
@@ -134,9 +149,9 @@ def _service_compute_queue(queued_flops: float, incoming_flops: float,
 def _interval_active_seconds(intervals, start: float, end: float) -> float:
     """Union length of intervals overlapping [start, end)."""
     clipped = sorted(
-        (max(start, begin), min(end, finish))
-        for begin, finish in intervals
-        if finish > start and begin < end
+        (max(start, interval[0]), min(end, interval[1]))
+        for interval in intervals
+        if interval[1] > start and interval[0] < end
     )
     total = 0.0
     cursor_start = cursor_end = None
@@ -201,6 +216,8 @@ class BasiliskBackend:
         self._communication_schedule = {
             sid: {"tx": [], "rx": []} for sid in self.sat_ids
         }
+        self._compute_schedule = {sid: [] for sid in self.sat_ids}
+        self._scheduled_compute_remaining = {sid: 0.0 for sid in self.sat_ids}
         self._sim_time_s = 0.0
         if ground_stations:
             stations = [
@@ -304,6 +321,12 @@ class BasiliskBackend:
             self._communication_schedule = {
                 sid: {"tx": [], "rx": []} for sid in self.sat_ids
             }
+        if not hasattr(self, "_compute_schedule"):
+            self._compute_schedule = {sid: [] for sid in self.sat_ids}
+        if not hasattr(self, "_scheduled_compute_remaining"):
+            self._scheduled_compute_remaining = {
+                sid: 0.0 for sid in self.sat_ids
+            }
         epoch_start = getattr(self, "_sim_time_s", 0.0)
         epoch_end = epoch_start + self.epoch_length_s
         for sid in self.sat_ids:
@@ -312,13 +335,41 @@ class BasiliskBackend:
             sat = self.satellites[sid]
             d = sat.dynamics
             state = self.states[sid]
-            state.Q_i, compute_time = _service_compute_queue(
-                state.Q_i,
-                w.compute_flops,
+            compute_schedule = self._compute_schedule[sid]
+            previous_scheduled = self._scheduled_compute_remaining[sid]
+            external_backlog = max(0.0, state.Q_i - previous_scheduled)
+            if w.compute_intervals:
+                compute_schedule.extend(w.compute_intervals)
+            else:
+                external_backlog += max(0.0, w.compute_flops)
+            external_remaining, external_time = _service_compute_queue(
+                external_backlog,
+                0.0,
                 state.C_i,
                 self.epoch_length_s,
                 available=bool(state.A_i),
             )
+            timed_compute_time = _interval_active_seconds(
+                compute_schedule, epoch_start, epoch_end
+            ) if state.A_i else 0.0
+            compute_time = min(
+                self.epoch_length_s, external_time + timed_compute_time
+            )
+            remaining_schedule = []
+            scheduled_remaining = 0.0
+            for interval in compute_schedule:
+                start, finish, flops = interval[:3]
+                if finish <= epoch_end + 1e-9:
+                    continue
+                duration = max(finish - start, 1e-12)
+                remaining_fraction = max(
+                    0.0, min(1.0, (finish - max(epoch_end, start)) / duration)
+                )
+                remaining_schedule.append(interval)
+                scheduled_remaining += flops * remaining_fraction
+            self._compute_schedule[sid] = remaining_schedule
+            self._scheduled_compute_remaining[sid] = scheduled_remaining
+            state.Q_i = external_remaining + scheduled_remaining
             duty_cycle = (
                 compute_time / self.epoch_length_s
                 if self.epoch_length_s > 0.0 else 0.0
@@ -329,14 +380,28 @@ class BasiliskBackend:
             d.computeSink.powerStatus = int(compute_time > 0.0)
             schedule = self._communication_schedule[sid]
             if w.tx_intervals or w.rx_intervals:
-                schedule["tx"].extend(w.tx_intervals)
-                schedule["rx"].extend(w.rx_intervals)
+                schedule["tx"].extend(
+                    (*interval, owner)
+                    for interval, owner in zip(
+                        w.tx_intervals,
+                        w.tx_interval_owners
+                        or (None,) * len(w.tx_intervals),
+                    )
+                )
+                schedule["rx"].extend(
+                    (*interval, owner)
+                    for interval, owner in zip(
+                        w.rx_intervals,
+                        w.rx_interval_owners
+                        or (None,) * len(w.rx_intervals),
+                    )
+                )
             else:
                 # Untimed callers still get persistent service instead of
                 # losing traffic beyond the current epoch.
                 cursor = max(
                     epoch_start,
-                    max((finish for _begin, finish in schedule["tx"]),
+                    max((interval[1] for interval in schedule["tx"]),
                         default=epoch_start),
                 )
                 tx_seconds = max(0.0, w.tx_bits) / ISL_RATE_BPS
@@ -352,7 +417,7 @@ class BasiliskBackend:
                 if rx_seconds:
                     rx_start = max(
                         epoch_start,
-                        max((finish for _begin, finish in schedule["rx"]),
+                        max((interval[1] for interval in schedule["rx"]),
                             default=epoch_start),
                     )
                     schedule["rx"].append(
@@ -368,12 +433,19 @@ class BasiliskBackend:
             )
             d.communicationSink.nodePowerOut = -communication_power
             d.communicationSink.powerStatus = int(communication_power > 0.0)
+            fault_sink = getattr(d, "faultSink", None)
+            if fault_sink is not None:
+                fault_sink.nodePowerOut = -max(0.0, w.fault_power_w)
+                fault_sink.powerStatus = int(w.fault_power_w > 0.0)
             payload_power = max(0.0, -d.computeSink.nodePowerOut) + max(
                 0.0, -d.communicationSink.nodePowerOut
             )
-            d.thermalSensor.sensorPowerDraw = payload_power
-            d.thermalSensor.sensorPowerStatus = int(payload_power > 0.0)
-            workload_energy_j += payload_power * self.epoch_length_s
+            thermal_power = payload_power + max(0.0, w.fault_heat_w)
+            d.thermalSensor.sensorPowerDraw = thermal_power
+            d.thermalSensor.sensorPowerStatus = int(thermal_power > 0.0)
+            workload_energy_j += (
+                payload_power + max(0.0, w.fault_power_w)
+            ) * self.epoch_length_s
             schedule["tx"] = [
                 interval for interval in schedule["tx"]
                 if interval[1] > epoch_end + 1e-9
@@ -387,6 +459,34 @@ class BasiliskBackend:
         self._sim_time_s = epoch_end
         self._sync_projection()
         return workload_energy_j
+
+    def cancel(self, owner, sim_time: float | None = None) -> None:
+        """Remove an abandoned assignment's unexecuted physical workload."""
+        cutoff = self._sim_time_s if sim_time is None else float(sim_time)
+        for sid in self.sat_ids:
+            for channel in ("tx", "rx"):
+                self._communication_schedule[sid][channel] = [
+                    interval for interval in self._communication_schedule[sid][channel]
+                    if len(interval) < 3 or interval[2] != owner
+                    or interval[0] < cutoff
+                ]
+            self._compute_schedule[sid] = [
+                interval for interval in self._compute_schedule[sid]
+                if len(interval) < 4 or interval[3] != owner
+                or interval[0] < cutoff
+            ]
+            remaining = 0.0
+            for interval in self._compute_schedule[sid]:
+                start, finish, flops = interval[:3]
+                duration = max(finish - start, 1e-12)
+                remaining += flops * max(
+                    0.0, min(1.0, (finish - max(cutoff, start)) / duration)
+                )
+            old_remaining = self._scheduled_compute_remaining.get(sid, 0.0)
+            self.states[sid].Q_i = max(
+                0.0, self.states[sid].Q_i - old_remaining + remaining
+            )
+            self._scheduled_compute_remaining[sid] = remaining
 
     def close(self):
         self.env.close()

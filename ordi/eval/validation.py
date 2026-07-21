@@ -32,6 +32,7 @@ class DecisionFeasibilityModel:
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
     ground_compute_ready_at: dict[str, float] = field(default_factory=dict)
+    reservations: list[dict] = field(default_factory=list)
 
     def _copy(self):
         return DecisionFeasibilityModel(
@@ -39,9 +40,11 @@ class DecisionFeasibilityModel:
             self.contact_residual_bits.copy(),
             self.compute_ready_at.copy(),
             self.ground_compute_ready_at.copy(),
+            [record.copy() for record in self.reservations],
         )
 
-    def _reserve_hop(self, request, source, target, bits, start, trace=None):
+    def _reserve_hop(self, request, source, target, bits, start, trace=None,
+                     owner=None):
         candidates = sorted(
             (contact for contact in request.contacts
              if contact.source == source and contact.target == target),
@@ -64,6 +67,11 @@ class DecisionFeasibilityModel:
                 continue
             self.contact_residual_bits[key] = residual - bits
             self.contact_ready_at[key] = finish
+            self.reservations.append({
+                "owner": owner, "kind": "contact", "resource": key,
+                "start": depart, "finish": finish, "amount": bits,
+                "capacity": capacity,
+            })
             if trace is not None:
                 trace.append(
                     (source, target, depart, finish, contact.kind)
@@ -74,15 +82,16 @@ class DecisionFeasibilityModel:
             f"({bits:.3f} bits after t={start:.6f})"
         )
 
-    def _reserve_path(self, request, path, bits, start, trace=None):
+    def _reserve_path(self, request, path, bits, start, trace=None, owner=None):
         now = start
         for source, target in zip(path, path[1:]):
             now = self._reserve_hop(
-                request, source, target, bits, now, trace=trace
+                request, source, target, bits, now, trace=trace, owner=owner
             )
         return now
 
-    def _reserve_compute(self, request, helper, work, start):
+    def _reserve_compute(self, request, helper, work, start, trace=None,
+                         owner=None):
         state = request.satellites.get(helper)
         if state is None or not state.available:
             raise InvalidDecisionError(
@@ -96,9 +105,15 @@ class DecisionFeasibilityModel:
         )
         finish = compute_start + work / max(state.compute_rate, 1.0)
         self.compute_ready_at[helper] = finish
+        self.reservations.append({
+            "owner": owner, "kind": "compute", "resource": helper,
+            "start": compute_start, "finish": finish, "amount": work,
+        })
+        if trace is not None:
+            trace.append((helper, compute_start, finish, work))
         return finish
 
-    def _reserve_ground_compute(self, station, work, rate, start):
+    def _reserve_ground_compute(self, station, work, rate, start, owner=None):
         if not station:
             raise InvalidDecisionError("ground compute has no station")
         if rate <= 0.0:
@@ -110,7 +125,54 @@ class DecisionFeasibilityModel:
         )
         finish = compute_start + max(0.0, work) / rate
         self.ground_compute_ready_at[station] = finish
+        self.reservations.append({
+            "owner": owner, "kind": "ground_compute", "resource": station,
+            "start": compute_start, "finish": finish, "amount": work,
+        })
         return finish
+
+    def cancel(self, owner, sim_time: float) -> None:
+        """Release an assignment's unconsumed future reservations."""
+        kept = []
+        for record in self.reservations:
+            if record["owner"] != owner or record["finish"] <= sim_time:
+                kept.append(record)
+                continue
+            if record["start"] < sim_time and record["kind"] == "contact":
+                duration = record["finish"] - record["start"]
+                consumed = ((sim_time - record["start"]) / duration
+                            if duration > 0.0 else 1.0)
+                partial = record.copy()
+                partial["finish"] = sim_time
+                partial["amount"] *= max(0.0, min(1.0, consumed))
+                kept.append(partial)
+        self.reservations = kept
+        self.contact_ready_at.clear()
+        self.contact_residual_bits.clear()
+        self.compute_ready_at.clear()
+        self.ground_compute_ready_at.clear()
+        for record in kept:
+            kind = record["kind"]
+            resource = record["resource"]
+            if kind == "contact":
+                self.contact_residual_bits[resource] = (
+                    self.contact_residual_bits.get(
+                        resource, record["capacity"]
+                    ) - record["amount"]
+                )
+                self.contact_ready_at[resource] = max(
+                    self.contact_ready_at.get(resource, resource[2]),
+                    record["finish"],
+                )
+            elif kind == "compute":
+                self.compute_ready_at[resource] = max(
+                    self.compute_ready_at.get(resource, 0.0), record["finish"]
+                )
+            elif kind == "ground_compute":
+                self.ground_compute_ready_at[resource] = max(
+                    self.ground_compute_ready_at.get(resource, 0.0),
+                    record["finish"],
+                )
 
     def validate_and_reserve(self, request: EpochInput, decision: Decision,
                              *, retime: bool = False):
@@ -150,6 +212,7 @@ class DecisionFeasibilityModel:
                 )
 
             communication_intervals = []
+            compute_intervals = []
             reserved_handshakes = set()
             for event in assignment.message_events:
                 reservation_key = (
@@ -165,7 +228,7 @@ class DecisionFeasibilityModel:
                     continue
                 trial._reserve_hop(
                     request, event.node, event.peer, event.bits, event.time,
-                    trace=communication_intervals,
+                    trace=communication_intervals, owner=key,
                 )
                 reserved_handshakes.add(reservation_key)
 
@@ -183,7 +246,7 @@ class DecisionFeasibilityModel:
                 ))
                 downlink_finish = trial._reserve_path(
                     request, path, bits, request.sim_time,
-                    trace=communication_intervals,
+                    trace=communication_intervals, owner=key,
                 )
                 source_release_time = downlink_finish
                 ground_work = float(assignment.metadata.get(
@@ -201,7 +264,8 @@ class DecisionFeasibilityModel:
                     "ground_station", path[-1]
                 ))
                 finishes.append(trial._reserve_ground_compute(
-                    station, ground_work, ground_rate, downlink_finish
+                    station, ground_work, ground_rate, downlink_finish,
+                    owner=key,
                 ))
             else:
                 if len(assignment.routes) != len(assignment.helpers):
@@ -301,11 +365,13 @@ class DecisionFeasibilityModel:
                         tile.d_in_bits * input_fraction
                         + protocol_header_bits,
                         request.sim_time, trace=communication_intervals,
+                        owner=key,
                     )
                     input_done = now
                     now = trial._reserve_compute(
                         request, helper,
                         tile.compute_ops * work_fraction, now,
+                        trace=compute_intervals, owner=key,
                     )
                     compute_done = now
                     now = trial._reserve_path(
@@ -313,6 +379,7 @@ class DecisionFeasibilityModel:
                         tile.d_out_bits * output_fraction
                         + protocol_header_bits, now,
                         trace=communication_intervals,
+                        owner=key,
                     )
                     output_done = now
                     now = trial._reserve_path(
@@ -320,6 +387,7 @@ class DecisionFeasibilityModel:
                         tile.d_out_bits * output_fraction
                         + protocol_header_bits, now,
                         trace=communication_intervals,
+                        owner=key,
                     )
                     finishes.append(now)
                     replica_phase_ends.append(
@@ -384,6 +452,7 @@ class DecisionFeasibilityModel:
                 metadata["communication_intervals"] = tuple(
                     communication_intervals
                 )
+                metadata["compute_intervals"] = tuple(compute_intervals)
                 ground_work = float(metadata.get("ground_compute_flops", 0.0))
                 ground_rate = float(metadata.get(
                     "ground_compute_rate_flops_per_s", 0.0
@@ -402,6 +471,7 @@ class DecisionFeasibilityModel:
         self.contact_residual_bits = trial.contact_residual_bits
         self.compute_ready_at = trial.compute_ready_at
         self.ground_compute_ready_at = trial.ground_compute_ready_at
+        self.reservations = trial.reservations
         return (replace(decision, assignments=tuple(accepted))
                 if retime else decision)
 

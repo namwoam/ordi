@@ -463,21 +463,28 @@ def compute_realized_metrics(
                 return True
             key = (nid, period)
             if key not in node_alive:
-                node_alive[key] = rng.random() < reliability.node_pi(nid)
+                node_alive[key] = (
+                    rng.random() < reliability.node_pi(nid, epoch=period)
+                )
             return node_alive[key]
 
         def link_ok(pair: Tuple[str, str], period: int) -> bool:
             key = (pair, period)
             if key not in link_alive:
                 link_alive[key] = (
-                    rng.random() < reliability.link_pi(pair[0], pair[1], "isl")
+                    rng.random() < reliability.link_pi(
+                        pair[0], pair[1], "isl", epoch=period
+                    )
                 )
             return link_alive[key]
 
         def down_ok(nid: str, period: int) -> bool:
             key = (nid, period)
             if key not in down_alive:
-                down_alive[key] = rng.random() < reliability.downlink_pi(nid)
+                down_alive[key] = (
+                    rng.random()
+                    < reliability.downlink_pi(nid, epoch=period)
+                )
             return down_alive[key]
 
         n_miss = 0

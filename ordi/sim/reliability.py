@@ -38,6 +38,9 @@ class ReliabilityModel:
     # Per-aggregator downlink overrides: node_id → downlink probability
     # (adverse weather / degraded ground contact for specific aggregators)
     _downlink_overrides: Dict[str, float] = None
+    _link_history: Dict[Tuple[str, str, int], float] = None
+    _node_history: Dict[Tuple[str, int], float] = None
+    _downlink_history: Dict[Tuple[str, int], float] = None
 
     def __post_init__(self):
         if self._link_overrides is None:
@@ -46,29 +49,56 @@ class ReliabilityModel:
             self._node_overrides = {}
         if self._downlink_overrides is None:
             self._downlink_overrides = {}
+        if self._link_history is None:
+            self._link_history = {}
+        if self._node_history is None:
+            self._node_history = {}
+        if self._downlink_history is None:
+            self._downlink_history = {}
 
-    def link_pi(self, node_a: str, node_b: str, link_type: str = "isl") -> float:
+    def link_pi(self, node_a: str, node_b: str, link_type: str = "isl",
+                epoch: Optional[int] = None) -> float:
         """Probability that link (a→b) remains usable for a scheduled transfer."""
         key = (node_a, node_b)
+        if epoch is not None and (*key, epoch) in self._link_history:
+            return self._link_history[(*key, epoch)]
         if key in self._link_overrides:
             return self._link_overrides[key]
         if link_type == "downlink":
             return self.default_downlink_pi
         return self.default_isl_pi
 
-    def node_pi(self, node_id: str) -> float:
+    def node_pi(self, node_id: str, epoch: Optional[int] = None) -> float:
         """Survival probability of node during one epoch."""
+        if epoch is not None and (node_id, epoch) in self._node_history:
+            return self._node_history[(node_id, epoch)]
         if node_id in self._node_overrides:
             return self._node_overrides[node_id]
         return self.default_node_pi
 
-    def downlink_pi(self, aggregator_id: str) -> float:
+    def downlink_pi(self, aggregator_id: str,
+                    epoch: Optional[int] = None) -> float:
         """Probability that the aggregator's downlink to ground succeeds.
         Falls back to the clear-sky default; an adverse-weather fault sets a
         per-aggregator override (e.g. DEFAULT_DOWNLINK_ADV_PI)."""
+        if (epoch is not None
+                and (aggregator_id, epoch) in self._downlink_history):
+            return self._downlink_history[(aggregator_id, epoch)]
         if aggregator_id in self._downlink_overrides:
             return self._downlink_overrides[aggregator_id]
         return self.default_downlink_pi
+
+    def record_link_pi(self, node_a: str, node_b: str, epoch: int,
+                       probability: float) -> None:
+        self._link_history[(node_a, node_b, int(epoch))] = probability
+
+    def record_node_pi(self, node_id: str, epoch: int,
+                       probability: float) -> None:
+        self._node_history[(node_id, int(epoch))] = probability
+
+    def record_downlink_pi(self, node_id: str, epoch: int,
+                           probability: float) -> None:
+        self._downlink_history[(node_id, int(epoch))] = probability
 
     def path_pi(self, path: list, link_type: str = "isl") -> float:
         """

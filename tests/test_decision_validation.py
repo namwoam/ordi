@@ -90,6 +90,27 @@ def test_retiming_records_exact_communication_intervals():
     assert all(finish > start for _src, _dst, start, finish, _kind in intervals)
 
 
+def test_compute_waits_for_input_and_cancel_releases_future_reservations():
+    model = DecisionFeasibilityModel()
+    request = _request(contact_bits=200.0)
+    accepted = model.validate_and_reserve(
+        request, _replicated_decision(), retime=True
+    )
+
+    communication = accepted.assignments[0].metadata["communication_intervals"]
+    compute = accepted.assignments[0].metadata["compute_intervals"]
+    first_input_finish = communication[1][3]
+    assert compute[0][1] >= first_input_finish
+    assert model.compute_ready_at
+
+    model.cancel((1, 0), request.sim_time)
+    assert not model.compute_ready_at
+    assert not any(
+        record["owner"] == (1, 0) for record in model.reservations
+    )
+    model.validate_and_reserve(request, _replicated_decision(), retime=True)
+
+
 def test_model_side_admission_drops_only_invalid_assignments():
     decision = replace(
         _replicated_decision(),

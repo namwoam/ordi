@@ -77,6 +77,7 @@ class StateTransitionTests(unittest.TestCase):
 
     def test_thermal_fault_reduces_and_restores_compute_rate(self):
         state = _state("sat")
+        original_temperature = state.Theta_i
         injector = FaultInjector(
             {"sat": state}, ReliabilityModel(), [], rng_seed=0
         )
@@ -87,11 +88,33 @@ class StateTransitionTests(unittest.TestCase):
 
         injector.apply_epoch(0)
         self.assertAlmostEqual(state.C_i, 0.25e9)
+        self.assertEqual(state.Theta_i, original_temperature)
+        self.assertGreater(
+            injector.physical_workloads(60.0)["sat"]["heat_w"], 0.0
+        )
         injector.refresh_active_state()
         self.assertAlmostEqual(state.C_i, 0.25e9)
 
         injector.withdraw_epoch(2)
         self.assertAlmostEqual(state.C_i, 1e9)
+        self.assertEqual(state.Theta_i, original_temperature)
+
+    def test_battery_fault_is_a_basilisk_load_not_a_state_overwrite(self):
+        state = _state("sat")
+        original_battery = state.B_i
+        injector = FaultInjector(
+            {"sat": state}, ReliabilityModel(), [], rng_seed=0
+        )
+        fault = FaultEvent("battery_shortage", 0, 1, ["sat"])
+        injector.schedule(fault)
+
+        injector.apply_epoch(0)
+        self.assertEqual(state.B_i, original_battery)
+        self.assertGreater(
+            injector.physical_workloads(60.0)["sat"]["power_w"], 0.0
+        )
+        injector.withdraw_epoch(1)
+        self.assertEqual(state.B_i, original_battery)
 
     def test_random_fault_mix_covers_compute_network_and_ground_domains(self):
         assert set(RANDOM_FAULT_TYPES) == {
@@ -223,6 +246,71 @@ class StateTransitionTests(unittest.TestCase):
         self.assertAlmostEqual(first, state.params.comms_power_w * 60.0)
         self.assertAlmostEqual(second, state.params.comms_power_w * 30.0)
         self.assertAlmostEqual(communication_sink.nodePowerOut, -2.5)
+
+    def test_backend_waits_for_input_ready_compute_interval(self):
+        state = _state("sat", rate_gflops=1.0)
+        compute_sink = SimpleNamespace(nodePowerOut=0.0, powerStatus=0)
+        dynamics = SimpleNamespace(
+            computeSink=compute_sink,
+            communicationSink=SimpleNamespace(
+                nodePowerOut=0.0, powerStatus=0,
+            ),
+            thermalSensor=SimpleNamespace(
+                sensorPowerDraw=0.0, sensorPowerStatus=0,
+            ),
+            battery_charge=state.B_i,
+            temperature_c=state.Theta_i,
+        )
+
+        class FakeSatellite:
+            name = "sat"
+            def __init__(self):
+                self.dynamics = dynamics
+            @staticmethod
+            def is_alive():
+                return True
+
+        backend = BasiliskBackend.__new__(BasiliskBackend)
+        backend.epoch_length_s = 60.0
+        backend.states = {"sat": state}
+        backend.sat_ids = ["sat"]
+        backend._work = {"sat": Workload()}
+        backend.env = SimpleNamespace(
+            satellites=[FakeSatellite()], step=lambda _actions: None,
+        )
+
+        workload = Workload(compute_intervals=(
+            (120.0, 180.0, 60e9, (1, 0)),
+        ))
+        first = backend.submit({"sat": workload})
+        second = backend.submit({})
+        self.assertEqual((first, second), (0.0, 0.0))
+        self.assertAlmostEqual(state.Q_i, 60e9)
+        third = backend.submit({})
+        self.assertAlmostEqual(third, state.params.compute_power_w * 60.0)
+        self.assertAlmostEqual(state.Q_i, 0.0)
+
+    def test_backend_cancel_removes_future_owned_work(self):
+        state = _state("sat")
+        backend = BasiliskBackend.__new__(BasiliskBackend)
+        backend.epoch_length_s = 60.0
+        backend.states = {"sat": state}
+        backend.sat_ids = ["sat"]
+        backend._sim_time_s = 0.0
+        backend._communication_schedule = {
+            "sat": {"tx": [(120.0, 121.0, (1, 0))], "rx": []}
+        }
+        backend._compute_schedule = {
+            "sat": [(120.0, 121.0, 1e9, (1, 0))]
+        }
+        backend._scheduled_compute_remaining = {"sat": 1e9}
+        state.Q_i = 1e9
+
+        backend.cancel((1, 0), 60.0)
+
+        self.assertEqual(backend._communication_schedule["sat"]["tx"], [])
+        self.assertEqual(backend._compute_schedule["sat"], [])
+        self.assertEqual(state.Q_i, 0.0)
 
     def test_backend_waits_until_reserved_contact_interval(self):
         state = _state("sat")

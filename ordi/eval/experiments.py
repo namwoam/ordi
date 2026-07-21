@@ -536,15 +536,22 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
     downlink_bits = {sat_id: 0.0 for sat_id in states}
     tx_intervals = {sat_id: [] for sat_id in states}
     rx_intervals = {sat_id: [] for sat_id in states}
+    tx_interval_owners = {sat_id: [] for sat_id in states}
+    rx_interval_owners = {sat_id: [] for sat_id in states}
+    compute_intervals = {sat_id: [] for sat_id in states}
 
-    def add_interval(sender, receiver, start, finish):
+    def add_interval(sender, receiver, start, finish, owner=None):
+        interval = (float(start), float(finish))
         if sender in tx_intervals:
-            tx_intervals[sender].append((float(start), float(finish)))
+            tx_intervals[sender].append(interval)
+            tx_interval_owners[sender].append(owner)
         if receiver in rx_intervals:
-            rx_intervals[receiver].append((float(start), float(finish)))
+            rx_intervals[receiver].append(interval)
+            rx_interval_owners[receiver].append(owner)
 
     for assignment in assignments:
-        source_and_tile = tile_by_key.get((assignment.task_id, assignment.tile_id))
+        assignment_key = (assignment.task_id, assignment.tile_id)
+        source_and_tile = tile_by_key.get(assignment_key)
         if source_and_tile is None:
             continue
         source, tile = source_and_tile
@@ -552,7 +559,13 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
             assignment.metadata.get("communication_intervals", ())
         )
         for sender, receiver, start, finish, _kind in timed_communication:
-            add_interval(sender, receiver, start, finish)
+            add_interval(sender, receiver, start, finish, assignment_key)
+        for helper, start, finish, work in assignment.metadata.get(
+                "compute_intervals", ()):
+            if helper in compute_intervals:
+                compute_intervals[helper].append(
+                    (float(start), float(finish), float(work), assignment_key)
+                )
 
         # Direct-downlink assignments have no compute replica.
         if not assignment.helpers:
@@ -579,7 +592,8 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
             per_helper_work = float(assignment.metadata.get(
                 "compute_flops", tile.compute_ops * work_fraction
             ))
-            compute_work[helper] += per_helper_work
+            if not assignment.metadata.get("compute_intervals"):
+                compute_work[helper] += per_helper_work
 
             bits = float(assignment.metadata.get(
                 "downlink_bits", tile.d_out_bits * output_fraction
@@ -672,14 +686,18 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
         sid: Workload(compute_flops=compute_work[sid], tx_bits=isl_tx_bits[sid],
                       rx_bits=rx_bits[sid], downlink_bits=downlink_bits[sid],
                       tx_intervals=tuple(tx_intervals[sid]),
-                      rx_intervals=tuple(rx_intervals[sid]))
+                      rx_intervals=tuple(rx_intervals[sid]),
+                      tx_interval_owners=tuple(tx_interval_owners[sid]),
+                      rx_interval_owners=tuple(rx_interval_owners[sid]),
+                      compute_intervals=tuple(compute_intervals[sid]))
         for sid in states
     }
 
 
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                        reliability=None, realized_trials=500, realized_seed=0,
-                       state_driver=None, outcome_callback=None):
+                       state_driver=None, outcome_callback=None,
+                       cancellation_callback=None):
     """Run one stateful rolling-horizon simulation and return a lifetime
     EpochMetrics.  schedule_fn(epoch, todo_tasks) -> Decision dispatches to an
     algorithm policy. A committed tile stays in-flight (not
@@ -771,6 +789,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                     outcome_callback("fault_failure")
                 feedback_reported.add(key)
                 fault_impacted.add(key)
+                if physical_backend is not None:
+                    physical_backend.cancel(key, ep_start)
+                if cancellation_callback is not None:
+                    cancellation_callback(key, ep_start)
                 del committed[key]
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
@@ -792,10 +814,18 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                 committed[(a.task_id, a.tile_id)] = a
                 newly_committed.append(a)
         if state_driver is None:
-            epoch_energy_j = physical_backend.submit(_advance_synthetic_states(
+            workloads = _advance_synthetic_states(
                 newly_committed, tasks, states, cfg.epoch_length,
                 protocol_events=result.message_events,
-            ))
+            )
+            if injector:
+                for sid, effect in injector.physical_workloads(
+                        cfg.epoch_length).items():
+                    if sid not in workloads:
+                        continue
+                    workloads[sid].fault_power_w += effect["power_w"]
+                    workloads[sid].fault_heat_w += effect["heat_w"]
+            epoch_energy_j = physical_backend.submit(workloads)
             physical_energy_j += float(epoch_energy_j or 0.0)
         if injector:
             injector.withdraw_epoch(epoch + 1)
@@ -1069,10 +1099,24 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
                 f"{error}"
             ) from error
 
+    def cancel_assignment(owner, sim_time):
+        feasibility.cancel(owner, sim_time)
+        # Decentralized policies retain a planning cache of the same physical
+        # resources. Keep it aligned with the authoritative ledger so a
+        # canceled future reservation is genuinely available for replanning.
+        messages = getattr(sched, "messages", None)
+        if messages is not None:
+            messages.contact_ready_at = feasibility.contact_ready_at.copy()
+            messages.contact_residual_bits = (
+                feasibility.contact_residual_bits.copy()
+            )
+            messages.compute_ready_at = feasibility.compute_ready_at.copy()
+
     m = _simulate_stateful(
         schedule_fn, tasks, sat_ids, local_states, cfg, injector,
         reliability=local_rel, realized_seed=seed,
         outcome_callback=getattr(sched, "observe_assignment_outcome", None),
+        cancellation_callback=cancel_assignment,
     )
     return result_key, [m]
 

@@ -7,8 +7,8 @@ Supports eight fault types from the proposal:
   3. Helper failure          - flip A_i=0 for a specific satellite
   4. Straggler               - scale C_i by factor for a helper during execution
   5. Ground-contact miss     - remove downlink window for N epochs
-  6. Battery shortage        - drain B_i below B_min
-  7. Thermal throttling      - set Θ_i above Θ_max to force throttle
+  6. Battery shortage        - add a Basilisk electrical fault load
+  7. Thermal throttling      - add Basilisk heat and throttle compute control
   8. Adverse downlink        - reduce aggregator downlink π (weather)
 """
 
@@ -119,13 +119,7 @@ class FaultInjector:
         taking duplicate straggler snapshots.
         """
         for fault in self._active:
-            if fault.fault_type == "battery_shortage":
-                for sat_id in fault.targets:
-                    if sat_id in self.states:
-                        state = self.states[sat_id]
-                        state.B_i = state.params.battery_min_j * 0.5
-                        state._update_availability()
-            elif fault.fault_type == "thermal_throttle":
+            if fault.fault_type == "thermal_throttle":
                 for sat_id in fault.targets:
                     if sat_id in self.states:
                         state = self.states[sat_id]
@@ -133,16 +127,47 @@ class FaultInjector:
                             0.0, min(1.0, fault.params.get("factor", 0.5))
                         )
                         state._environment_thermal_multiplier = factor
-                        state.Theta_i = (
-                            state.params.thermal_max_c - 10.0 * factor
-                        )
                         state.C_i = state._effective_compute_rate()
-                        state._update_availability()
             elif fault.fault_type == "straggler":
                 for sat_id in fault.targets:
                     if sat_id in self.states:
                         state = self.states[sat_id]
                         state.C_i = state._effective_compute_rate()
+
+    def physical_workloads(self, epoch_length_s: float) -> Dict[str, dict]:
+        """Return active fault loads for Basilisk's power/thermal nodes."""
+        effects = {
+            sat_id: {"power_w": 0.0, "heat_w": 0.0}
+            for sat_id in self.states
+        }
+        duration = max(float(epoch_length_s), 1e-9)
+        for fault in self._active:
+            if fault.fault_type == "battery_shortage":
+                for sat_id in fault.targets:
+                    state = self.states.get(sat_id)
+                    if state is None:
+                        continue
+                    target = state.params.battery_min_j * float(
+                        fault.params.get("target_fraction_of_min", 0.5)
+                    )
+                    drain = max(0.0, state.B_i - target) / duration
+                    # Counter nominal panel generation so Basilisk, rather than
+                    # a state overwrite, determines the realized battery path.
+                    drain += max(0.0, state.params.solar_power_w)
+                    effects[sat_id]["power_w"] += float(
+                        fault.params.get("power_w", drain)
+                    )
+            elif fault.fault_type == "thermal_throttle":
+                for sat_id in fault.targets:
+                    state = self.states.get(sat_id)
+                    if state is None:
+                        continue
+                    heat = float(fault.params.get(
+                        "heat_w", state.params.compute_power_w
+                    ))
+                    effects[sat_id]["power_w"] += max(0.0, heat)
+                    effects[sat_id]["heat_w"] += max(0.0, heat)
+        return effects
 
     # ── apply/withdraw per fault type ─────────────────────────────────────────
 
@@ -159,6 +184,9 @@ class FaultInjector:
                 a, b = link_str.split(":")
                 self.reliability.disable_link(a, b)
                 self.reliability.disable_link(b, a)
+                for epoch in range(fault.start_epoch, fault.end_epoch):
+                    self.reliability.record_link_pi(a, b, epoch, 0.0)
+                    self.reliability.record_link_pi(b, a, epoch, 0.0)
                 disrupted.add((a, b))
                 disrupted.add((b, a))
             self._remove_edges(fault, lambda na, nb: (na, nb) in disrupted)
@@ -169,12 +197,16 @@ class FaultInjector:
                 if sat_id in self.states:
                     self.states[sat_id].inject_failure()
                 self.reliability.set_node_pi(sat_id, 0.0)
+                for epoch in range(fault.start_epoch, fault.end_epoch):
+                    self.reliability.record_node_pi(sat_id, epoch, 0.0)
 
         elif ft == "helper_failure":
             for sat_id in fault.targets:
                 if sat_id in self.states:
                     self.states[sat_id].inject_failure()
                 self.reliability.set_node_pi(sat_id, 0.0)
+                for epoch in range(fault.start_epoch, fault.end_epoch):
+                    self.reliability.record_node_pi(sat_id, epoch, 0.0)
 
         elif ft == "straggler":
             factor = fault.params.get("factor", 0.1)
@@ -195,6 +227,11 @@ class FaultInjector:
                 fault,
                 lambda na, nb: (na in tgt and nb in gs) or (nb in tgt and na in gs),
             )
+            for sat_id in fault.targets:
+                for epoch in range(fault.start_epoch, fault.end_epoch):
+                    self.reliability.record_downlink_pi(
+                        sat_id, epoch, 0.0
+                    )
 
         elif ft == "downlink_adverse":
             # Adverse weather / degraded ground contact: the aggregator can still
@@ -202,13 +239,15 @@ class FaultInjector:
             adv_pi = fault.params.get("pi", DEFAULT_DOWNLINK_ADV_PI)
             for sat_id in fault.targets:
                 self.reliability.set_downlink_pi(sat_id, adv_pi)
+                for epoch in range(fault.start_epoch, fault.end_epoch):
+                    self.reliability.record_downlink_pi(
+                        sat_id, epoch, adv_pi
+                    )
 
         elif ft == "battery_shortage":
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    s = self.states[sat_id]
-                    s.B_i = s.params.battery_min_j * 0.5   # below minimum
-                    s._update_availability()
+            # The active fault is translated into a Basilisk power-sink load
+            # by physical_workloads(); battery state is never assigned here.
+            pass
 
         elif ft == "thermal_throttle":
             factor = fault.params.get("factor", 0.5)
@@ -220,12 +259,7 @@ class FaultInjector:
                     s._environment_thermal_multiplier = max(
                         0.0, min(1.0, factor)
                     )
-                    s.Theta_i = (
-                        s.params.thermal_max_c
-                        - 10.0 * s._environment_thermal_multiplier
-                    )
                     s.C_i = s._effective_compute_rate()
-                    s._update_availability()
 
     def _withdraw(self, fault: FaultEvent):
         ft = fault.fault_type
@@ -266,12 +300,9 @@ class FaultInjector:
                 self.reliability._downlink_overrides.pop(sat_id, None)
 
         elif ft == "battery_shortage":
-            for sat_id in fault.targets:
-                if sat_id in self.states:
-                    s = self.states[sat_id]
-                    # Restore battery above minimum so _update_availability sets A_i=1.
-                    s.B_i = s.params.battery_min_j * 1.5
-                    s.recover()
+            # Removing the load does not manufacture charge; the Basilisk
+            # panel/battery model determines whether and when recovery occurs.
+            pass
 
         elif ft == "thermal_throttle":
             snapshot = self._thermal_snapshots.pop(id(fault), {})
@@ -280,9 +311,8 @@ class FaultInjector:
                     s = self.states[sat_id]
                     if sat_id in snapshot:
                         s._environment_thermal_multiplier = snapshot[sat_id]
-                    s.Theta_i = s.params.thermal_ambient_c
                     s.C_i = s._effective_compute_rate()
-                    s.recover()
+                    s._update_availability()
 
     # ── epoch-graph edge removal/restore (shared by graph-mutating faults) ─────
 
