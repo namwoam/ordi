@@ -19,6 +19,7 @@ import math
 from .schema import Assignment, Decision
 from ._common import advertisement_metadata, protocol_trace
 from ordi.eval.validation import InvalidDecisionError
+from ordi.eval.validation import _terminal_slot
 from ordi.sim.messaging import MessageSimulator
 
 
@@ -39,6 +40,7 @@ class ResourceLedger:
     compute_ready_at: dict[str, float]
     contact_ready_at: dict[int, float]
     contact_residual_bits: dict[int, float]
+    terminal_intervals: dict[str, list[tuple[float, float]]]
 
     @classmethod
     def from_request(cls, request):
@@ -56,13 +58,17 @@ class ResourceLedger:
             * max(contact.rate_bps, 0.0)
             for index, contact in enumerate(request.contacts)
         }
-        return cls(ready, contact_ready, residual)
+        return cls(ready, contact_ready, residual, {})
 
     def clone(self):
         return ResourceLedger(
             self.compute_ready_at.copy(),
             self.contact_ready_at.copy(),
             self.contact_residual_bits.copy(),
+            {
+                terminal: list(intervals)
+                for terminal, intervals in self.terminal_intervals.items()
+            },
         )
 
 
@@ -118,12 +124,19 @@ def _route(request, ledger, source, targets, bits, start):
         for index, contact in by_source.get(node, ()):
             if ledger.contact_residual_bits[index] + 1e-9 < bits:
                 continue
-            depart = max(
-                now, contact.opens, ledger.contact_ready_at[index]
+            duration = bits / max(contact.rate_bps, 1.0)
+            terminals = tuple(
+                endpoint for endpoint in (contact.source, contact.target)
+                if endpoint in request.satellites
             )
-            finish = depart + bits / max(contact.rate_bps, 1.0)
-            if finish > contact.closes:
+            depart = _terminal_slot(
+                ledger.terminal_intervals, terminals,
+                max(now, contact.opens, ledger.contact_ready_at[index]),
+                duration, contact.closes,
+            )
+            if depart is None:
                 continue
+            finish = depart + duration
             if finish < best.get(contact.target, math.inf):
                 best[contact.target] = finish
                 reliability[contact.target] = (
@@ -140,6 +153,16 @@ def _reserve_route(request, ledger, route):
     for index, finish in zip(route.contact_indices, route.contact_finishes):
         ledger.contact_residual_bits[index] -= route.bits
         ledger.contact_ready_at[index] = finish
+        contact = request.contacts[index]
+        start = finish - route.bits / max(contact.rate_bps, 1.0)
+        if contact.source in request.satellites:
+            ledger.terminal_intervals.setdefault(contact.source, []).append(
+                (start, finish)
+            )
+        if contact.target in request.satellites:
+            ledger.terminal_intervals.setdefault(contact.target, []).append(
+                (start, finish)
+            )
 
 
 class SECOAdapted:

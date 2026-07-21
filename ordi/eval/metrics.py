@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
 from ordi.algorithms import Decision
 from ordi.sim.reliability import ReliabilityModel
@@ -306,44 +306,47 @@ def compute_metrics(
     return m
 
 
-def _replica_components(helper: str, agg: str, source: str, routes=None
-                        ) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...], str]:
-    """Decompose a replica into the (nodes, isl_links, downlink_node) whose
-    joint survival determines whether the replica delivers, mirroring the terms
-    of ReliabilityModel.replica_success_prob.
+def _timed_replica_components(assignment, index, source, active_start,
+                              active_end):
+    """Phase-specific component exposure for one scheduled replica/shard."""
+    helper = assignment.helpers[index]
+    aggregator = assignment.aggregators[index]
+    phases = assignment.metadata.get("replica_phase_ends", ())
+    if index < len(phases):
+        input_done, compute_done, output_done, delivery_done = map(
+            float, phases[index]
+        )
+    else:
+        input_done = compute_done = output_done = delivery_done = active_end
 
-    A replica succeeds iff the helper and aggregator nodes, source→helper ISL,
-    helper→aggregator ISL, and the aggregator's downlink all survive. (The
-    source node is shared across all replicas of a tile and sampled once at the
-    tile level, so it is excluded here.) Self-processing replicas where the
-    helper is the source carry no source→helper hop; helper-as-aggregator
-    replicas carry no helper→aggregator hop.
-
-    The component set mirrors the policy placement probability, so under
-    independent draws the Monte Carlo miss ratio converges to the modeled
-    expectation; the only divergence comes from draws
-    shared across replicas, which is the correlation effect this layer exists
-    to expose.
-    """
-    nodes = {helper, agg}
-    nodes.discard(source)
-    isl_links: Set[Tuple[str, str]] = set()
-    downlink_node = agg
+    node_windows = [(source, active_start, input_done)]
+    node_windows.append((helper, input_done, compute_done))
+    routes = assignment.routes[index] if index < len(assignment.routes) else ()
     if routes:
         route_in, route_out, route_down = routes
-        for path in (route_in, route_out):
-            isl_links.update((min(a, b), max(a, b))
-                             for a, b in zip(path, path[1:]))
-        if len(route_down) >= 2:
-            isl_links.update((min(a, b), max(a, b))
-                             for a, b in zip(route_down[:-2], route_down[1:-1]))
-            downlink_node = route_down[-2]
     else:
-        if helper != source:
-            isl_links.add((min(source, helper), max(source, helper)))
-        if helper != agg:
-            isl_links.add((min(helper, agg), max(helper, agg)))
-    return tuple(sorted(nodes)), tuple(sorted(isl_links)), downlink_node
+        route_in = (source, helper)
+        route_out = (helper, aggregator)
+        route_down = (aggregator,)
+    downlink_node = route_down[-2] if len(route_down) >= 2 else aggregator
+    node_windows.append((aggregator, output_done, delivery_done))
+    if downlink_node != aggregator:
+        node_windows.append((downlink_node, output_done, delivery_done))
+
+    link_events = []
+    for path, timestamp in (
+        (route_in, input_done),
+        (route_out, output_done),
+        (route_down[:-1], delivery_done),
+    ):
+        link_events.extend(
+            ((source_node, target_node), timestamp)
+            for source_node, target_node in zip(path, path[1:])
+        )
+    return (
+        tuple(node_windows), tuple(link_events),
+        downlink_node, delivery_done,
+    )
 
 
 def compute_realized_metrics(
@@ -389,7 +392,7 @@ def compute_realized_metrics(
     if reliability_epoch_s <= 0.0:
         raise ValueError("reliability_epoch_s must be positive")
 
-    # (task_id, tile, latency, groups, source, active_start, active_end)
+    # (task_id, tile, latency, phase-aware reconstruction groups)
     scored = []
     for a in result.assignments:
         key = (a.task_id, a.tile_id)
@@ -412,17 +415,24 @@ def compute_realized_metrics(
             # sampled rather than silently treated as always-delivered.
             if reliability_estimate > 0 and not math.isinf(latency):
                 aggregator = a.aggregators[0] if a.aggregators else a.source
+                source_release = float(a.metadata.get(
+                    "source_release_time", active_end
+                ))
+                direct = (
+                    ((task_obj.source_sat, active_start, source_release),),
+                    (), aggregator, source_release,
+                )
                 scored.append((task_obj.task_id, tile, latency,
-                               [([(("__none__",), (), aggregator)], 1)],
-                               task_obj.source_sat, active_start, active_end))
+                               [([direct], 1)]))
             else:
-                scored.append((task_obj.task_id, tile, latency, [],
-                               task_obj.source_sat, active_start, active_end))
+                scored.append((task_obj.task_id, tile, latency, []))
             continue
-        comps = [_replica_components(
-            h, g, task_obj.source_sat,
-            a.routes[index] if index < len(a.routes) else None,
-        ) for index, (h, g) in enumerate(zip(a.helpers, a.aggregators))]
+        comps = [
+            _timed_replica_components(
+                a, index, task_obj.source_sat, active_start, active_end
+            )
+            for index in range(len(a.helpers))
+        ]
         required = int(a.metadata.get("data_shards", 1))
         shard_labels = a.metadata.get("shard_groups")
         if shard_labels is not None and len(shard_labels) == len(comps):
@@ -437,8 +447,7 @@ def compute_realized_metrics(
             groups = [(comps, required)] if len(comps) >= required else []
         else:
             groups = [([component], 1) for component in comps]
-        scored.append((task_obj.task_id, tile, latency, groups,
-                       task_obj.source_sat, active_start, active_end))
+        scored.append((task_obj.task_id, tile, latency, groups))
 
     rng = random.Random(seed)
     miss_trials = []
@@ -492,23 +501,32 @@ def compute_realized_metrics(
         task_delivered: Dict[int, int] = {}
         task_total: Dict[int, int] = {}
 
-        for tid, tile, L_hat, groups, src, active_start, active_end in scored:
-            task_total[tid] = task_total.get(tid, 0) + 1
-            delivered = False
-            periods = tuple(active_periods(active_start, active_end))
-            transfer_period = periods[-1]
-            if groups and all(node_ok(src, period) for period in periods):
-                delivered = any(
-                    sum(
-                        all(node_ok(n, period) for n in nodes
-                            for period in periods)
-                        and all(link_ok(link, transfer_period)
-                                for link in isl_links)
-                        and down_ok(agg, transfer_period)
-                        for nodes, isl_links, agg in group
-                    ) >= required
-                    for group, required in groups
+        def phase_periods(start, end):
+            if end <= start + 1e-9:
+                return (period_at(end),)
+            return tuple(active_periods(start, end))
+
+        def replica_ok(component):
+            node_windows, link_events, downlink_node, downlink_time = component
+            return (
+                all(
+                    node_ok(node, period)
+                    for node, start, end in node_windows
+                    for period in phase_periods(start, end)
                 )
+                and all(
+                    link_ok(link, period_at(timestamp))
+                    for link, timestamp in link_events
+                )
+                and down_ok(downlink_node, period_at(downlink_time))
+            )
+
+        for tid, tile, L_hat, groups in scored:
+            task_total[tid] = task_total.get(tid, 0) + 1
+            delivered = any(
+                sum(replica_ok(component) for component in group) >= required
+                for group, required in groups
+            )
             if delivered:
                 util += tile.utility * math.exp(-alpha * L_hat)
                 task_delivered[tid] = task_delivered.get(tid, 0) + 1

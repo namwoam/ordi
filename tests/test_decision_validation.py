@@ -8,7 +8,9 @@ from ordi.algorithms import (
     FullReplication, OnboardOnly, ORDI, RandomReplication, SatelliteView,
 )
 from ordi.eval.experiments import _validate_feasible_subset
-from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
+from ordi.eval.validation import (
+    DecisionFeasibilityModel, InvalidDecisionError, _terminal_slot,
+)
 from ordi.sim.ground import H100_SXM_PROFILE
 
 
@@ -88,6 +90,22 @@ def test_retiming_records_exact_communication_intervals():
         "isl", "downlink",
     }
     assert all(finish > start for _src, _dst, start, finish, _kind in intervals)
+    source_intervals = sorted(
+        (start, finish) for source, _target, start, finish, _kind in intervals
+        if source == "src"
+    )
+    assert all(
+        left[1] <= right[0] + 1e-9
+        for left, right in zip(source_intervals, source_intervals[1:])
+    )
+
+
+def test_future_terminal_reservation_does_not_block_an_earlier_gap():
+    calendars = {"src": [(100.0, 110.0)]}
+
+    assert _terminal_slot(
+        calendars, ("src",), 10.0, 5.0, 20.0
+    ) == pytest.approx(10.0)
 
 
 def test_compute_waits_for_input_and_cancel_releases_future_reservations():

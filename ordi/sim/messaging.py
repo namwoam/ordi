@@ -8,6 +8,7 @@ import math
 
 from ordi.algorithms.schema import MessageEvent, WorkItem
 from ordi.eval.validation import InvalidDecisionError
+from ordi.eval.validation import _terminal_slot
 
 
 def _contact_key(contact):
@@ -65,6 +66,9 @@ class MessageSimulator:
     contact_ready_at: dict[tuple, float] = field(default_factory=dict)
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
+    terminal_intervals: dict[str, list[tuple[float, float]]] = field(
+        default_factory=dict
+    )
     delivered_keys: set[tuple[str, str]] = field(default_factory=set)
     knowledge: dict[str, dict[str, tuple[object, float, float]]] = field(
         default_factory=dict
@@ -112,6 +116,10 @@ class MessageSimulator:
         self.advertised_epochs.add(request.epoch)
         ready = self.contact_ready_at.copy()
         residual = self.contact_residual_bits.copy()
+        terminal_intervals = {
+            terminal: list(intervals)
+            for terminal, intervals in self.terminal_intervals.items()
+        }
         counter = self._next_id
         scheduled_pairs = set()
         message_count = 0
@@ -130,7 +138,8 @@ class MessageSimulator:
                 continue
             try:
                 depart, finish = self._reserve_hop(
-                    request, ready, residual, contact.source, contact.target,
+                    request, ready, residual, terminal_intervals,
+                    contact.source, contact.target,
                     self.advertisement_bits, request.sim_time,
                 )
             except InvalidDecisionError:
@@ -167,6 +176,7 @@ class MessageSimulator:
 
         self.contact_ready_at = ready
         self.contact_residual_bits = residual
+        self.terminal_intervals = terminal_intervals
         self._next_id = counter
         return AdvertisementBatch(
             tuple(sorted(events, key=lambda event: event.time)),
@@ -204,7 +214,8 @@ class MessageSimulator:
         ))
 
     @staticmethod
-    def _reserve_hop(request, ready, residual, source, target, bits, start):
+    def _reserve_hop(request, ready, residual, terminal_intervals,
+                     source, target, bits, start):
         candidates = sorted(
             (contact for contact in request.contacts
              if contact.source == source and contact.target == target),
@@ -218,12 +229,25 @@ class MessageSimulator:
             available = residual.get(key, capacity)
             if available + 1e-9 < bits:
                 continue
-            depart = max(start, contact.opens, ready.get(key, contact.opens))
-            finish = depart + bits / max(contact.rate_bps, 1.0)
-            if finish > contact.closes + 1e-9:
+            duration = bits / max(contact.rate_bps, 1.0)
+            terminals = tuple(
+                endpoint for endpoint in (source, target)
+                if endpoint in request.satellites
+            )
+            depart = _terminal_slot(
+                terminal_intervals, terminals,
+                max(start, contact.opens, ready.get(key, contact.opens)),
+                duration, contact.closes,
+            )
+            if depart is None:
                 continue
+            finish = depart + duration
             residual[key] = available - bits
             ready[key] = finish
+            for terminal in terminals:
+                terminal_intervals.setdefault(terminal, []).append(
+                    (depart, finish)
+                )
             return depart, finish
         raise InvalidDecisionError(
             f"message has no contact capacity for {source}->{target} "
@@ -243,6 +267,10 @@ class MessageSimulator:
 
         ready = self.contact_ready_at.copy()
         residual = self.contact_residual_bits.copy()
+        terminal_intervals = {
+            terminal: list(intervals)
+            for terminal, intervals in self.terminal_intervals.items()
+        }
         compute_ready = self.compute_ready_at.copy()
         delivered_keys = self.delivered_keys.copy()
         counter = self._next_id
@@ -307,7 +335,7 @@ class MessageSimulator:
                          message.receiver)
             for source, target in zip(path, path[1:]):
                 depart, now = self._reserve_hop(
-                    request, ready, residual, source, target,
+                    request, ready, residual, terminal_intervals, source, target,
                     message.bits, now,
                 )
                 self._record(events, depart, "hop_sent", message, source, target)
@@ -511,6 +539,7 @@ class MessageSimulator:
 
         self.contact_ready_at = ready
         self.contact_residual_bits = residual
+        self.terminal_intervals = terminal_intervals
         self.compute_ready_at = compute_ready
         self.delivered_keys = delivered_keys
         self._next_id = counter

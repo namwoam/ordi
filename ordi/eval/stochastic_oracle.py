@@ -637,12 +637,28 @@ def _policy_plan(instance: MultiEpochInstance, scheduler,
                 )
                 if not any(status.values()):
                     if observe:
-                        observe("fault_failure")
+                        observe(
+                            "fault_failure",
+                            domains=tuple(sorted({
+                                helper.split("_")[1]
+                                if len(helper.split("_")) > 2 else helper
+                                for helper in assignment.helpers
+                            })),
+                            event_id=request.epoch,
+                            assignment=assignment,
+                        )
                 elif request.epoch >= delivery_epoch:
                     if observe:
                         observe(
                             "primary_success" if status.get(0, False)
-                            else "backup_recovery"
+                            else "backup_recovery",
+                            domains=tuple(sorted({
+                                helper.split("_")[1]
+                                if len(helper.split("_")) > 2 else helper
+                                for helper in assignment.helpers
+                            })),
+                            event_id=request.epoch,
+                            assignment=assignment,
                         )
                 else:
                     still_pending.append((original_request, assignment))

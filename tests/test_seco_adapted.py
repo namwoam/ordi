@@ -63,8 +63,8 @@ def test_seco_reserves_contact_capacity_between_tiles():
     }
     contacts = (
         # One handshake + 800-bit image fits, but two do not.
-        ContactWindow("src", "helper", 0, 2.2, 4_000, "isl"),
-        ContactWindow("helper", "src", 0, 2.2, 4_000, "isl"),
+        ContactWindow("src", "helper", 0, 4.0, 4_000, "isl"),
+        ContactWindow("helper", "src", 0, 4.0, 4_000, "isl"),
         ContactWindow("helper", "ground", 0, 20, 1_000, "downlink"),
     )
     task = SimpleNamespace(

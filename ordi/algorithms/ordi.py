@@ -12,7 +12,7 @@ import math
 import random
 
 from .schema import Assignment, Decision, NodeDecision, WorkItem
-from ._common import enumerate_placements, plane
+from ._common import enumerate_placements, group_success, groups_success, plane
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
@@ -73,6 +73,8 @@ class ORDI:
         self._fault_risk_beta = float(fault_risk_beta)
         self._fault_domain_failures = 0.0
         self._fault_domain_successes = 0.0
+        self._fault_domain_counts = {}
+        self._observed_fault_events = set()
         self._fault_risk_discount = float(fault_risk_discount)
         self._cold_start_backup_budget = int(cold_start_backup_budget)
         self._cold_start_backups_used = 0
@@ -96,22 +98,44 @@ class ORDI:
     def fault_domain_sample_count(self):
         return self._fault_domain_failures + self._fault_domain_successes
 
-    def observe_fault_domain_sample(self, failed: bool):
+    def observe_fault_domain_sample(self, failed: bool, domain="global",
+                                    event_id=None):
         """Update the online risk estimate from one observed domain outcome."""
+        event_key = None if event_id is None else (domain, event_id)
+        if event_key is not None and event_key in self._observed_fault_events:
+            return False
+        if event_key is not None:
+            self._observed_fault_events.add(event_key)
+        failures, successes = self._fault_domain_counts.get(domain, (0.0, 0.0))
         if failed:
             self._fault_domain_failures += 1.0
+            failures += 1.0
         else:
             self._fault_domain_successes += 1.0
+            successes += 1.0
+        self._fault_domain_counts[domain] = (failures, successes)
+        return True
 
-    def sample_fault_domain_failure_risk(self):
+    def sample_fault_domain_failure_risk(self, domains=None):
         """Draw a Thompson sample from the learned fault-risk posterior."""
-        self._last_fault_risk_sample = self._fault_rng.betavariate(
-            self._fault_risk_alpha + self._fault_domain_failures,
-            self._fault_risk_beta + self._fault_domain_successes,
+        domains = tuple(domains or ("global",))
+        samples = []
+        global_counts = self._fault_domain_counts.get(
+            "global", (0.0, 0.0)
         )
+        for domain in domains:
+            failures, successes = self._fault_domain_counts.get(
+                domain, global_counts
+            )
+            samples.append(self._fault_rng.betavariate(
+                self._fault_risk_alpha + failures,
+                self._fault_risk_beta + successes,
+            ))
+        self._last_fault_risk_sample = max(samples)
         return self._last_fault_risk_sample
 
-    def observe_assignment_outcome(self, outcome: str):
+    def observe_assignment_outcome(self, outcome: str, *, domains=None,
+                                   event_id=None, **_context):
         """Learn from one completed or failed scheduled assignment.
 
         A backup recovery and an unrecoverable hard fault are evidence that the
@@ -125,11 +149,27 @@ class ORDI:
             raise ValueError(f"unknown assignment outcome {outcome!r}")
         if outcome == "nonfault_failure":
             return
+        failed = outcome in {"backup_recovery", "fault_failure"}
+        domains = tuple(dict.fromkeys(domains or ("global",)))
+        unobserved = tuple(
+            domain for domain in domains
+            if event_id is None
+            or (domain, event_id) not in self._observed_fault_events
+        )
+        if not unobserved:
+            return
         self._fault_domain_failures *= self._fault_risk_discount
         self._fault_domain_successes *= self._fault_risk_discount
-        self.observe_fault_domain_sample(
-            outcome in {"backup_recovery", "fault_failure"}
-        )
+        self._fault_domain_counts = {
+            key: (failures * self._fault_risk_discount,
+                  successes * self._fault_risk_discount)
+            for key, (failures, successes)
+            in self._fault_domain_counts.items()
+        }
+        for domain in unobserved:
+            self.observe_fault_domain_sample(
+                failed, domain=domain, event_id=event_id
+            )
 
     @staticmethod
     def _contact_key(contact):
@@ -237,10 +277,7 @@ class ORDI:
 
         placements = tuple(ranked[:shard_count])
         latency = max(p.latency for p in placements)
-        source_p = request.satellites[task.source_sat].reliability
-        reliability = source_p * math.prod(
-            p.reliability for p in placements
-        )
+        reliability = group_success(request, task, placements)
         communication = sum(p.communication_bits for p in placements)
         value = (
             tile.utility * reliability
@@ -265,10 +302,6 @@ class ORDI:
             return None
         plan = max(feasible, key=lambda item: item.value)
         return plan if plan.value > 0 else None
-
-    @staticmethod
-    def _group_probability(placements):
-        return math.prod(p.reliability for p in placements)
 
     @staticmethod
     def _route_satellite_nodes(placement, source, ground_stations):
@@ -336,12 +369,19 @@ class ORDI:
         if len(ranked) < q:
             return None
         backup = tuple(ranked[:q])
-        source_p = request.satellites[task.source_sat].reliability
-        primary_p = self._group_probability(primary.placements)
-        backup_p = self._group_probability(backup)
-        sampled_domain_risk = self.sample_fault_domain_failure_risk()
-        primary_failure_risk = max(1.0 - primary_p, sampled_domain_risk)
-        reliability_gain = source_p * primary_failure_risk * backup_p
+        primary_p = group_success(request, task, primary.placements)
+        backup_p = group_success(request, task, backup)
+        sampled_domain_risk = self.sample_fault_domain_failure_risk(
+            {plane(p.helper) for p in primary.placements}
+        )
+        modeled_gain = (
+            groups_success(
+                request, task, (primary.placements, backup)
+            ) - primary_p
+        )
+        reliability_gain = max(
+            modeled_gain, sampled_domain_risk * backup_p
+        )
         backup_latency = max(p.latency for p in backup)
         gain = (
             tile.utility * reliability_gain
@@ -444,15 +484,8 @@ class ORDI:
                     group_id for group_id, group in enumerate(groups)
                     for _ in group
                 )
-                group_probabilities = [
-                    self._group_probability(group)
-                    for group in groups
-                ]
-                source_p = local_request.satellites[
-                    task.source_sat
-                ].reliability
-                reliability = source_p * (
-                    1.0 - math.prod(1.0 - p for p in group_probabilities)
+                reliability = groups_success(
+                    local_request, task, groups
                 )
                 latency = min(
                     max(p.latency for p in group)

@@ -62,6 +62,16 @@ class StateTransitionTests(unittest.TestCase):
             power_w, params.comms_power_w * expected_active_seconds / 10.0
         )
 
+    def test_overlapping_terminal_intervals_have_additive_power(self):
+        params = _state("sat").params
+        workload = Workload(tx_intervals=((0.0, 2.0), (0.0, 2.0)))
+
+        power_w = _communication_power_w(workload, params, 10.0)
+
+        self.assertAlmostEqual(
+            power_w, params.comms_power_w * 4.0 / 10.0
+        )
+
     def test_straggler_multiplier_is_applied_to_projected_state(self):
         state = _state("sat")
         injector = FaultInjector(

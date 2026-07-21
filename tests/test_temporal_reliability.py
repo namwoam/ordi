@@ -70,3 +70,31 @@ def test_withdrawn_downlink_fault_remains_in_temporal_scoring_history():
         n_trials=10, seed=1, reliability_epoch_s=60.0,
     )
     assert realized.realized_miss_ratio == 1.0
+
+
+def test_direct_source_is_not_required_after_downlink_finishes():
+    model = ReliabilityModel(
+        default_isl_pi=1.0, default_downlink_pi=1.0,
+        default_node_pi=1.0,
+    )
+    model.record_node_pi("src", 1, 0.0)
+    tile = SimpleNamespace(
+        tile_id=0, compute_ops=1.0, d_in_bits=1.0,
+        d_out_bits=1.0, utility=1.0,
+    )
+    task = SimpleNamespace(task_id=1, source_sat="src", tiles=[tile])
+    assignment = Assignment(
+        1, 0, "src", downlink_only=True,
+        metadata={
+            "reliability": 1.0, "latency": 120.0,
+            "scheduled_at": 0.0, "delivery_time": 120.0,
+            "source_release_time": 30.0,
+        },
+    )
+
+    realized = compute_realized_metrics(
+        Decision(0, (assignment,)), [task], model,
+        n_trials=10, seed=1, reliability_epoch_s=60.0,
+    )
+
+    assert realized.realized_miss_ratio == 0.0

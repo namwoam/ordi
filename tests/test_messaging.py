@@ -153,9 +153,9 @@ def test_protocol_enforces_hop_and_split_depth_limits():
 
 
 def test_state_advertisements_are_delayed_and_then_used_locally():
-    request, task, _tile = _request()
+    request, task, _tile = _request(link_rate=10_000.0)
     reverse = ContactWindow(
-        "helper", "src", 0.0, 10.0, 1_000.0, "isl"
+        "helper", "src", 0.0, 10.0, 10_000.0, "isl"
     )
     warmup = replace(
         request, epoch=0, sim_time=0.0, tasks=[],
@@ -167,7 +167,7 @@ def test_state_advertisements_are_delayed_and_then_used_locally():
     )
     before_arrival.schedule(warmup)
     early = before_arrival.schedule(replace(
-        request, epoch=1, sim_time=1.0,
+        request, epoch=1, sim_time=0.05,
         contacts=warmup.contacts,
     )).assignments[0]
     assert early.metadata["split_count"] == 1
@@ -176,13 +176,13 @@ def test_state_advertisements_are_delayed_and_then_used_locally():
     after_arrival = ORDI(max_replicas=1, split_options=(2,))
     after_arrival.schedule(warmup)
     informed_result = after_arrival.schedule(replace(
-        request, epoch=1, sim_time=2.0,
+        request, epoch=1, sim_time=0.3,
         contacts=warmup.contacts,
     ))
     informed = informed_result.assignments[0]
     assert informed.metadata["split_count"] == 2
     assert informed.metadata["known_state_nodes"] == 2
-    assert informed.metadata["max_state_age_s"] == pytest.approx(2.0)
+    assert informed.metadata["max_state_age_s"] == pytest.approx(0.3)
     assert any(
         event.kind == "state_advertisement"
         for event in informed_result.message_events

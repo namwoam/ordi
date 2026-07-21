@@ -31,6 +31,7 @@ Shared realistic LEO-EO simulation setup (all experiments):
 from __future__ import annotations
 import csv
 import hashlib
+import inspect
 import math
 import os
 import random
@@ -499,6 +500,45 @@ def _assignment_viable(a: Assignment, states, sim_time=None, injector=None) -> b
     ).values())
 
 
+def _assignment_primary_domains(assignment: Assignment) -> tuple[str, ...]:
+    """Orbital-plane domains used by the primary reconstruction group."""
+    labels = assignment.metadata.get("shard_groups")
+    helpers = assignment.helpers
+    if labels is not None and len(labels) == len(helpers):
+        helpers = tuple(
+            helper for helper, label in zip(helpers, labels) if label == 0
+        )
+    domains = {
+        helper.split("_")[1] if len(helper.split("_")) > 2 else helper
+        for helper in helpers
+    }
+    return tuple(sorted(domains))
+
+
+def _report_assignment_outcome(callback, outcome, assignment, epoch):
+    """Send structured feedback while retaining one-argument callback support."""
+    if callback is None:
+        return
+    try:
+        parameters = inspect.signature(callback).parameters.values()
+        structured = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or parameter.name in {"domains", "event_id"}
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        structured = False
+    if structured:
+        callback(
+            outcome,
+            domains=_assignment_primary_domains(assignment),
+            event_id=int(epoch),
+            assignment=assignment,
+        )
+    else:
+        callback(outcome)
+
+
 def _uncommitted_tasks(pending, committed):
     """Shallow task copies holding only not-yet-committed tiles."""
     out = []
@@ -732,7 +772,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], Assignment] = {}
     feedback_reported = set()
-    backup_recovery = set()
+    backup_recovery = {}
     fault_impacted = set()
     rejection_causes = {}
     protocol_message_count = 0.0
@@ -771,9 +811,12 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             ))
             if delivery_time <= ep_start + 1e-9:
                 if outcome_callback and key not in feedback_reported:
-                    outcome_callback(
+                    _report_assignment_outcome(
+                        outcome_callback,
                         "backup_recovery" if key in backup_recovery
-                        else "primary_success"
+                        else "primary_success",
+                        assignment,
+                        backup_recovery.get(key, epoch),
                     )
                     feedback_reported.add(key)
                 continue
@@ -783,10 +826,11 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             primary_alive = groups.get(0, next(iter(groups.values()), False))
             any_alive = any(groups.values())
             if not primary_alive and any_alive:
-                backup_recovery.add(key)
+                backup_recovery.setdefault(key, epoch)
             if not any_alive:
-                if outcome_callback:
-                    outcome_callback("fault_failure")
+                _report_assignment_outcome(
+                    outcome_callback, "fault_failure", assignment, epoch
+                )
                 feedback_reported.add(key)
                 fault_impacted.add(key)
                 if physical_backend is not None:
@@ -834,10 +878,14 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                      for task in tasks for tile in task.tiles}
     final = [committed.get(k) or Assignment(k[0], k[1], source_by_key[k])
              for k in all_tiles]
+    final_by_key = dict(zip(all_tiles, final))
     if outcome_callback:
         for key in all_tiles:
             if key not in committed and key not in feedback_reported:
-                outcome_callback("nonfault_failure")
+                _report_assignment_outcome(
+                    outcome_callback, "nonfault_failure", final_by_key[key],
+                    N_EPOCHS,
+                )
     res = Decision(
         N_EPOCHS - 1, tuple(final),
         metadata={
@@ -1111,6 +1159,10 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
                 feasibility.contact_residual_bits.copy()
             )
             messages.compute_ready_at = feasibility.compute_ready_at.copy()
+            messages.terminal_intervals = {
+                terminal: list(intervals)
+                for terminal, intervals in feasibility.terminal_intervals.items()
+            }
 
     m = _simulate_stateful(
         schedule_fn, tasks, sat_ids, local_states, cfg, injector,

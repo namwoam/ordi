@@ -12,6 +12,22 @@ class InvalidDecisionError(ValueError):
     """Raised when a policy submits a decision the modeled system cannot run."""
 
 
+def _terminal_slot(calendars, terminals, earliest, duration, latest):
+    """Earliest gap shared by all participating spacecraft terminals."""
+    intervals = sorted(
+        interval for terminal in terminals
+        for interval in calendars.get(terminal, ())
+    )
+    start = earliest
+    for reserved_start, reserved_finish in intervals:
+        if reserved_finish <= start + 1e-9:
+            continue
+        if start + duration <= reserved_start + 1e-9:
+            break
+        start = reserved_finish
+    return start if start + duration <= latest + 1e-9 else None
+
+
 def _contact_key(contact):
     return (
         contact.source, contact.target, contact.opens, contact.closes,
@@ -32,15 +48,22 @@ class DecisionFeasibilityModel:
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
     ground_compute_ready_at: dict[str, float] = field(default_factory=dict)
+    terminal_intervals: dict[str, list[tuple[float, float]]] = field(
+        default_factory=dict
+    )
     reservations: list[dict] = field(default_factory=list)
 
     def _copy(self):
         return DecisionFeasibilityModel(
-            self.contact_ready_at.copy(),
-            self.contact_residual_bits.copy(),
-            self.compute_ready_at.copy(),
-            self.ground_compute_ready_at.copy(),
-            [record.copy() for record in self.reservations],
+            contact_ready_at=self.contact_ready_at.copy(),
+            contact_residual_bits=self.contact_residual_bits.copy(),
+            compute_ready_at=self.compute_ready_at.copy(),
+            ground_compute_ready_at=self.ground_compute_ready_at.copy(),
+            terminal_intervals={
+                terminal: list(intervals)
+                for terminal, intervals in self.terminal_intervals.items()
+            },
+            reservations=[record.copy() for record in self.reservations],
         )
 
     def _reserve_hop(self, request, source, target, bits, start, trace=None,
@@ -58,19 +81,34 @@ class DecisionFeasibilityModel:
             residual = self.contact_residual_bits.get(key, capacity)
             if residual + 1e-9 < bits:
                 continue
-            depart = max(
-                start, contact.opens,
-                self.contact_ready_at.get(key, contact.opens),
+            duration = bits / max(contact.rate_bps, 1.0)
+            terminals = tuple(
+                endpoint for endpoint in (source, target)
+                if endpoint in request.satellites
             )
-            finish = depart + bits / max(contact.rate_bps, 1.0)
-            if finish > contact.closes + 1e-9:
+            depart = _terminal_slot(
+                self.terminal_intervals, terminals,
+                max(start, contact.opens,
+                    self.contact_ready_at.get(key, contact.opens)),
+                duration, contact.closes,
+            )
+            if depart is None:
                 continue
+            finish = depart + duration
             self.contact_residual_bits[key] = residual - bits
             self.contact_ready_at[key] = finish
+            for terminal in terminals:
+                self.terminal_intervals.setdefault(terminal, []).append(
+                    (depart, finish)
+                )
             self.reservations.append({
                 "owner": owner, "kind": "contact", "resource": key,
                 "start": depart, "finish": finish, "amount": bits,
                 "capacity": capacity,
+                "terminal_resources": tuple(
+                    endpoint for endpoint in (source, target)
+                    if endpoint in request.satellites
+                ),
             })
             if trace is not None:
                 trace.append(
@@ -151,6 +189,7 @@ class DecisionFeasibilityModel:
         self.contact_residual_bits.clear()
         self.compute_ready_at.clear()
         self.ground_compute_ready_at.clear()
+        self.terminal_intervals.clear()
         for record in kept:
             kind = record["kind"]
             resource = record["resource"]
@@ -164,6 +203,10 @@ class DecisionFeasibilityModel:
                     self.contact_ready_at.get(resource, resource[2]),
                     record["finish"],
                 )
+                for terminal in record.get("terminal_resources", resource[:2]):
+                    self.terminal_intervals.setdefault(terminal, []).append(
+                        (record["start"], record["finish"])
+                    )
             elif kind == "compute":
                 self.compute_ready_at[resource] = max(
                     self.compute_ready_at.get(resource, 0.0), record["finish"]
@@ -471,6 +514,7 @@ class DecisionFeasibilityModel:
         self.contact_residual_bits = trial.contact_residual_bits
         self.compute_ready_at = trial.compute_ready_at
         self.ground_compute_ready_at = trial.ground_compute_ready_at
+        self.terminal_intervals = trial.terminal_intervals
         self.reservations = trial.reservations
         return (replace(decision, assignments=tuple(accepted))
                 if retime else decision)

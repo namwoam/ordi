@@ -1,6 +1,7 @@
 """Time-dependent routing and placement shared fairly by all policies."""
 from __future__ import annotations
 from dataclasses import dataclass, replace
+from itertools import combinations
 import heapq
 import math
 from .schema import NodeDecision, WorkItem
@@ -137,14 +138,90 @@ def enumerate_placements(request, task, tile, allow_source=True,
                 comm_bits,route_in.path,route_out.path,down.path))
     return out
 
+def _edge_reliability(request, source, target, kind):
+    """Reliability of the contact class used by a selected route edge."""
+    values = [
+        contact.reliability for contact in request.contacts
+        if contact.source == source and contact.target == target
+        and contact.kind == kind
+    ]
+    return max(values, default=1.0)
+
+
+def placement_components(request, task, placement):
+    """Independent physical components required by one placement.
+
+    Keys identify shared components, allowing a group of shards or replicas to
+    count a shared node/link/downlink exactly once rather than once per path.
+    Source survival remains a tile-level component handled by callers.
+    """
+    components = {}
+    for node in {placement.helper, placement.aggregator} - {task.source_sat}:
+        state = request.satellites.get(node)
+        if state is not None:
+            components[("node", node)] = state.reliability
+
+    route_in, route_out, route_down = (
+        placement.route_in, placement.route_out, placement.route_down
+    )
+    for path in (route_in, route_out):
+        for source, target in zip(path, path[1:]):
+            components[("isl", source, target)] = _edge_reliability(
+                request, source, target, "isl"
+            )
+    for source, target in zip(route_down, route_down[1:]):
+        kind = "downlink" if target in request.ground_stations else "isl"
+        components[(kind, source, target)] = _edge_reliability(
+            request, source, target, kind
+        )
+    return components
+
+
+def group_success(request, task, placements):
+    """Probability that every required shard in one group succeeds."""
+    components = {}
+    for placement in placements:
+        components.update(placement_components(request, task, placement))
+    probability = request.satellites[task.source_sat].reliability
+    return probability * math.prod(components.values())
+
+
+def groups_success(request, task, groups):
+    """Exact union probability for complete reconstruction groups.
+
+    Inclusion-exclusion is inexpensive here (normally one primary and one
+    backup) and correctly retains components shared by multiple groups.
+    """
+    groups = tuple(tuple(group) for group in groups if group)
+    if not groups:
+        return 0.0
+    source_probability = request.satellites[task.source_sat].reliability
+    total = 0.0
+    for count in range(1, len(groups) + 1):
+        sign = 1.0 if count % 2 else -1.0
+        for subset in combinations(groups, count):
+            components = {}
+            for group in subset:
+                for placement in group:
+                    components.update(
+                        placement_components(request, task, placement)
+                    )
+            total += sign * source_probability * math.prod(components.values())
+    return max(0.0, min(1.0, total))
+
+
 def independent_success(placements):
+    """Compatibility helper for callers without component information."""
     failure=1.0
     for p in placements: failure*=1.0-p.reliability
     return 1.0-failure
 
+
 def tile_success(request, task, placements):
-    """Replica-union reliability with the source node counted exactly once."""
-    return request.satellites[task.source_sat].reliability*independent_success(placements)
+    """Replica-union reliability using shared-component inclusion-exclusion."""
+    return groups_success(
+        request, task, ((placement,) for placement in placements)
+    )
 
 
 def protocol_trace(request, task, tile, groups, work_fraction=1.0,

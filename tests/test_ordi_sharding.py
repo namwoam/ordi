@@ -6,7 +6,7 @@ import pytest
 from ordi.algorithms import (
     ContactWindow, Decision, EpochInput, ORDI, PolicyWeights, SatelliteView,
 )
-from ordi.algorithms._common import plane
+from ordi.algorithms._common import Placement, group_success, plane
 from ordi.eval.experiments import _advance_synthetic_states, _assignment_viable
 from ordi.faults.injector import FaultEvent, FaultInjector
 from ordi.sim.reliability import ReliabilityModel
@@ -302,6 +302,52 @@ def test_fault_learning_uses_assignment_outcomes_and_ignores_nonfault_misses():
     assert scheduler.fault_domain_sample_count == pytest.approx(before)
     assert scheduler._fault_domain_failures == pytest.approx(1.0)
     assert scheduler._fault_domain_successes == pytest.approx(0.5)
+
+
+def test_fault_learning_is_domain_specific_and_deduplicates_one_epoch_event():
+    scheduler = ORDI(fault_risk_discount=1.0)
+
+    scheduler.observe_assignment_outcome(
+        "fault_failure", domains=("00",), event_id=7
+    )
+    scheduler.observe_assignment_outcome(
+        "fault_failure", domains=("00",), event_id=7
+    )
+    scheduler.observe_assignment_outcome(
+        "primary_success", domains=("01",), event_id=7
+    )
+
+    assert scheduler.fault_domain_sample_count == 2
+    assert scheduler._fault_domain_counts["00"] == (1.0, 0.0)
+    assert scheduler._fault_domain_counts["01"] == (0.0, 1.0)
+
+
+def test_split_reliability_counts_a_shared_link_once():
+    states = {
+        name: replace(_view(name), reliability=1.0)
+        for name in ("src", "relay", "h1", "h2")
+    }
+    contacts = (
+        ContactWindow("src", "relay", 0, 10, 1e9, "isl", 0.5),
+        ContactWindow("relay", "h1", 0, 10, 1e9, "isl", 0.8),
+        ContactWindow("relay", "h2", 0, 10, 1e9, "isl", 0.8),
+        ContactWindow("h1", "ground", 0, 10, 1e9, "downlink", 1.0),
+        ContactWindow("h2", "ground", 0, 10, 1e9, "downlink", 1.0),
+    )
+    task = SimpleNamespace(source_sat="src")
+    request = EpochInput(
+        0, 0.0, [], states, {}, frozenset({"ground"}), contacts
+    )
+    placements = (
+        Placement("h1", "h1", 1.0, 0.4, 0.0,
+                  ("src", "relay", "h1"), ("h1",),
+                  ("h1", "ground")),
+        Placement("h2", "h2", 1.0, 0.4, 0.0,
+                  ("src", "relay", "h2"), ("h2",),
+                  ("h2", "ground")),
+    )
+
+    assert group_success(request, task, placements) == pytest.approx(0.32)
 
 
 def test_fault_risk_beta_parameters_are_positive():

@@ -169,6 +169,15 @@ def _interval_active_seconds(intervals, start: float, end: float) -> float:
     return total
 
 
+def _interval_total_seconds(intervals, start: float, end: float) -> float:
+    """Sum clipped activity, retaining overlap from multiple terminals."""
+    return sum(
+        max(0.0, min(end, interval[1]) - max(start, interval[0]))
+        for interval in intervals
+        if interval[1] > start and interval[0] < end
+    )
+
+
 def _communication_power_w(workload: Workload, params,
                            epoch_length_s: float,
                            epoch_start_s: float = 0.0) -> float:
@@ -178,10 +187,10 @@ def _communication_power_w(workload: Workload, params,
         return 0.0
     epoch_end = epoch_start_s + duration
     if workload.tx_intervals or workload.rx_intervals:
-        tx_time = _interval_active_seconds(
+        tx_time = _interval_total_seconds(
             workload.tx_intervals, epoch_start_s, epoch_end
         )
-        rx_time = _interval_active_seconds(
+        rx_time = _interval_total_seconds(
             workload.rx_intervals, epoch_start_s, epoch_end
         )
     else:
