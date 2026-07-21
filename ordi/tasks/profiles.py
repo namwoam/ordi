@@ -30,6 +30,7 @@ class TileProfile:
     compute_ops: float       # FLOPs
     base_utility: float      # dimensionless priority weight
     deadline_median_s: float = 600.0  # per-type median deadline at reference scale
+    input_bands: int = 3     # total channels represented by d_in_bits
 
     @property
     def d_in_bytes(self) -> float:
@@ -45,6 +46,14 @@ _TILE_EDGE_PIX = 1024
 _REFERENCE_TILE_EDGE_PIX = 128
 _AREA_SCALE = (_TILE_EDGE_PIX / _REFERENCE_TILE_EDGE_PIX) ** 2  # 64×
 _TILE_PIX = _TILE_EDGE_PIX * _TILE_EDGE_PIX * 3 * 8
+
+# E1 treats this grid as a PlanetScope/SuperDove-class inference ROI rather
+# than a complete framed scene. At native sampling it spans about 15.2 km per
+# side and fits within the nominal SuperDove scene footprint.
+PLANETSCOPE_NATIVE_GSD_M = 3.7
+PLANETSCOPE_ROI_EDGE_PIX = 4096
+PLANETSCOPE_TILE_EDGE_PIX = _TILE_EDGE_PIX
+PLANETSCOPE_SCENE_KM = (32.5, 19.6)
 
 PROFILES: Dict[str, TileProfile] = {
     "wildfire": TileProfile(
@@ -78,6 +87,7 @@ PROFILES: Dict[str, TileProfile] = {
         compute_ops=1.8e9 * _AREA_SCALE,    # area-scaled Siamese CNN
         base_utility=0.9,
         deadline_median_s=1800.0,           # 30 min — change analysis
+        input_bands=6,                       # paired RGB observations
     ),
 }
 

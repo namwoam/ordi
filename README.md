@@ -15,10 +15,30 @@ ORDI schedules each image tile over a rolling horizon. For every epoch it:
 1. Builds feasible source-helper-aggregator routes from a time-expanded orbital contact graph.
 2. Accounts for compute rate, battery, temperature, queue state, availability, latency, and link reliability.
 3. Selects a primary assignment by marginal utility and communication congestion; policies do not estimate joules.
-4. Adds backups up to a configurable cap only while their marginal reliability gain exceeds their replication cost, while keeping replicas fault-disjoint. The default cap is one.
+4. Adds backups up to a configurable cap only while their marginal reliability gain exceeds their replication cost, while keeping replicas fault-disjoint. Correlated fault-domain risk is learned online with a discounted Jeffreys-prior Beta–Bernoulli estimator from actual primary deliveries, backup recoveries, and hard assignment failures. Seeded Thompson sampling balances backup exploration against cost, with one exploratory backup allowed until three assignment outcomes establish a minimal sample; idle healthy planes and contact/queue misses are not fault samples. The scheduler is not given the injector's error rate. The default cap is one backup.
 5. Replans work affected by helper failures, missed contacts, or stragglers.
 
 Basilisk/BSK-RL models the spacecraft environment. ORDI retains workload generation, contact-graph construction, bandwidth allocation, store-and-forward routing, and seven classes of injected faults.
+
+## Reference Architecture and Scope
+
+ORDI does not claim that E1 reproduces one existing operator's deployed
+constellation. It uses a composed, traceable reference architecture:
+
+| Layer | Reference |
+| --- | --- |
+| EO payload and image model | [PlanetScope/SuperDove](https://science.nasa.gov/earth-science/csda/vendor-planet/) |
+| ISL and distributed compute model | [Kepler Tranche 1](https://kepler.space/kepler-deploys-first-space-based-scalable-cloud-infrastructure-powered-by-nvidia/) |
+| Fault-tolerant sensing/transport topology | [SDA PWSA](https://www.sda.mil/home/about-us/faq/) |
+| Autonomous EO scheduling concept | [ESA TASCNET](https://incubed.esa.int/portfolio/tascnet/) |
+
+We evaluate a notional next-generation EO constellation combining
+PlanetScope-class multispectral imagers with a Kepler-class optical
+edge-compute fabric. This architecture reflects emerging ESA TASCNET and
+[FireSat/Muon](https://www.muonspace.com/press/muon-space-to-integrate-spacexs-starlink-mini-space-lasers-into-its-halo-tm-satellite-platform)
+concepts but does not claim to reproduce an existing operator's deployed
+system. The absence of a complete operational civilian EO compute mesh is the
+research gap ORDI addresses.
 
 ## Requirements
 
@@ -87,7 +107,7 @@ Available evaluations are:
 
 | ID | Evaluation |
 | --- | --- |
-| E1 | ORDI versus five core baselines under matched random faults |
+| E1 | PlanetScope-class ROI placement on a scaled 3×12 optical compute mesh with 10 GS and 2% matched random faults |
 | E2 | Random-fault intensity sweep |
 | E3 | Correlated orbital-plane failures |
 | E4 | Constellation scalability |

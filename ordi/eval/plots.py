@@ -145,6 +145,44 @@ def plot_E1():
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
+    plot_E1_miss_decomposition(rows)
+
+
+def plot_E1_miss_decomposition(rows=None):
+    """Stack E1 miss causes so irreducible contact loss stays visible."""
+    rows = _read_csv("E1_core") if rows is None else rows
+    if not rows:
+        print("No E1 data")
+        return
+    _ensure_figures()
+    labels = [ALG_LABELS.get(row["algorithm"], row["algorithm"])
+              for row in rows]
+    causes = (
+        ("contact_miss_ratio", "Contact", "#457b9d"),
+        ("compute_queue_miss_ratio", "Compute queue", "#e9c46a"),
+        ("policy_miss_ratio", "Policy/admission", "#2a9d8f"),
+        ("hard_fault_miss_ratio", "Hard fault", "#e76f51"),
+        ("soft_failure_miss_ratio", "Soft failure", "#9b5de5"),
+    )
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    bottom = np.zeros(len(rows))
+    for metric, label, color in causes:
+        values = np.array([_float(row, metric) for row in rows])
+        ax.bar(range(len(rows)), values, bottom=bottom,
+               label=label, color=color)
+        bottom += values
+    ax.set_xticks(range(len(rows)))
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_ylabel("Deadline miss ratio")
+    ax.set_title("E1 Miss-Cause Decomposition")
+    ax.set_ylim(0.0, max(0.5, float(max(bottom, default=0.0)) * 1.15))
+    ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+    ax.legend(ncol=5, fontsize=8, loc="upper center")
+    fig.tight_layout()
+    path = os.path.join(FIGURES_DIR, "E1_miss_decomposition.png")
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  Saved {path}")
 
 
 # ── E2: Fault intensity ──────────────────────────────────────────────────────

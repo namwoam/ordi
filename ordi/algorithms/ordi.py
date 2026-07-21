@@ -9,6 +9,7 @@ protocol trace; the model-side resource ledger remains authoritative.
 from copy import copy
 from dataclasses import dataclass, replace
 import math
+import random
 
 from .schema import Assignment, Decision, NodeDecision, WorkItem
 from ._common import enumerate_placements, plane
@@ -41,7 +42,10 @@ class ORDI:
     name = "ordi"
 
     def __init__(self, max_replicas=2, split_options=(1, 2, 4),
-                 coded_options=(), halo_fraction=0.05, shard_count=None):
+                 coded_options=(), halo_fraction=0.05, shard_count=None,
+                 fault_risk_alpha=0.5, fault_risk_beta=0.5,
+                 fault_risk_discount=0.98, cold_start_backup_budget=1,
+                 min_fault_outcomes=3, rng_seed=0):
         # shard_count is retained as a compatibility hook for controlled tests
         # and ablations. Normal evaluation uses dynamic split_options.
         if shard_count is not None:
@@ -56,9 +60,82 @@ class ORDI:
             if 1 <= int(required) < int(fanout)
         }))
         self.halo_fraction = max(0.0, halo_fraction)
+        if fault_risk_alpha <= 0.0 or fault_risk_beta <= 0.0:
+            raise ValueError(
+                "fault-risk Beta parameters must be positive"
+            )
+        if not 0.0 < fault_risk_discount <= 1.0:
+            raise ValueError("fault_risk_discount must be in (0, 1]")
+        if cold_start_backup_budget < 0:
+            raise ValueError("cold_start_backup_budget must be non-negative")
+        if min_fault_outcomes < 0:
+            raise ValueError("min_fault_outcomes must be non-negative")
+        # Online Beta-Bernoulli estimate. Jeffreys' Beta(1/2, 1/2) prior is
+        # invariant and noninformative; it does not encode an error rate.
+        # Each observed orbital plane contributes one
+        # availability sample per epoch; helper and plane outages are thus
+        # learned from policy-visible state rather than supplied in advance.
+        self._fault_risk_alpha = float(fault_risk_alpha)
+        self._fault_risk_beta = float(fault_risk_beta)
+        self._fault_domain_failures = 0.0
+        self._fault_domain_successes = 0.0
+        self._fault_risk_discount = float(fault_risk_discount)
+        self._cold_start_backup_budget = int(cold_start_backup_budget)
+        self._cold_start_backups_used = 0
+        self._min_fault_outcomes = int(min_fault_outcomes)
+        self._fault_rng = random.Random(rng_seed)
+        self._last_fault_risk_sample = self.fault_domain_failure_estimate
         self.resources = DecisionFeasibilityModel()
         self.messages = MessageSimulator()
         self.waiting: dict[tuple[int, int], _RetryState] = {}
+
+    @property
+    def fault_domain_failure_estimate(self):
+        return (
+            self._fault_risk_alpha + self._fault_domain_failures
+        ) / (
+            self._fault_risk_alpha + self._fault_risk_beta
+            + self._fault_domain_failures + self._fault_domain_successes
+        )
+
+    @property
+    def fault_domain_sample_count(self):
+        return self._fault_domain_failures + self._fault_domain_successes
+
+    def observe_fault_domain_sample(self, failed: bool):
+        """Update the online risk estimate from one observed domain outcome."""
+        if failed:
+            self._fault_domain_failures += 1.0
+        else:
+            self._fault_domain_successes += 1.0
+
+    def sample_fault_domain_failure_risk(self):
+        """Draw a Thompson sample from the learned fault-risk posterior."""
+        self._last_fault_risk_sample = self._fault_rng.betavariate(
+            self._fault_risk_alpha + self._fault_domain_failures,
+            self._fault_risk_beta + self._fault_domain_successes,
+        )
+        return self._last_fault_risk_sample
+
+    def observe_assignment_outcome(self, outcome: str):
+        """Learn from one completed or failed scheduled assignment.
+
+        A backup recovery and an unrecoverable hard fault are evidence that the
+        primary fault domain failed. Ordinary primary delivery is a success.
+        Contact/queue misses never become Bernoulli fault samples.
+        """
+        if outcome not in {
+            "primary_success", "backup_recovery", "fault_failure",
+            "nonfault_failure",
+        }:
+            raise ValueError(f"unknown assignment outcome {outcome!r}")
+        if outcome == "nonfault_failure":
+            return
+        self._fault_domain_failures *= self._fault_risk_discount
+        self._fault_domain_successes *= self._fault_risk_discount
+        self.observe_fault_domain_sample(
+            outcome in {"backup_recovery", "fault_failure"}
+        )
 
     @staticmethod
     def _contact_key(contact):
@@ -254,6 +331,13 @@ class ORDI:
         if min(self.max_replicas,
                getattr(tile, "n_replicas_max", 1)) <= 1:
             return None
+        cold_start = (
+            self.fault_domain_sample_count < self._min_fault_outcomes
+        )
+        if (cold_start
+                and self._cold_start_backups_used
+                >= self._cold_start_backup_budget):
+            return None
         q = primary.shard_count
         choices = enumerate_placements(
             request, task, tile,
@@ -299,17 +383,22 @@ class ORDI:
             primary.placements, primary.shard_count
         )
         backup_p = self._group_probability(backup, primary.shard_count)
-        reliability_gain = source_p * (1.0 - primary_p) * backup_p
+        sampled_domain_risk = self.sample_fault_domain_failure_risk()
+        primary_failure_risk = max(1.0 - primary_p, sampled_domain_risk)
+        reliability_gain = source_p * primary_failure_risk * backup_p
+        backup_latency = max(p.latency for p in backup)
         gain = (
             tile.utility * reliability_gain
-            * math.exp(-request.weights.freshness * min(
-                primary.latency, max(p.latency for p in backup)
-            ))
+            * math.exp(-request.weights.freshness * backup_latency)
             - request.weights.communication
             * sum(p.communication_bits for p in backup)
             - request.weights.replication
         )
-        return backup if gain > 0 else None
+        if gain <= 0:
+            return None
+        if cold_start:
+            self._cold_start_backups_used += 1
+        return backup
 
     @staticmethod
     def _leaf_item(task, tile, placement, group_id, work_fraction,
@@ -450,6 +539,13 @@ class ORDI:
                         "known_state_nodes": len(local_request.satellites),
                         "max_state_age_s": max(
                             local_request.state_age_s.values(), default=0.0
+                        ),
+                        "fault_domain_failure_estimate": (
+                            self.fault_domain_failure_estimate
+                        ),
+                        "fault_domain_samples": self.fault_domain_sample_count,
+                        "fault_domain_risk_sample": (
+                            self._last_fault_risk_sample
                         ),
                     },
                     routes=tuple(

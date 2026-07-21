@@ -60,6 +60,11 @@ class EpochMetrics:
     realized_miss_ratio: float = 0.0
     realized_utility: float = 0.0
     realized_coverage: float = 0.0
+    contact_miss_ratio: float = 0.0
+    compute_queue_miss_ratio: float = 0.0
+    policy_miss_ratio: float = 0.0
+    hard_fault_miss_ratio: float = 0.0
+    soft_failure_miss_ratio: float = 0.0
 
 
 def _percentile(values, quantile):
@@ -509,6 +514,9 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "helper_request_count", "helper_acceptance_ratio",
         "state_age_mean_s", "state_age_p95_s",
         "realized_miss_ratio", "realized_utility", "realized_coverage",
+        "contact_miss_ratio", "compute_queue_miss_ratio",
+        "policy_miss_ratio",
+        "hard_fault_miss_ratio", "soft_failure_miss_ratio",
     ]
     out: Dict[str, float] = {}
     for k in keys:

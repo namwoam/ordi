@@ -81,6 +81,9 @@ def test_e1_exports_reliability_latency_cost_and_decentralization_metrics():
         "isl_traffic_bits_per_delivered_tile", "control_traffic_ratio",
         "energy_j_per_delivered_tile", "compute_load_balance",
         "helper_acceptance_ratio", "state_age_p95_s",
+        "contact_miss_ratio", "compute_queue_miss_ratio",
+        "policy_miss_ratio",
+        "hard_fault_miss_ratio", "soft_failure_miss_ratio",
     }
     assert required <= set(E1_METRIC_KEYS)
 

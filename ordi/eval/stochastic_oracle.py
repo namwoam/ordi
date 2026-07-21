@@ -17,7 +17,7 @@ import math
 import os
 import random
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ordi.algorithms import (
     Assignment, ContactWindow, Decision, EpochInput, ORDI, PolicyWeights,
@@ -32,6 +32,7 @@ from ordi.tasks.profiles import PROFILES
 @dataclass(frozen=True)
 class FaultScenario:
     name: str
+    weight: float = 1.0
     node_failures: tuple[tuple[int, frozenset[str]], ...] = ()
     link_failures: tuple[
         tuple[int, frozenset[tuple[str, str]]], ...
@@ -226,6 +227,7 @@ def _action_statistics(instance: MultiEpochInstance, request: EpochInput,
 
     utility_total = 0.0
     misses = 0
+    total_weight = sum(scenario.weight for scenario in instance.scenarios)
     for scenario in instance.scenarios:
         surviving = []
         for index, latency in enumerate(adjusted):
@@ -241,16 +243,17 @@ def _action_statistics(instance: MultiEpochInstance, request: EpochInput,
                     )):
                 surviving.append(latency)
         if not surviving:
-            misses += 1
+            misses += scenario.weight
             continue
         latency = min(surviving)
-        utility_total += tile.utility * math.exp(
+        utility_total += scenario.weight * tile.utility * math.exp(
             -request.weights.freshness * latency
         )
 
-    scenario_count = max(len(instance.scenarios), 1)
-    expected_utility = utility_total / scenario_count
-    miss_probability = misses / scenario_count
+    total_weight = max(total_weight, 1e-12)
+    # ``misses`` is accumulated as a weight, not a scenario count.
+    expected_utility = utility_total / total_weight
+    miss_probability = misses / total_weight
     replica_count = len(set(assignment.metadata.get(
         "shard_groups", range(len(assignment.helpers))
     )))
@@ -280,11 +283,9 @@ def enumerate_stochastic_actions(
     instance: MultiEpochInstance,
     primary_cap: int = 4,
     backup_cap: int = 3,
-    required_actions: dict | None = None,
 ):
     """Enumerate bounded primary and disjoint-backup choices per request."""
     requests, tasks, tiles = _task_maps(instance)
-    required_actions = required_actions or {}
     actions = {}
     for key, request in requests.items():
         task = tasks[key]
@@ -321,7 +322,6 @@ def enumerate_stochastic_actions(
             reverse=True,
         )
         selected.extend(pairs[:backup_cap])
-        selected.extend(required_actions.get(key, ()))
         deduplicated = {}
         for action in selected:
             deduplicated.setdefault(_action_key(action), action)
@@ -333,11 +333,10 @@ def solve_stochastic_oracle(
     instance: MultiEpochInstance,
     primary_cap: int = 4,
     backup_cap: int = 3,
-    required_actions: dict | None = None,
 ) -> StochasticOracleResult:
     """Solve the bounded multi-epoch stochastic placement problem exactly."""
     actions, requests, tasks, tiles = enumerate_stochastic_actions(
-        instance, primary_cap, backup_cap, required_actions
+        instance, primary_cap, backup_cap
     )
     keys = tuple(sorted(actions))
     upper = {
@@ -419,7 +418,19 @@ def solve_stochastic_oracle(
     )
 
 
-def build_fault_scenarios(sat_ids) -> tuple[FaultScenario, ...]:
+def build_fault_scenarios(
+    sat_ids, fault_rate: float = 0.10
+) -> tuple[FaultScenario, ...]:
+    """Build a finite distribution matched to E1's injected fault mass.
+
+    E1 samples one of seven random fault families with probability
+    ``fault_rate`` per epoch. The reduced model groups helper, straggler,
+    battery, and thermal effects into compute-domain risk; ISL, ground-contact,
+    and adverse-downlink effects into route-domain risk. A quarter of each
+    group is reserved for correlated plane/cut stress cases.
+    """
+    if not 0.0 <= fault_rate <= 1.0:
+        raise ValueError("fault_rate must be between zero and one")
     sat_ids = tuple(sat_ids)
     planes = {}
     for sat_id in sat_ids:
@@ -431,22 +442,32 @@ def build_fault_scenarios(sat_ids) -> tuple[FaultScenario, ...]:
         if plane(left) != plane(right)
     )
     sparse_cut = frozenset(sorted(cross_links)[:max(2, len(sat_ids))])
+    compute_mass = fault_rate * 4.0 / 7.0
+    route_mass = fault_rate * 3.0 / 7.0
+    plane_mass = compute_mass * 0.25
+    correlated_mass = route_mass * 0.25
     return (
-        FaultScenario("nominal"),
-        FaultScenario("plane_early", (
-            (1, frozenset(planes[plane_names[0]])),
-        )),
-        FaultScenario("plane_late", (
-            (2, frozenset(planes[plane_names[1]])),
-        )),
-        FaultScenario("helper_failure", (
-            (1, frozenset({sat_ids[-1]})),
-        )),
-        FaultScenario("isl_cut", (), ((1, sparse_cut),)),
+        FaultScenario("nominal", weight=1.0 - fault_rate),
         FaultScenario(
-            "correlated_plane_isl",
-            ((2, frozenset(planes[plane_names[-1]])),),
-            ((2, sparse_cut),),
+            "plane_early", weight=plane_mass / 2.0,
+            node_failures=((1, frozenset(planes[plane_names[0]])),),
+        ),
+        FaultScenario(
+            "plane_late", weight=plane_mass / 2.0,
+            node_failures=((2, frozenset(planes[plane_names[1]])),),
+        ),
+        FaultScenario(
+            "helper_failure", weight=compute_mass - plane_mass,
+            node_failures=((1, frozenset({sat_ids[-1]})),),
+        ),
+        FaultScenario(
+            "isl_cut", weight=route_mass - correlated_mass,
+            link_failures=((1, sparse_cut),),
+        ),
+        FaultScenario(
+            "correlated_plane_isl", weight=correlated_mass,
+            node_failures=((2, frozenset(planes[plane_names[-1]])),),
+            link_failures=((2, sparse_cut),),
         ),
     )
 
@@ -456,6 +477,7 @@ def build_multi_epoch_instance(
     n_sats: int = 6,
     n_requests: int = 5,
     n_epochs: int = 3,
+    fault_rate: float = 0.10,
 ) -> MultiEpochInstance:
     if not 4 <= n_sats <= 6:
         raise ValueError("n_sats must be between 4 and 6")
@@ -534,12 +556,97 @@ def build_multi_epoch_instance(
         states, opportunities, frozenset({ground}), tuple(contacts),
         epoch_length, weights,
     ) for epoch in range(n_epochs))
-    return MultiEpochInstance(requests, build_fault_scenarios(sat_ids))
+    return MultiEpochInstance(
+        requests, build_fault_scenarios(sat_ids, fault_rate=fault_rate)
+    )
 
 
-def _policy_plan(instance: MultiEpochInstance, scheduler):
+def _scenario_request(request: EpochInput, scenario: FaultScenario):
+    """Expose only faults active by this decision epoch to an online policy."""
+    states = {
+        sat_id: replace(
+            state,
+            available=(
+                state.available
+                and not scenario.node_failed(sat_id, request.epoch)
+            ),
+        )
+        for sat_id, state in request.satellites.items()
+    }
+    contacts = tuple(
+        contact for contact in request.contacts
+        if (not scenario.node_failed(contact.source, request.epoch)
+            and not scenario.node_failed(contact.target, request.epoch)
+            and not scenario.link_failed(
+                contact.source, contact.target, request.epoch
+            ))
+    )
+    return replace(request, satellites=states, contacts=contacts)
+
+
+def _scenario_instance(instance: MultiEpochInstance,
+                       scenario: FaultScenario):
+    normalized = replace(scenario, weight=1.0)
+    return MultiEpochInstance(
+        tuple(_scenario_request(request, scenario)
+              for request in instance.requests),
+        (normalized,),
+    )
+
+
+def _scenario_group_status(assignment: Assignment,
+                           scenario: FaultScenario, epoch: int,
+                           ground_stations):
+    alive = [
+        _replica_survives(
+            assignment, index, scenario, epoch, ground_stations
+        )
+        for index in range(len(assignment.helpers))
+    ]
+    required = max(1, int(assignment.metadata.get("data_shards", 1)))
+    labels = assignment.metadata.get("shard_groups")
+    if labels is None:
+        return {0: sum(alive) >= required}
+    grouped = {}
+    for label, survives in zip(labels, alive):
+        grouped.setdefault(label, []).append(survives)
+    return {
+        label: len(group) >= required and sum(group) >= required
+        for label, group in grouped.items()
+    }
+
+
+def _policy_plan(instance: MultiEpochInstance, scheduler,
+                 scenario: FaultScenario | None = None):
     actions = {}
+    pending_feedback = []
+    observe = getattr(scheduler, "observe_assignment_outcome", None)
     for request in instance.requests:
+        if scenario is not None:
+            still_pending = []
+            for original_request, assignment in pending_feedback:
+                delivery_time = original_request.sim_time + float(
+                    assignment.metadata.get("latency", math.inf)
+                )
+                delivery_epoch = int(
+                    delivery_time // max(request.epoch_length, 1.0)
+                )
+                status = _scenario_group_status(
+                    assignment, scenario, request.epoch,
+                    request.ground_stations,
+                )
+                if not any(status.values()):
+                    if observe:
+                        observe("fault_failure")
+                elif request.epoch >= delivery_epoch:
+                    if observe:
+                        observe(
+                            "primary_success" if status.get(0, False)
+                            else "backup_recovery"
+                        )
+                else:
+                    still_pending.append((original_request, assignment))
+            pending_feedback = still_pending
         for task in request.tasks:
             scheduler.messages.seed_knowledge(
                 task.source_sat, request.satellites,
@@ -549,7 +656,28 @@ def _policy_plan(instance: MultiEpochInstance, scheduler):
         decision = scheduler.schedule(request)
         for assignment in decision.assignments:
             key = (request.epoch, assignment.task_id, assignment.tile_id)
-            actions[key] = _centralize_action(assignment)
+            action = _centralize_action(assignment)
+            actions[key] = action
+            if scenario is not None:
+                pending_feedback.append((request, action))
+    if scenario is not None:
+        for request, assignment in pending_feedback:
+            delivery_time = request.sim_time + float(
+                assignment.metadata.get("latency", math.inf)
+            )
+            delivery_epoch = int(
+                delivery_time // max(request.epoch_length, 1.0)
+            )
+            status = _scenario_group_status(
+                assignment, scenario, delivery_epoch,
+                request.ground_stations,
+            )
+            if observe:
+                observe(
+                    "primary_success" if status.get(0, False)
+                    else ("backup_recovery" if any(status.values())
+                          else "fault_failure")
+                )
     return actions
 
 
@@ -594,39 +722,66 @@ def compare_stochastic_oracle(
     n_epochs: int = 3,
     primary_cap: int = 4,
     backup_cap: int = 3,
+    fault_rate: float = 0.10,
 ) -> tuple[StochasticGapRecord, ...]:
     instance = build_multi_epoch_instance(
-        seed, n_sats, n_requests, n_epochs
+        seed, n_sats, n_requests, n_epochs, fault_rate
     )
-    plans = {
-        "ORDI": _policy_plan(
-            instance, ORDI(max_replicas=2, split_options=(1,))
-        ),
-        "seco_adapted": _policy_plan(
-            instance, SECOAdapted(split_options=(1,))
-        ),
-    }
-    required = {}
-    for plan in plans.values():
-        for key, action in plan.items():
-            required.setdefault(key, []).append(action)
-    oracle = solve_stochastic_oracle(
-        instance, primary_cap, backup_cap, required
-    )
-    records = []
-    for algorithm, plan in plans.items():
-        objective, misses, cost, accepted = evaluate_fixed_plan(
-            instance, plan
+    total_weight = sum(item.weight for item in instance.scenarios)
+    oracle_objective = 0.0
+    oracle_misses = 0.0
+    oracle_cost = 0.0
+    oracle_assignments = 0.0
+    oracle_search_nodes = 0
+    for scenario in instance.scenarios:
+        visible = _scenario_instance(instance, scenario)
+        scenario_oracle = solve_stochastic_oracle(
+            visible, primary_cap, backup_cap
         )
+        oracle_objective += scenario.weight * scenario_oracle.objective
+        oracle_misses += (
+            scenario.weight * scenario_oracle.expected_miss_ratio
+        )
+        oracle_cost += scenario.weight * scenario_oracle.replication_cost
+        oracle_assignments += (
+            scenario.weight * len(scenario_oracle.assignments)
+        )
+        oracle_search_nodes += scenario_oracle.search_nodes
+    oracle_objective /= total_weight
+    oracle_misses /= total_weight
+    oracle_cost /= total_weight
+    oracle_assignments /= total_weight
+    records = []
+    policy_factories = {
+        "ORDI": lambda: ORDI(
+            max_replicas=2, split_options=(1,), rng_seed=seed
+        ),
+        "seco_adapted": lambda: SECOAdapted(split_options=(1,)),
+    }
+    for algorithm, factory in policy_factories.items():
+        objective = misses = cost = accepted = 0.0
+        for scenario in instance.scenarios:
+            visible = _scenario_instance(instance, scenario)
+            scheduler = factory()
+            plan = _policy_plan(visible, scheduler, scenario)
+            values = evaluate_fixed_plan(visible, plan)
+            objective += scenario.weight * values[0]
+            misses += scenario.weight * values[1]
+            cost += scenario.weight * values[2]
+            accepted += scenario.weight * values[3]
+        objective /= total_weight
+        misses /= total_weight
+        cost /= total_weight
+        accepted /= total_weight
         gap = (
-            max(0.0, (oracle.objective - objective) / oracle.objective)
-            if oracle.objective > 0.0 else 0.0
+            (oracle_objective - objective) / oracle_objective
+            if oracle_objective > 0.0 else 0.0
         )
         records.append(StochasticGapRecord(
-            seed, algorithm, oracle.objective, objective, gap,
-            oracle.expected_miss_ratio, misses,
-            oracle.replication_cost, cost,
-            len(oracle.assignments), accepted, oracle.search_nodes,
+            seed, algorithm, oracle_objective, objective, gap,
+            oracle_misses, misses,
+            oracle_cost, cost,
+            oracle_assignments, accepted, oracle_search_nodes,
         ))
     return tuple(records)
 
@@ -661,6 +816,7 @@ def _main():
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--primary-cap", type=int, default=4)
     parser.add_argument("--backup-cap", type=int, default=3)
+    parser.add_argument("--fault-rate", type=float, default=0.10)
     parser.add_argument(
         "--output", default="results/stochastic_oracle_gap.csv"
     )
@@ -672,6 +828,7 @@ def _main():
         n_epochs=args.epochs,
         primary_cap=args.primary_cap,
         backup_cap=args.backup_cap,
+        fault_rate=args.fault_rate,
     )
     for algorithm in ("ORDI", "seco_adapted"):
         rows = [row for row in records if row.algorithm == algorithm]

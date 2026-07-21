@@ -59,6 +59,9 @@ class ExperimentConfig:
     # every internal boundary, so total input and compute grow with the split.
     seco_split_options: tuple[int, ...] = (1, 2, 4)
     split_halo_fraction: float = 0.05
+    # Recurring non-ORDI accelerator demand. The physical queue receives this
+    # fraction of one epoch's capacity before each scheduling round.
+    background_compute_utilization: float = 0.0
 
 @dataclass(frozen=True)
 class EpochInput:

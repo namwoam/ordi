@@ -7,10 +7,10 @@ Task k:
   deadline D_k         = r_k + deadline_slack_s
   tile set V_k         = grid of n_tiles_side × n_tiles_side tiles
 
-When sat_groundtrack is supplied (FOV-aware mode), each task event samples a
-random ground target and picks a satellite currently within fov_range_km of
-it as the source.  This replaces the original uniform-random source assignment
-with physically motivated imaging geometry.
+When sat_groundtrack is supplied, fixed-target mode gates an event against the
+configured access radius. Groundtrack mode instead constructs a feasible
+near-nadir acquisition at a sampled spacecraft subpoint, avoiding confusion
+between pointing access and the much smaller instantaneous camera footprint.
 """
 
 from __future__ import annotations
@@ -96,6 +96,7 @@ def build_tiles(
     n_replicas_max: int,
     rng: random.Random,
     utility_scale: float = 1.0,
+    input_band_count: Optional[int] = None,
 ) -> List[Tile]:
     """Build the n_tiles_side × n_tiles_side tile grid for one task.
 
@@ -116,11 +117,16 @@ def build_tiles(
             spatial_weight = 1.0 + 0.3 * (1.0 - dist_from_center / max(max_dist, 1e-6))
             u = profile.base_utility * spatial_weight * utility_scale * rng.uniform(0.9, 1.1)
 
+            band_scale = (
+                input_band_count / profile.input_bands
+                if input_band_count is not None else 1.0
+            )
             tiles.append(Tile(
                 task_id=task_id,
                 tile_id=len(tiles),
                 profile=profile,
-                d_in_bits=profile.d_in_bits * rng.uniform(0.9, 1.1),
+                d_in_bits=(profile.d_in_bits * band_scale
+                           * rng.uniform(0.9, 1.1)),
                 d_out_bits=profile.d_out_bits * rng.uniform(0.9, 1.1),
                 compute_ops=profile.compute_ops * rng.uniform(0.85, 1.15),
                 utility=u,
@@ -186,6 +192,10 @@ def generate_tasks(
     fov_range_km: float = 500.0,
     # max ground distance for the camera footprint at 550 km altitude
     # ~500 km corresponds to ±arctan(500/550) ≈ 42° off-nadir (wide-field)
+    acquisition_mode: str = "targets",
+    # "targets" gates against fixed targets. "groundtrack" constructs a
+    # feasible near-nadir ROI at a sampled spacecraft subpoint.
+    input_band_counts: Optional[Dict[str, int]] = None,
 ) -> List[EOTask]:
     """
     Generate EO tasks via a Poisson arrival process.
@@ -221,8 +231,22 @@ def generate_tasks(
       that every task corresponds to a satellite that is physically overhead
       the imaging target at the moment of data capture — the physically
       correct model for EO scheduling.
+
+    Groundtrack acquisition mode (when sat_groundtrack is given):
+      Each event selects a spacecraft and defines its ROI at that spacecraft's
+      sampled subpoint. ``input_band_counts`` optionally scales only the input
+      tensor volume relative to each profile's baseline channel count.
     """
     rng = random.Random(seed)
+    if acquisition_mode not in {"targets", "groundtrack"}:
+        raise ValueError("acquisition_mode must be 'targets' or 'groundtrack'")
+    if input_band_counts is not None:
+        invalid = {
+            name: count for name, count in input_band_counts.items()
+            if name not in PROFILES or count <= 0
+        }
+        if invalid:
+            raise ValueError(f"invalid input band counts: {invalid}")
 
     if task_type_weights is None:
         task_type_weights = {t: 1.0 for t in TASK_TYPES}
@@ -259,7 +283,12 @@ def generate_tasks(
             break
 
         # ── source satellite selection ──────────────────────────────────────
-        if sat_groundtrack and ground_targets:
+        if sat_groundtrack and acquisition_mode == "groundtrack":
+            # Define the acquired ROI at this spacecraft's sampled subpoint.
+            # It is therefore feasible by construction, without treating a
+            # wide off-nadir access envelope as the sensor footprint.
+            src = rng.choice(sat_ids)
+        elif sat_groundtrack and ground_targets:
             # FOV-aware: find every satellite that is over at least one target.
             # Scanning all targets for each satellite is fast (100 targets × 24
             # sats = 2400 checks) and avoids the "pick random target first" bias
@@ -304,7 +333,8 @@ def generate_tasks(
                 burst_id=burst_id,
             )
             task.tiles = build_tiles(
-                task_id, profile, n_tiles_side, n_replicas_max, rng
+                task_id, profile, n_tiles_side, n_replicas_max, rng,
+                input_band_count=(input_band_counts or {}).get(ttype),
             )
             tasks.append(task)
             task_id += 1

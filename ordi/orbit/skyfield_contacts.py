@@ -19,7 +19,7 @@ def build_synthetic_walker(n_planes=6, sats_per_plane=6, alt_km=550.0, inc_deg=5
 
 def _unix(tt): return 946727935.816+(tt-2451545.0)*86400.0
 
-def compute_contact_windows(satellites,t_start_unix,t_end_unix,ground_stations=None,isl_max_range_km=ISL_MAX_RANGE_KM,dt_seconds=30.0,min_elevation_deg=GS_MIN_ELEVATION_DEG):
+def compute_contact_windows(satellites,t_start_unix,t_end_unix,ground_stations=None,isl_max_range_km=ISL_MAX_RANGE_KM,dt_seconds=30.0,min_elevation_deg=GS_MIN_ELEVATION_DEG,isl_pairs=None):
     stations=ground_stations or DEFAULT_GROUND_STATIONS; ts=load.timescale(); events=[]
     start=ts.from_datetime(dt.datetime.fromtimestamp(t_start_unix,dt.timezone.utc)); end=ts.from_datetime(dt.datetime.fromtimestamp(t_end_unix,dt.timezone.utc))
     for sat in satellites:
@@ -32,6 +32,10 @@ def compute_contact_windows(satellites,t_start_unix,t_end_unix,ground_stations=N
     nsteps=int((t_end_unix-t_start_unix)/dt_seconds)+1; tt=np.linspace(start.tt,end.tt,nsteps); times=np.array([_unix(x) for x in tt]); pos=np.array([sat.at(ts.tt_jd(tt)).position.km.T for sat in satellites])
     for i in range(len(satellites)):
         for j in range(i+1,len(satellites)):
+            if (isl_pairs is not None
+                    and frozenset((satellites[i].name, satellites[j].name))
+                    not in isl_pairs):
+                continue
             active=np.linalg.norm(pos[i]-pos[j],axis=1)<=isl_max_range_km; begin=None
             for k,on in enumerate(np.r_[active,False]):
                 if on and begin is None: begin=times[k]

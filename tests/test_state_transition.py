@@ -188,6 +188,79 @@ class StateTransitionTests(unittest.TestCase):
         self.assertEqual(len(submitted), 2)
         self.assertEqual(state.B_i, battery_before)
 
+    def test_background_compute_is_enqueued_before_each_schedule(self):
+        state = _state("sat", rate_gflops=1.0)
+        observed_queues = []
+
+        class FakeBackend:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            @staticmethod
+            def submit(_workloads):
+                return 0.0
+
+        def empty_schedule(epoch, _tasks):
+            observed_queues.append(state.Q_i)
+            return Decision(epoch)
+
+        with patch("ordi.eval.experiments.N_EPOCHS", 2), patch(
+            "ordi.sim.basilisk_backend.BasiliskBackend", FakeBackend
+        ):
+            _simulate_stateful(
+                empty_schedule, [], ["sat"], {"sat": state},
+                ExperimentConfig(
+                    epoch_length=60.0,
+                    background_compute_utilization=0.15,
+                ),
+                realized_trials=0,
+            )
+
+        self.assertEqual(observed_queues, [9e9, 18e9])
+
+    def test_stateful_loop_reports_completed_assignment_outcome_once(self):
+        state = _state("sat")
+        tile = SimpleNamespace(
+            tile_id=0, compute_ops=1e6, d_in_bits=100.0,
+            d_out_bits=10.0, utility=1.0,
+        )
+        task = SimpleNamespace(
+            task_id=1, source_sat="sat", release_time=0.0,
+            deadline=180.0, tiles=[tile],
+        )
+        outcomes = []
+
+        class FakeBackend:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            @staticmethod
+            def submit(_workloads):
+                return 0.0
+
+        def schedule(epoch, _tasks):
+            if epoch:
+                return Decision(epoch)
+            return Decision(0, (Assignment(
+                1, 0, "sat", helpers=("sat",), aggregators=("sat",),
+                metadata={
+                    "latency": 30.0, "delivery_time": 30.0,
+                    "reliability": 1.0, "data_shards": 1,
+                    "shard_groups": (0,),
+                },
+            ),))
+
+        with patch("ordi.eval.experiments.N_EPOCHS", 2), patch(
+            "ordi.sim.basilisk_backend.BasiliskBackend", FakeBackend
+        ):
+            _simulate_stateful(
+                schedule, [task], ["sat"], {"sat": state},
+                ExperimentConfig(epoch_length=60.0), realized_trials=0,
+                outcome_callback=outcomes.append,
+            )
+
+        self.assertEqual(outcomes, ["primary_success"])
+
 
 if __name__ == "__main__":
     unittest.main()

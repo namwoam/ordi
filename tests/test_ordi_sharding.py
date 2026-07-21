@@ -6,6 +6,7 @@ import pytest
 from ordi.algorithms import (
     ContactWindow, Decision, EpochInput, ORDI, PolicyWeights, SatelliteView,
 )
+from ordi.algorithms._common import plane
 from ordi.eval.experiments import _advance_synthetic_states, _assignment_viable
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
@@ -234,3 +235,107 @@ def test_backup_disjointness_includes_downlink_relays():
     )
 
     assert nodes == {"helper", "agg", "relay"}
+
+
+def test_sampled_fault_risk_selects_a_cost_effective_disjoint_backup():
+    states = {
+        name: _view(name)
+        for name in ("SAT_00_00", "SAT_01_00")
+    }
+    contacts = (
+        ContactWindow(
+            "SAT_00_00", "SAT_01_00", 0.0, 20.0, 1e9, "isl", 0.99
+        ),
+        ContactWindow(
+            "SAT_01_00", "SAT_00_00", 0.0, 20.0, 1e9, "isl", 0.99
+        ),
+        ContactWindow(
+            "SAT_00_00", "ground", 0.0, 20.0, 1e9,
+            "downlink", 0.99,
+        ),
+        ContactWindow(
+            "SAT_01_00", "ground", 0.0, 20.0, 1e9,
+            "downlink", 0.99,
+        ),
+    )
+    tile = SimpleNamespace(
+        tile_id=0, n_replicas_max=2, d_in_bits=100.0,
+        d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="SAT_00_00", deadline=20.0, tiles=[tile]
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts,
+        weights=PolicyWeights(
+            freshness=0.0, energy=0.0, communication=0.0,
+            replication=0.05,
+        ),
+    )
+
+    low_risk = ORDI(split_options=(1,))
+    risk_aware = ORDI(split_options=(1,))
+    for _ in range(20):
+        low_risk.observe_fault_domain_sample(False)
+    for scheduler in (low_risk, risk_aware):
+        scheduler.messages.seed_knowledge(
+            "SAT_00_00", states, generated_at=-60.0, delivered_at=0.0
+        )
+
+    assert len(low_risk.schedule(request).assignments[0].helpers) == 1
+    assignment = risk_aware.schedule(request).assignments[0]
+    assert len(assignment.helpers) == 2
+    assert assignment.metadata["shard_groups"] == (0, 1)
+    assert plane(assignment.helpers[0]) != plane(assignment.helpers[1])
+    assert assignment.metadata["fault_domain_samples"] == 0
+
+
+def test_fault_domain_estimate_learns_from_samples():
+    scheduler = ORDI()
+    assert scheduler.fault_domain_failure_estimate == pytest.approx(0.5)
+
+    for failed in (False, False, False, True):
+        scheduler.observe_fault_domain_sample(failed)
+
+    assert scheduler.fault_domain_sample_count == 4
+    assert scheduler.fault_domain_failure_estimate == pytest.approx(1.5 / 5)
+
+
+def test_fault_domain_thompson_samples_are_seeded_and_bounded():
+    left = ORDI(rng_seed=7)
+    right = ORDI(rng_seed=7)
+
+    samples = [left.sample_fault_domain_failure_risk() for _ in range(4)]
+
+    assert samples == [
+        right.sample_fault_domain_failure_risk() for _ in range(4)
+    ]
+    assert all(0.0 <= sample <= 1.0 for sample in samples)
+
+
+def test_fault_learning_uses_assignment_outcomes_and_ignores_nonfault_misses():
+    scheduler = ORDI(fault_risk_discount=0.5)
+
+    scheduler.observe_assignment_outcome("primary_success")
+    scheduler.observe_assignment_outcome("backup_recovery")
+    before = scheduler.fault_domain_sample_count
+    scheduler.observe_assignment_outcome("nonfault_failure")
+
+    assert scheduler.fault_domain_sample_count == pytest.approx(before)
+    assert scheduler._fault_domain_failures == pytest.approx(1.0)
+    assert scheduler._fault_domain_successes == pytest.approx(0.5)
+
+
+def test_fault_risk_beta_parameters_are_positive():
+    with pytest.raises(ValueError, match="must be positive"):
+        ORDI(fault_risk_alpha=0.0)
+
+
+def test_cold_start_backup_exploration_is_budgeted():
+    scheduler = ORDI(cold_start_backup_budget=1)
+
+    assert scheduler._cold_start_backup_budget == 1
+    with pytest.raises(ValueError, match="must be non-negative"):
+        ORDI(cold_start_backup_budget=-1)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        ORDI(min_fault_outcomes=-1)

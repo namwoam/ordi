@@ -4,30 +4,41 @@ Focused experiment runner for E1–E4.
 Each experiment returns a dict: {algorithm_name: List[EpochMetrics]}.
 Results are saved to results/<experiment_id>.csv.
 
+The evaluation is a notional next-generation architecture, not a reproduction
+of one operator's deployed system. It composes a PlanetScope/SuperDove-class EO
+workload with Kepler-class optical edge compute, an SDA-PWSA-inspired
+fault-tolerant transport topology, and the autonomous scheduling direction
+represented by ESA TASCNET.
+
 Shared realistic LEO-EO simulation setup (all experiments unless overridden):
-  - Synthetic Walker constellation: 6 planes × 6 sats = 36 sats (default)
+  - Synthetic Walker constellation: 6 planes × 6 sats = 36 sats (default).
+    E1 uses a 3 × 12 scaled near-polar mesh so fore/aft neighbors remain
+    mutually visible at the modeled optical-terminal range.
   - 6 geographically distributed ground stations: Fairbanks, Greenwich,
     Singapore, Nairobi, Hawaii, and Punta Arenas.
-  - FOV-constrained task generation: tasks arise only when a satellite is
-    within 600 km of one of 100 random ground targets — physically correct
-    for an EO system whose camera covers a finite swath.
+  - E1 acquisition events construct feasible near-nadir PlanetScope-class
+    regions along sampled ground tracks. Other experiments retain the legacy
+    fixed-target access generator.
   - Orbital period: 5760 s (96 min) — correct for 550 km LEO altitude.
   - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
   - E1 tasks: mean 20 requests/orbit in a clustered hot-source process. Sixty
     percent of parent events generate 3–6 same-source requests within 60 s.
-  - E1 expands one same-area burst to eight requests within 30 s and amplifies
-    it to 16× inference work while preserving per-request data volume and the
-    deadline model, creating explicit compute pressure.
-  - Each request is a 4096×4096 scene split into sixteen 1024×1024 tiles.
+  - E1 expands one same-area burst per orbit to ten requests within 30 s and
+    adds 15% recurring background accelerator demand.
+  - Each request is a 4096×4096 PlanetScope-class inference ROI split into
+    sixteen 1024×1024 tiles, with workload-specific spectral band counts.
   - Deadlines are log-normal (σ=0.6), with medians wildfire 600 s, ship
     900 s, change 1800 s, and cloud_filter 5760 s (one orbit).
 """
 
 from __future__ import annotations
 import csv
+import hashlib
 import math
 import os
+import random
 import time
+from dataclasses import replace
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import copy, deepcopy
@@ -55,6 +66,7 @@ from ordi.eval.metrics import (
     compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
 )
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
+from ordi.algorithms._common import earliest_route
 
 RESULTS_DIR = "results"
 SIM_DURATION_S = 17_280       # 3 complete orbits at 550 km (3 × 5760 s)
@@ -89,7 +101,9 @@ def _intensify_one_area_burst(tasks, compute_multiplier,
     task type, source satellite, and deadline slack.  Only compute demand is
     multiplied.  Release times can optionally be compressed into ``window_s``.
     """
-    if compute_multiplier <= 1.0 or not tasks:
+    if compute_multiplier <= 0.0:
+        raise ValueError("compute_multiplier must be positive")
+    if (compute_multiplier == 1.0 and request_count is None) or not tasks:
         return None
     grouped = {}
     for task in tasks:
@@ -147,6 +161,68 @@ def _intensify_one_area_burst(tasks, compute_multiplier,
     return selected[0].burst_id, len(selected)
 
 
+def _intensify_repeated_area_bursts(
+    tasks, compute_multiplier, request_count, window_s,
+    orbit_period_s, bursts_per_orbit,
+):
+    """Expand high-pressure bursts independently in each orbital interval."""
+    if bursts_per_orbit <= 0 or not tasks:
+        return []
+    selected = []
+    orbit_count = max(
+        1, int(math.ceil(max(task.release_time for task in tasks)
+                         / orbit_period_s)),
+    )
+    for orbit_index in range(orbit_count):
+        start = orbit_index * orbit_period_s
+        end = start + orbit_period_s
+        period_tasks = [
+            task for task in tasks if start <= task.release_time < end
+        ]
+        for _ in range(bursts_per_orbit):
+            available = [
+                task for task in period_tasks
+                if task.burst_id not in {item[0] for item in selected}
+            ]
+            if not available:
+                break
+            before_objects = {id(task) for task in available}
+            result = _intensify_one_area_burst(
+                available, compute_multiplier,
+                request_count=request_count, window_s=window_s,
+            )
+            if result is None:
+                break
+            # The helper expands its supplied list. Move clones into the full
+            # task list and assign globally unique identifiers.
+            for clone in available:
+                if id(clone) in before_objects:
+                    continue
+                clone.task_id = max(task.task_id for task in tasks) + 1
+                for tile in clone.tiles:
+                    tile.task_id = clone.task_id
+                tasks.append(clone)
+                period_tasks.append(clone)
+            selected.append(result)
+    return selected
+
+
+def _four_neighbor_walker_pairs(n_planes, sats_per_plane):
+    """Fore/aft plus adjacent-plane optical neighbors for a Walker mesh."""
+    pairs = set()
+    for plane in range(n_planes):
+        for slot in range(sats_per_plane):
+            here = f"SAT_{plane:02d}_{slot:02d}"
+            neighbors = {
+                f"SAT_{plane:02d}_{(slot - 1) % sats_per_plane:02d}",
+                f"SAT_{plane:02d}_{(slot + 1) % sats_per_plane:02d}",
+                f"SAT_{(plane - 1) % n_planes:02d}_{slot:02d}",
+                f"SAT_{(plane + 1) % n_planes:02d}_{slot:02d}",
+            }
+            pairs.update(frozenset((here, neighbor)) for neighbor in neighbors)
+    return pairs
+
+
 def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                deadline_lognorm_sigma=0.6,
                arrival_rate=16.0, ground_stations=None,
@@ -158,6 +234,12 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
                intense_area_window_s=None,
                use_fov=True, fov_range_km=600.0, n_targets=100,
                min_elevation_deg=25.0, satellite_params_factory=None,
+               reliability_model_factory=None,
+               orbit_altitude_km=550.0, orbit_inclination_deg=53.0,
+               isl_topology="range",
+               acquisition_mode="targets", input_band_counts=None,
+               intense_bursts_per_orbit=0,
+               background_compute_utilization=0.0,
                n_replicas_max=2):
     """Build all shared simulation objects.
 
@@ -181,17 +263,35 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     fov_range_km          : camera footprint radius (600 km ≈ ±42° off-nadir at 550 km
                             altitude; realistic for a wide-field EO imager).
     n_targets             : number of random ground targets (uniformly in ±60° lat).
+    reliability_model_factory:
+                            optional zero-argument factory for the link/node
+                            reliability model used by policies and realized
+                            delivery trials.
     n_replicas_max        : hard per-tile cap on total replicas.
+
+    ``acquisition_mode='groundtrack'`` defines a feasible near-nadir ROI at a
+    sampled satellite subpoint. ``isl_topology='four_neighbor'`` limits the
+    range/line-of-sight contact plan to fore/aft and adjacent-plane pairs.
+    ``background_compute_utilization`` is recurring physical queued work.
     """
     import random as _rng_mod
     if ground_stations is None:
         ground_stations = _EVALUATION_GS
-    sats = build_synthetic_walker(n_planes=n_planes, sats_per_plane=sats_per_plane)
+    sats = build_synthetic_walker(
+        n_planes=n_planes, sats_per_plane=sats_per_plane,
+        alt_km=orbit_altitude_km, inc_deg=orbit_inclination_deg,
+    )
     sat_ids = [s.name for s in sats]
     gs_names = {gs[0] for gs in ground_stations}
 
     print(f"  Computing contact windows for {len(sats)} sats × {len(ground_stations)} GS ...")
     t0 = time.time()
+    isl_pairs = (
+        _four_neighbor_walker_pairs(n_planes, sats_per_plane)
+        if isl_topology == "four_neighbor" else None
+    )
+    if isl_topology not in {"range", "four_neighbor"}:
+        raise ValueError("isl_topology must be 'range' or 'four_neighbor'")
     contacts = compute_contact_windows(
         sats,
         t_start_unix=0.0,
@@ -199,6 +299,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         dt_seconds=60.0,
         ground_stations=ground_stations,
         min_elevation_deg=min_elevation_deg,
+        isl_pairs=isl_pairs,
     )
     print(f"  {len(contacts)} contact events in {time.time()-t0:.1f}s")
 
@@ -206,7 +307,11 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     states = make_constellation_states(
         sat_ids, seed=seed, params_factory=satellite_params_factory
     )
-    reliability = ReliabilityModel()
+    reliability = (
+        reliability_model_factory()
+        if reliability_model_factory is not None
+        else ReliabilityModel()
+    )
 
     sat_groundtrack = None
     ground_targets = None
@@ -237,25 +342,66 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
         sat_groundtrack=sat_groundtrack,
         ground_targets=ground_targets,
         fov_range_km=fov_range_km,
+        acquisition_mode=acquisition_mode,
+        input_band_counts=input_band_counts,
         n_replicas_max=n_replicas_max,
     )
-    intense = _intensify_one_area_burst(
-        tasks, intense_area_compute_multiplier,
-        request_count=intense_area_request_count,
-        window_s=intense_area_window_s,
-    )
-    if intense is not None:
-        burst_id, request_count = intense
-        print(
-            f"  Intensified area burst {burst_id}: {request_count} requests "
-            f"at {intense_area_compute_multiplier:.1f}× compute"
+    if intense_bursts_per_orbit:
+        intense = _intensify_repeated_area_bursts(
+            tasks, intense_area_compute_multiplier,
+            intense_area_request_count, intense_area_window_s,
+            orbit_period_s, intense_bursts_per_orbit,
         )
-    cfg = ORDIConfig(epoch_length=EPOCH_LENGTH_S)
+    else:
+        one = _intensify_one_area_burst(
+            tasks, intense_area_compute_multiplier,
+            request_count=intense_area_request_count,
+            window_s=intense_area_window_s,
+        )
+        intense = [one] if one is not None else []
+    if intense:
+        print(
+            f"  Intensified {len(intense)} area bursts: "
+            f"{intense_area_request_count} requests each at "
+            f"{intense_area_compute_multiplier:.1f}× compute"
+        )
+    cfg = ORDIConfig(
+        epoch_length=EPOCH_LENGTH_S,
+        background_compute_utilization=background_compute_utilization,
+    )
 
     return sats, sat_ids, gs_names, contacts, graphs, states, reliability, tasks, cfg
 
 
 # ── stateful rolling-horizon helpers ──────────────────────────────────────────
+
+def _assignment_group_viability(a: Assignment, states):
+    """Return reconstruction-group viability before delivery completes."""
+    if not a.helpers:
+        source = states.get(a.source)
+        alive = source is not None and bool(source.A_i)
+        return {0: alive}
+    viable = []
+    for helper, aggregator in zip(a.helpers, a.aggregators):
+        h = states.get(helper)
+        g = states.get(aggregator)
+        viable.append(bool(
+            h is not None and g is not None and h.A_i and g.A_i
+        ))
+    required = max(1, int(a.metadata.get("data_shards", 1)))
+    shard_groups = a.metadata.get("shard_groups")
+    if shard_groups is None:
+        return {0: sum(viable) >= required}
+    if len(shard_groups) != len(viable):
+        return {}
+    grouped = {}
+    for label, alive in zip(shard_groups, viable):
+        grouped.setdefault(label, []).append(alive)
+    return {
+        label: len(group) >= required and sum(group) >= required
+        for label, group in grouped.items()
+    }
+
 
 def _assignment_viable(a: Assignment, states, sim_time=None) -> bool:
     """In-flight tile survives if any replica's helper+aggregator are both alive
@@ -273,27 +419,7 @@ def _assignment_viable(a: Assignment, states, sim_time=None) -> bool:
             return True
         source = states.get(a.source)
         return source is not None and bool(source.A_i)
-    viable = []
-    for helper, aggregator in zip(a.helpers, a.aggregators):
-        h = states.get(helper)
-        g = states.get(aggregator)
-        if h is not None and g is not None and h.A_i and g.A_i:
-            viable.append(True)
-        else:
-            viable.append(False)
-    required = int(a.metadata.get("data_shards", 1))
-    shard_groups = a.metadata.get("shard_groups")
-    if shard_groups is None:
-        return sum(viable) >= required
-    if len(shard_groups) != len(viable):
-        return False
-    grouped = {}
-    for label, alive in zip(shard_groups, viable):
-        grouped.setdefault(label, []).append(alive)
-    return any(
-        len(group) >= required and sum(group) >= required
-        for group in grouped.values()
-    )
+    return any(_assignment_group_viability(a, states).values())
 
 
 def _uncommitted_tasks(pending, committed):
@@ -439,7 +565,7 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
 
 def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                        reliability=None, realized_trials=500, realized_seed=0,
-                       state_driver=None):
+                       state_driver=None, outcome_callback=None):
     """Run one stateful rolling-horizon simulation and return a lifetime
     EpochMetrics.  schedule_fn(epoch, todo_tasks) -> Decision dispatches to an
     algorithm policy. A committed tile stays in-flight (not
@@ -466,6 +592,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         )
     all_tiles = [(t.task_id, tile.tile_id) for t in tasks for tile in t.tiles]
     committed: Dict[Tuple[int, int], Assignment] = {}
+    feedback_reported = set()
+    backup_recovery = set()
+    fault_impacted = set()
+    rejection_causes = {}
     protocol_message_count = 0.0
     protocol_control_bits = 0.0
 
@@ -479,17 +609,50 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
             state_driver(epoch, ep_start, states)
         if injector:
             injector.refresh_active_state()
+        background_fraction = cfg.background_compute_utilization
+        if not 0.0 <= background_fraction < 1.0:
+            raise ValueError(
+                "background_compute_utilization must be in [0, 1)"
+            )
+        for state in states.values():
+            state.Q_i += (
+                background_fraction * state.C_i * cfg.epoch_length
+            )
         for sat_id in sat_ids:
             state = states[sat_id]
             if state.A_i:
                 sat_cap[sat_id] += state.C_i * cfg.epoch_length
-        # Drop committed tiles whose every replica lost a node → re-planned.
+        # Report actual scheduled-work outcomes. Idle healthy domains are not
+        # samples: only primary delivery, backup recovery, or hard failure
+        # updates a learning policy.
         for key in list(committed.keys()):
-            if not _assignment_viable(committed[key], states, ep_start):
+            assignment = committed[key]
+            delivery_time = float(assignment.metadata.get(
+                "delivery_time", math.inf
+            ))
+            if delivery_time <= ep_start + 1e-9:
+                if outcome_callback and key not in feedback_reported:
+                    outcome_callback(
+                        "backup_recovery" if key in backup_recovery
+                        else "primary_success"
+                    )
+                    feedback_reported.add(key)
+                continue
+            groups = _assignment_group_viability(assignment, states)
+            primary_alive = groups.get(0, next(iter(groups.values()), False))
+            any_alive = any(groups.values())
+            if not primary_alive and any_alive:
+                backup_recovery.add(key)
+            if not any_alive:
+                if outcome_callback:
+                    outcome_callback("fault_failure")
+                feedback_reported.add(key)
+                fault_impacted.add(key)
                 del committed[key]
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
         result = schedule_fn(epoch, todo)
+        rejection_causes.update(result.metadata.get("rejection_causes", {}))
         protocol_message_count += float(
             result.metadata.get("protocol_message_count", 0.0)
         )
@@ -518,6 +681,10 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                      for task in tasks for tile in task.tiles}
     final = [committed.get(k) or Assignment(k[0], k[1], source_by_key[k])
              for k in all_tiles]
+    if outcome_callback:
+        for key in all_tiles:
+            if key not in committed and key not in feedback_reported:
+                outcome_callback("nonfault_failure")
     res = Decision(
         N_EPOCHS - 1, tuple(final),
         metadata={
@@ -529,6 +696,25 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         res, tasks, 0.0, sat_cap, cfg.alpha,
         physical_energy_j=physical_energy_j,
     )
+    missing = {key for key, assignment in zip(all_tiles, final)
+               if not assignment.helpers and not assignment.downlink_only}
+    total_tiles = max(len(all_tiles), 1)
+    hard_fault_misses = missing.intersection(fault_impacted)
+    compute_misses = {
+        key for key in missing - hard_fault_misses
+        if rejection_causes.get(key) == "compute_queue"
+    }
+    policy_misses = {
+        key for key in missing - hard_fault_misses - compute_misses
+        if rejection_causes.get(key) == "policy"
+    }
+    contact_misses = (
+        missing - hard_fault_misses - compute_misses - policy_misses
+    )
+    m.hard_fault_miss_ratio = len(hard_fault_misses) / total_tiles
+    m.compute_queue_miss_ratio = len(compute_misses) / total_tiles
+    m.policy_miss_ratio = len(policy_misses) / total_tiles
+    m.contact_miss_ratio = len(contact_misses) / total_tiles
     r_total = sum(max(0, float(a.metadata.get(
         "effective_replicas", len(a.helpers))) - 1) for a in final)
     m.objective = (m.delivered_utility
@@ -542,6 +728,9 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         m.realized_miss_ratio = rm.realized_miss_ratio
         m.realized_utility = rm.realized_utility
         m.realized_coverage = rm.realized_coverage
+        m.soft_failure_miss_ratio = max(
+            0.0, m.realized_miss_ratio - m.deadline_miss_ratio
+        )
     return m
 
 
@@ -625,6 +814,70 @@ def _validate_feasible_subset(feasibility, request, decision):
     )
 
 
+def _classify_rejected_tiles(request, decision):
+    """Shared lightweight contact/queue/admission diagnosis.
+
+    This is a lower-bound counterfactual used only for reporting: contact asks
+    whether any source-to-ground result path exists; queue compares optimistic
+    completion with current queues against the same zero-queue bound.
+    """
+    assigned = {
+        (assignment.task_id, assignment.tile_id)
+        for assignment in decision.assignments
+    }
+    causes = {}
+    for task in request.tasks:
+        # Earlier rejections may be retried and are not misses. Diagnose only
+        # the final scheduling opportunity before this task expires.
+        if task.deadline > request.sim_time + request.epoch_length + 1e-9:
+            continue
+        for tile in task.tiles:
+            key = (task.task_id, tile.tile_id)
+            if key in assigned:
+                continue
+            source = request.satellites.get(task.source_sat)
+            if source is None or not source.available:
+                causes[key] = "fault"
+                continue
+            route = earliest_route(
+                request, task.source_sat, request.ground_stations,
+                tile.d_out_bits,
+            )
+            if route is None or route.arrival > task.deadline:
+                causes[key] = "contact"
+                continue
+            available = [
+                state for state in request.satellites.values()
+                if state.available
+            ]
+            zero_compute = min(
+                (tile.compute_ops / max(state.compute_rate, 1.0)
+                 for state in available),
+                default=math.inf,
+            )
+            queued_compute = min(
+                ((state.queued_flops + tile.compute_ops)
+                 / max(state.compute_rate, 1.0)
+                 for state in available),
+                default=math.inf,
+            )
+            zero_finish = max(
+                route.arrival, request.sim_time + zero_compute
+            )
+            queued_finish = max(
+                route.arrival, request.sim_time + queued_compute
+            )
+            causes[key] = (
+                "compute_queue"
+                if (zero_finish <= task.deadline + 1e-9
+                    and queued_finish > task.deadline + 1e-9)
+                else "policy"
+            )
+    metadata = dict(decision.metadata)
+    metadata["rejection_causes"] = causes
+    return replace(decision, metadata=metadata)
+
+
 def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
     """
     Worker for ProcessPoolExecutor.
@@ -663,6 +916,7 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
             split_options=cfg.ordi_split_options,
             coded_options=cfg.ordi_coded_options,
             halo_fraction=cfg.split_halo_fraction,
+            rng_seed=seed,
         )
     elif scheduler_class is SECOAdapted:
         sched = scheduler_class(
@@ -683,17 +937,21 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         )
         decision = sched.schedule(request)
         try:
-            return _validate_feasible_subset(
+            validated = _validate_feasible_subset(
                 feasibility, request, decision
             )
+            return _classify_rejected_tiles(request, validated)
         except InvalidDecisionError as error:
             raise InvalidDecisionError(
                 f"{sched.name} submitted an invalid decision in epoch {ep}: "
                 f"{error}"
             ) from error
 
-    m = _simulate_stateful(schedule_fn, tasks, sat_ids, local_states, cfg, injector,
-                           reliability=local_rel, realized_seed=seed)
+    m = _simulate_stateful(
+        schedule_fn, tasks, sat_ids, local_states, cfg, injector,
+        reliability=local_rel, realized_seed=seed,
+        outcome_callback=getattr(sched, "observe_assignment_outcome", None),
+    )
     return result_key, [m]
 
 
@@ -850,27 +1108,62 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
 
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
-# The compute-stressed reference scenario uses a contact-relaxed ground segment,
-# sustained (rather than marketing-peak) accelerator throughput, and one dense
-# same-area hotspot.  Data sizes and deadlines remain unchanged.
+# The composed reference scenario uses PlanetScope-class acquisitions on a
+# degree-limited optical edge-compute mesh. Rates are sustained workload
+# throughput assumptions, not accelerator nameplate specifications.
 def _e1_satellite_params(sat_id):
-    return SatelliteParams(sat_id=sat_id, compute_rate_gflops=5.0)
+    digest = hashlib.sha256(sat_id.encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    rate = min(8.0, max(3.0, rng.lognormvariate(math.log(5.0), 0.25)))
+    return SatelliteParams(sat_id=sat_id, compute_rate_gflops=rate)
 
 
-_E1_BUILD_KWARGS = dict(n_planes=6, sats_per_plane=4,
+def _e1_reliability_model():
+    """Clear-sky reliability assumptions for compute-placement E1.
+
+    Fault robustness remains covered by the matched 2% random schedule and
+    by E2/E3.  E1 uses high-availability links and nodes so stochastic delivery
+    loss does not dominate the compute-placement comparison.
+    """
+    return ReliabilityModel(
+        default_isl_pi=0.995,
+        default_downlink_pi=0.98,
+        default_node_pi=0.999,
+    )
+
+
+_E1_BUILD_KWARGS = dict(n_planes=3, sats_per_plane=12,
+                        orbit_altitude_km=475.0,
+                        orbit_inclination_deg=97.4,
+                        orbit_period_s=5670.0,
                         arrival_rate=20.0, deadline_slack=600.0,
                         deadline_lognorm_sigma=0.6,
                         burst_probability=0.6,
                         burst_size_range=(3, 6), burst_window_s=60.0,
-                        intense_area_request_count=8,
-                        intense_area_compute_multiplier=16.0,
+                        intense_area_request_count=10,
+                        intense_area_compute_multiplier=1.0,
                         intense_area_window_s=30.0,
+                        intense_bursts_per_orbit=1,
                         ground_stations=DEFAULT_GROUND_STATIONS,
                         min_elevation_deg=10.0,
-                        satellite_params_factory=_e1_satellite_params)
+                        isl_topology="four_neighbor",
+                        acquisition_mode="groundtrack",
+                        fov_range_km=16.25,
+                        input_band_counts={
+                            "ship": 3, "wildfire": 4,
+                            "change": 8, "cloud_filter": 8,
+                        },
+                        background_compute_utilization=0.15,
+                        satellite_params_factory=_e1_satellite_params,
+                        reliability_model_factory=_e1_reliability_model)
 
 E1_METRIC_KEYS = [
     "realized_miss_ratio",
+    "contact_miss_ratio",
+    "compute_queue_miss_ratio",
+    "policy_miss_ratio",
+    "hard_fault_miss_ratio",
+    "soft_failure_miss_ratio",
     "delivery_latency_p50_s",
     "delivery_latency_p95_s",
     "isl_traffic_bits_per_delivered_tile",
@@ -889,23 +1182,25 @@ E1_METRIC_KEYS = [
 ]
 
 def run_E1(seed=0, n_seeds=8,
-           fault_rate=0.25) -> Dict[str, List[EpochMetrics]]:
+           fault_rate=0.02) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
-    Uses a 6×4 Walker (24 sats, fewer sats than default 36 to stress routing)
+    Uses a scaled 3×12, 475 km near-polar Walker testbed. Twelve satellites
+    per plane keep fore/aft neighbors within the 4,000 km optical range; using
+    four satellites per plane would make those nominal links invisible.
     with a mean of 20 requests per orbit. Sixty percent of parent events create
     3–6 same-source requests within 60 s, producing realistic hot-source queues
     while preserving the requested mean rate.
 
-    One same-area burst is expanded to eight requests within 30 s and amplified
-    to 16× inference work without changing its input/output volume or deadline
-    model. This creates a localized compute hotspot while leaving the rest of
-    the workload unchanged. Satellites use 5 GFLOP/s sustained throughput.
+    One same-area burst per orbit is expanded to ten requests within 30 s.
+    Normal model FLOPs are retained; 15% recurring background work and
+    heterogeneous 3–8 GFLOP/s sustained accelerators create queue pressure.
 
-    All experiments use ten globally distributed ground stations and a 10°
-    minimum elevation angle, relaxing contact availability without changing
-    ISL or downlink rates.
+    E1 uses ten globally distributed ground stations and a 10° minimum
+    elevation angle. Optical terminals form a fore/aft and adjacent-plane
+    four-neighbor mesh. E1 assumes clear-sky 99.5% ISL, 98%
+    downlink, and 99.9% node reliability for realized delivery trials.
 
     B1 (DirectDownlink) is an end-to-end ground-processing baseline: it waits
     for the source satellite to enter a GS contact, downlinks the raw tile, and
@@ -913,17 +1208,20 @@ def run_E1(seed=0, n_seeds=8,
     controls may instead compute in orbit and route compact products through an
     ISL-connected satellite.
 
-    Deadline distribution: log-normal σ=0.6, with medians wildfire→600 s,
+    Each acquisition is a feasible near-nadir 4096² PlanetScope-class ROI at
+    3.7 m native GSD. Ship uses RGB, wildfire RGB+NIR, and cloud/change use
+    eight total input bands. Deadline distribution: log-normal σ=0.6, with medians wildfire→600 s,
     ship→900 s, change→1800 s, and cloud_filter→5760 s (one orbit).
 
     Each seed rebuilds the full environment (orbital phasing, ground targets,
     task arrivals, deadline draws) and draws a deterministic random fault
-    schedule shared by every policy in that seed. The default 0.25 per-epoch
-    fault probability matches E2's moderate fault-intensity setting. The CSV
-    reports across-seed mean and std.
+    schedule shared by every policy in that seed. The default 0.02 per-epoch
+    fault probability retains fault exposure without allowing robustness to
+    dominate the compute-placement comparison. E2 and E3 retain the stronger
+    fault-stress settings. The CSV reports across-seed mean and std.
     """
-    print(f"E1: Core performance (6×4 Walker, 10 global GS, 5 GFLOP/s, "
-          f"10° GS elevation, 8-request 16× hotspot, "
+    print(f"E1: Core performance (3×12 Walker at 475 km, 10 global GS, "
+          f"3–8 GFLOP/s, 10° GS elevation, 10-request/orbit hotspots, "
           f"fault rate {fault_rate:.2f}, {n_seeds} seeds)")
     build_kwargs = dict(_E1_BUILD_KWARGS)
     alg_classes = [("ORDI", ORDI)] + [(c.name, c) for c in CORE_BASELINES]
