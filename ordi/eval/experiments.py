@@ -12,16 +12,18 @@ represented by ESA TASCNET.
 
 Shared realistic LEO-EO simulation setup (all experiments):
   - Synthetic 3 × 12 Walker constellation at 475 km and 97.4° inclination.
-    E4 alone varies satellites per plane to measure constellation scalability.
+    E4 alone varies request load to measure scheduler and throughput scalability.
   - 10 globally distributed ground stations at a 10° minimum elevation.
   - Acquisition events construct feasible near-nadir PlanetScope-class
     regions along sampled ground tracks.
   - Orbital period: 5670 s.
-  - Simulation horizon: 17 280 s (3 orbits); 288 × 60 s epochs.
-  - Tasks: mean 20 requests/orbit in a clustered hot-source process. Sixty
-    percent of parent events generate 3–6 same-source requests within 60 s.
+  - Task-arrival horizon: 28 350 s (5 orbits); execution drains afterward.
+  - Tasks: nominal base rate 20 requests/orbit in a clustered hot-source
+    process. Sixty percent of parent events generate 3–6 same-source requests
+    within 60 s.
   - One same-area burst per orbit expands to ten requests within 30 s and
-    adds 15% recurring background accelerator demand.
+    adds 15% recurring background accelerator demand. Actual offered request
+    counts are recorded after this expansion.
   - Each request is a 4096×4096 PlanetScope-class inference ROI split into
     sixteen 1024×1024 tiles, with workload-specific spectral band counts.
   - Deadlines are log-normal (σ=0.6), with medians wildfire 600 s, ship
@@ -67,7 +69,10 @@ from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.algorithms._common import earliest_route
 
 RESULTS_DIR = "results"
-SIM_DURATION_S = 17_280       # task-arrival window; execution drains afterward
+SIM_ORBITS = 5
+REFERENCE_ORBIT_PERIOD_S = 5_670.0
+# Task arrivals stop here; execution continues until admitted deadlines drain.
+SIM_DURATION_S = SIM_ORBITS * REFERENCE_ORBIT_PERIOD_S
 EPOCH_LENGTH_S = 60.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
@@ -380,6 +385,7 @@ def _build_sim(n_planes=6, sats_per_plane=6, seed=0, deadline_slack=600.0,
     cfg = ORDIConfig(
         epoch_length=EPOCH_LENGTH_S,
         simulation_epochs=simulation_epochs,
+        arrival_orbits=SIM_ORBITS,
         background_compute_utilization=background_compute_utilization,
         n_planes=n_planes,
         sats_per_plane=sats_per_plane,
@@ -874,6 +880,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         "protocol_messages": 0.0,
         "compute_by_helper": {},
     }
+    scheduling_times = []
 
     simulation_epochs = cfg.simulation_epochs or N_EPOCHS
     for epoch in range(simulation_epochs):
@@ -947,7 +954,9 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
                 del committed[key]
         pending = [t for t in tasks if t.release_time <= ep_start < t.deadline]
         todo = _uncommitted_tasks(pending, committed)
+        schedule_started = time.perf_counter()
         result = schedule_fn(epoch, todo)
+        scheduling_times.append(time.perf_counter() - schedule_started)
         rejection_causes.update(result.metadata.get("rejection_causes", {}))
         protocol_message_count += float(
             result.metadata.get("protocol_message_count", 0.0)
@@ -1005,22 +1014,41 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         res, tasks, 0.0, sat_cap, cfg.alpha,
         physical_energy_j=physical_energy_j,
     )
+    arrival_orbits = max(int(cfg.arrival_orbits), 1)
+    m.offered_requests_per_orbit = len(tasks) / arrival_orbits
+    m.offered_tiles_per_orbit = len(all_tiles) / arrival_orbits
+    m.delivered_tiles_per_orbit = m.n_tiles_feasible / arrival_orbits
+    m.scheduling_time_total_s = sum(scheduling_times)
+    if scheduling_times:
+        ordered_times = sorted(scheduling_times)
+        p95_index = min(
+            len(ordered_times) - 1,
+            max(0, math.ceil(0.95 * len(ordered_times)) - 1),
+        )
+        m.scheduling_time_p95_s = ordered_times[p95_index]
     missing = {key for key, assignment in zip(all_tiles, final)
                if not assignment.helpers and not assignment.downlink_only}
     total_tiles = max(len(all_tiles), 1)
     hard_fault_misses = missing.intersection(fault_impacted)
-    compute_misses = {
+    source_fault_misses = {
         key for key in missing - hard_fault_misses
+        if rejection_causes.get(key) == "source_fault"
+    }
+    compute_misses = {
+        key for key in missing - hard_fault_misses - source_fault_misses
         if rejection_causes.get(key) == "compute_queue"
     }
     policy_misses = {
-        key for key in missing - hard_fault_misses - compute_misses
+        key for key in missing - hard_fault_misses - source_fault_misses
+        - compute_misses
         if rejection_causes.get(key) == "policy"
     }
     contact_misses = (
-        missing - hard_fault_misses - compute_misses - policy_misses
+        missing - hard_fault_misses - source_fault_misses
+        - compute_misses - policy_misses
     )
     m.hard_fault_miss_ratio = len(hard_fault_misses) / total_tiles
+    m.source_fault_miss_ratio = len(source_fault_misses) / total_tiles
     m.compute_queue_miss_ratio = len(compute_misses) / total_tiles
     m.policy_miss_ratio = len(policy_misses) / total_tiles
     m.contact_miss_ratio = len(contact_misses) / total_tiles
@@ -1037,6 +1065,9 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         m.realized_miss_ratio = rm.realized_miss_ratio
         m.realized_utility = rm.realized_utility
         m.realized_coverage = rm.realized_coverage
+        m.realized_delivered_tiles_per_orbit = (
+            len(all_tiles) * (1.0 - m.realized_miss_ratio) / arrival_orbits
+        )
         m.soft_failure_miss_ratio = max(
             0.0, m.realized_miss_ratio - m.deadline_miss_ratio
         )
@@ -1069,7 +1100,7 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     contacts = []
     # A policy cannot use a contact after every pending task has expired. The
     # old all-horizon projection made each route lookup scan the remaining
-    # three-orbit graph, even for tasks due within a few minutes.
+    # remaining multi-orbit graph, even for tasks due within a few minutes.
     # Always expose the current epoch's contacts so decentralized policies can
     # exchange state advertisements even when no science task is pending.
     latest_deadline = max(
@@ -1151,7 +1182,7 @@ def _classify_rejected_tiles(request, decision):
                 continue
             source = request.satellites.get(task.source_sat)
             if source is None or not source.available:
-                causes[key] = "fault"
+                causes[key] = "source_fault"
                 continue
             route = earliest_route(
                 request, task.source_sat, request.ground_stations,
@@ -1282,6 +1313,12 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
         reliability=local_rel, realized_seed=seed,
         outcome_callback=getattr(sched, "observe_assignment_outcome", None),
         cancellation_callback=cancel_assignment,
+    )
+    m.fault_event_count = float(len(faults or ()))
+    m.fault_target_minutes = sum(
+        fault.duration_epochs * cfg.epoch_length / 60.0
+        * max(len(fault.targets), 1)
+        for fault in (faults or ())
     )
     return result_key, [m]
 
@@ -1427,11 +1464,12 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
     os.makedirs(RESULTS_DIR, exist_ok=True)
     path = os.path.join(RESULTS_DIR, f"{exp_id}.csv")
     keys = _CSV_METRIC_KEYS if metric_keys is None else metric_keys
-    fields = ["algorithm"] + keys + [f"{key}_std" for key in keys]
+    fields = (["algorithm", "sample_count"] + keys
+              + [f"{key}_std" for key in keys])
     rows = []
     for alg_name, metrics in results.items():
         agg = aggregate_metrics(metrics)
-        row = {"algorithm": alg_name, **agg}
+        row = {"algorithm": alg_name, "sample_count": len(metrics), **agg}
         rows.append(row)
     if not rows:
         return
@@ -1502,6 +1540,7 @@ E1_METRIC_KEYS = [
     "compute_queue_miss_ratio",
     "policy_miss_ratio",
     "hard_fault_miss_ratio",
+    "source_fault_miss_ratio",
     "soft_failure_miss_ratio",
     "delivery_latency_p50_s",
     "delivery_latency_p95_s",
@@ -1527,10 +1566,10 @@ def run_E1(seed=0, n_seeds=8,
 
     Uses a scaled 3×12, 475 km near-polar Walker testbed. Twelve satellites
     per plane keep fore/aft neighbors within the 4,000 km optical range; using
-    four satellites per plane would make those nominal links invisible.
-    with a mean of 20 requests per orbit. Sixty percent of parent events create
-    3–6 same-source requests within 60 s, producing realistic hot-source queues
-    while preserving the requested mean rate.
+    four satellites per plane would make those nominal links invisible. The
+    workload has a nominal base rate of 20 requests per orbit. Sixty percent
+    of parent events create 3–6 same-source requests within 60 s, producing
+    realistic hot-source queues within the base generator.
 
     One same-area burst per orbit is expanded to ten requests within 30 s.
     Normal model FLOPs are retained; 15% recurring background work and
@@ -1590,7 +1629,10 @@ def run_E1(seed=0, n_seeds=8,
 
 # ── E2: Fault intensity sweep ────────────────────────────────────────────────
 
-def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
+_E2_FAULT_RATES = (0.0, _E1_FAULT_RATE, 0.10, 0.25, 0.50)
+
+
+def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     """
     Fault intensity sweep averaging over BOTH randomness sources: each seed
     rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
@@ -1598,7 +1640,7 @@ def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     than fault-draw jitter on one fixed world.
     """
     print(f"E2: Fault intensity sweep ({n_seeds} seeds)")
-    fault_rates = [0.0, 0.25, 0.50]
+    fault_rates = _E2_FAULT_RATES
     alg_classes = [("ORDI", ORDI),
                    ("seco_adapted", SECOAdapted),
                    ("full_replication", FullReplication)]
@@ -1626,64 +1668,73 @@ def run_E2(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
             ]
 
     _save_csv("E2_fault_intensity", results,
-              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
+              metric_keys=[
+                  "realized_miss_ratio", "hard_fault_miss_ratio",
+                  "source_fault_miss_ratio", "soft_failure_miss_ratio",
+                  "fault_event_count", "fault_target_minutes",
+                  "isl_traffic_bits_per_delivered_tile",
+                  "energy_j_per_delivered_tile", "n_replicas_avg",
+              ])
     return results
 
 
-# ── E4: Scalability (constellation size 12–36 sats) ─────────────────────────
+# ── E4: Scalability (request load on fixed 3×12 constellation) ─────────
 
-_E4_CONFIGS = {
-    12: (3, 4),   # 3 planes × 4 sats: enough inter-plane contact density
-    24: (3, 8),   # 3 planes × 8 sats
-    36: (3, 12),  # 3 planes × 12 sats: exact E1 control setup
-}
+_E4_REQUEST_RATES = (20, 40, 60, 80)
 
 
-def run_E4(seed=0, n_seeds=1) -> Dict[str, List[EpochMetrics]]:
-    print(f"E4: Scalability sweep ({n_seeds} seeds)")
+def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+    print(f"E4: Request-load scalability sweep ({n_seeds} seeds)")
 
-    # Sim is rebuilt per (constellation size, seed); each config worker chains
-    # the 2 algorithms behind one build. Chaining halves repeated orbit builds.
+    # Keep E1's 3×12 constellation fixed and rebuild per (request rate, seed).
+    # The two algorithms share each build, including its tasks and fault draw.
     alg_classes = [("ORDI", ORDI),
                    ("seco_adapted", SECOAdapted)]
-    sizes = list(_E4_CONFIGS)
     config_args = []
-    for n_sats in sizes:
-        planes, per_plane = _E4_CONFIGS[n_sats]
+    for request_rate in _E4_REQUEST_RATES:
         for s in range(n_seeds):
             fault_specs = [("random_schedule", _E1_FAULT_RATE, seed + s)]
-            jobs = [(f"{alg_name}@n={n_sats}#s{s}", alg_name, cls,
+            jobs = [(f"{alg_name}@requests={request_rate}#s{s}", alg_name, cls,
                      fault_specs)
                     for alg_name, cls in alg_classes]
             build_kwargs = dict(_E1_BUILD_KWARGS)
-            build_kwargs.update(n_planes=planes, sats_per_plane=per_plane)
+            build_kwargs.update(arrival_rate=float(request_rate))
             config_args.append(
                 (build_kwargs, jobs, seed + s))
 
-    raw = _run_configs_parallel(config_args, desc="E4 size×seed")
+    raw = _run_configs_parallel(config_args, desc="E4 load×seed")
 
     results: Dict[str, List[EpochMetrics]] = {}
-    for n_sats in sizes:
+    for request_rate in _E4_REQUEST_RATES:
         for alg_name, _cls in alg_classes:
-            results[f"{alg_name}@n={n_sats}"] = [
+            results[f"{alg_name}@requests={request_rate}"] = [
                 m for s in range(n_seeds)
-                for m in raw[f"{alg_name}@n={n_sats}#s{s}"]
+                for m in raw[f"{alg_name}@requests={request_rate}#s{s}"]
             ]
 
     _save_csv("E4_scalability", results,
-              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
+              metric_keys=[
+                  "offered_requests_per_orbit",
+                  "offered_tiles_per_orbit",
+                  "realized_delivered_tiles_per_orbit",
+                  "realized_miss_ratio", "scheduling_time_p95_s",
+                  "scheduling_time_total_s", "helper_utilization",
+                  "compute_load_balance",
+                  "isl_traffic_bits_per_delivered_tile",
+                  "energy_j_per_delivered_tile",
+              ])
     return results
 
 
 # ── E3: Correlated failures (orbital-plane outage) ────────────────────────────
 
-def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
+def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     """
     Correlated orbital-plane outages probing replica-placement quality.
 
-    Sustained outage (epochs 10-50, matching E2's severity) hits one plane or
-    two adjacent planes. Matched environment seeds vary orbital phasing, task
-    sources, and deadlines while keeping the compact evaluation tractable.
+    Sustained 40-epoch outages hit zero, one, or two adjacent planes. Outages
+    sample five orbital phases, while matched environment seeds vary orbital
+    phasing, plane labels, task sources, and deadlines.
 
     Algorithms: ORDI, full replication, and random replication.
     Differences isolate how much backup placement and count buy under
@@ -1694,21 +1745,39 @@ def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
                    ("full_replication", FullReplication),
                    ("random_replication", RandomReplication)]
 
-    # One fixed representative placement per scale; matched seeds provide the
-    # uncertainty samples without multiplying every seed by nine plane sweeps.
+    # Cover every plane position and five orbital phases. Pairing positions
+    # with phases keeps the matrix tractable; plane labels rotate by seed so
+    # plane and contact-phase effects are not confounded in aggregate.
+    # One 40-minute outage per arrival orbit, shifted through the orbit phase.
+    # Epochs correspond approximately to +10, +25, +40, +55, and +70 minutes
+    # within successive 94.5-minute orbits.
+    outage_starts = (10, 120, 229, 339, 448)
     scenarios = {
-        "1plane":  [(0,)],
-        "2planes": [(0, 1)],
+        "0plane": [()],
+        "1plane": [(case % 3,) for case in range(len(outage_starts))],
+        "2planes": [
+            (case % 3, (case + 1) % 3)
+            for case in range(len(outage_starts))
+        ],
     }
 
     config_args = []
     for s in range(n_seeds):
         jobs = []
         for label, plane_sets in scenarios.items():
-            for planes in plane_sets:
-                spec = [("plane_outage", 10, 40, planes)]
+            for case_index, planes in enumerate(plane_sets):
+                start = outage_starts[case_index] if planes else outage_starts[0]
+                effective_planes = tuple((plane + s) % 3 for plane in planes)
+                spec = (
+                    [] if not planes
+                    else [("plane_outage", start, 40, effective_planes)]
+                )
                 for alg_name, cls in alg_classes:
-                    key = f"{alg_name}@{label}#p{planes[0]}s{s}"
+                    position = (
+                        "none" if not planes
+                        else "-".join(map(str, effective_planes))
+                    )
+                    key = f"{alg_name}@{label}#p{position}t{start}s{s}"
                     jobs.append((key, alg_name, cls, spec))
         config_args.append((dict(_E1_BUILD_KWARGS), jobs, seed + s))
 
@@ -1719,12 +1788,32 @@ def run_E3(seed=0, n_seeds=2) -> Dict[str, List[EpochMetrics]]:
     for alg_name, _cls in alg_classes:
         for label, plane_sets in scenarios.items():
             results[f"{alg_name}@{label}"] = [
-                m for s in range(n_seeds) for planes in plane_sets
-                for m in raw[f"{alg_name}@{label}#p{planes[0]}s{s}"]
+                m for s in range(n_seeds)
+                for case_index, planes in enumerate(plane_sets)
+                for start in (
+                    outage_starts[case_index] if planes else outage_starts[0],
+                )
+                for effective_planes in (
+                    tuple((plane + s) % 3 for plane in planes),
+                )
+                for position in (
+                    "none" if not planes
+                    else "-".join(map(str, effective_planes)),
+                )
+                for m in raw[
+                    f"{alg_name}@{label}#p{position}t{start}s{s}"
+                ]
             ]
 
     _save_csv("E3_correlated", results,
-              metric_keys=["realized_miss_ratio", "isl_traffic_bits"])
+              metric_keys=[
+                  "realized_miss_ratio", "hard_fault_miss_ratio",
+                  "source_fault_miss_ratio", "contact_miss_ratio",
+                  "compute_queue_miss_ratio", "policy_miss_ratio",
+                  "soft_failure_miss_ratio",
+                  "isl_traffic_bits_per_delivered_tile",
+                  "energy_j_per_delivered_tile", "n_replicas_avg",
+              ])
     return results
 
 

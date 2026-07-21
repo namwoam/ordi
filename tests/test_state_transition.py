@@ -452,6 +452,29 @@ class StateTransitionTests(unittest.TestCase):
         self.assertEqual({f.targets[0] for f in isl_faults}, {"a:b"})
         self.assertEqual({f.targets[0] for f in ground_faults}, {"a"})
 
+    def test_random_fault_intensity_schedules_are_nested(self):
+        from ordi.faults.injector import random_fault_schedule
+
+        sat_ids = ["a", "b", "c"]
+        low = random_fault_schedule(
+            sat_ids, 200, fault_rate=0.10, seed=13
+        )
+        high = random_fault_schedule(
+            sat_ids, 200, fault_rate=0.50, seed=13
+        )
+
+        def signature(fault):
+            return (
+                fault.fault_type, fault.start_epoch, fault.duration_epochs,
+                tuple(fault.targets), tuple(sorted(fault.params.items())),
+            )
+
+        self.assertLess(len(low), len(high))
+        self.assertTrue(
+            {signature(fault) for fault in low}
+            <= {signature(fault) for fault in high}
+        )
+
     def test_background_compute_is_enqueued_before_each_schedule(self):
         state = _state("sat", rate_gflops=1.0)
         observed_queues = []

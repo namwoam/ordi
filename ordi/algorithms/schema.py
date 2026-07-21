@@ -47,6 +47,9 @@ class ExperimentConfig:
     # Number of execution epochs, including the post-arrival drain period.
     # ``None`` retains the legacy caller-selected/default horizon.
     simulation_epochs: int | None = None
+    # Arrival-window metadata used to normalize throughput across workload
+    # sweeps. The execution horizon may be longer because deadlines drain.
+    arrival_orbits: int = 5
     isl_rate_bps: float = 200e6
     max_backups: int = 1
     # A receiving ORDI node chooses the number of compute shards per tile.

@@ -110,7 +110,7 @@ Available evaluations are:
 | E1 | PlanetScope-class ROI placement on a scaled 3×12 optical compute mesh with 10 GS and 2% matched random faults |
 | E2 | E1 setup with random-fault intensity swept |
 | E3 | E1 setup with random faults replaced by correlated orbital-plane failures |
-| E4 | E1 setup with constellation size swept across 3×4, 3×8, and 3×12 |
+| E4 | E1 3×12 constellation with nominal load swept across 20, 40, 60, and 80 requests/orbit |
 
 The former real-data case is excluded until its removed Skyfield/TLE path is
 replaced by Basilisk propagation; it is not advertised as runnable in the
@@ -122,8 +122,8 @@ Run the full evaluation suite and generate every plot:
 task all
 ```
 
-The focused suite uses eight matched seeds for E1, two matched seeds for E2–E3,
-and one seed per E4 constellation size (12, 24, and 36 satellites). To run or
+The focused suite uses eight matched seeds for every experiment. E4 keeps the
+36-satellite E1 constellation fixed and varies only request load. To run or
 plot all experiments without Task:
 
 ```bash

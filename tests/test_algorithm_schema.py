@@ -64,7 +64,7 @@ def test_e1_report_can_exclude_ordi_utility_fields(tmp_path, monkeypatch):
 
     header = (tmp_path / "E1_core.csv").read_text().splitlines()[0]
     assert header.split(",") == [
-        "algorithm", "realized_miss_ratio", "isl_traffic_bits",
+        "algorithm", "sample_count", "realized_miss_ratio", "isl_traffic_bits",
         "realized_miss_ratio_std", "isl_traffic_bits_std",
     ]
     assert "utility" not in header

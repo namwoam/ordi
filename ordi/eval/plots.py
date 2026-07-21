@@ -89,6 +89,12 @@ def _std(row, key):
     return _float(row, f"{key}_std")
 
 
+def _ci95(row, key):
+    """Normal-approximation 95% CI from across-run sample dispersion."""
+    n = max(_float(row, "sample_count"), 1.0)
+    return 1.96 * _std(row, key) / np.sqrt(n)
+
+
 # ── E1: Core performance bar chart ───────────────────────────────────────────
 
 def plot_E1():
@@ -198,26 +204,66 @@ def plot_E2():
         if "fault=" in r["algorithm"]
     ))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.ravel()
     for alg in algs:
-        miss, miss_err, traffic, traffic_err = [], [], [], []
+        series = {metric: [] for metric in (
+            "realized_miss_ratio", "hard_fault_miss_ratio",
+            "source_fault_miss_ratio",
+            "isl_traffic_bits_per_delivered_tile",
+            "energy_j_per_delivered_tile",
+        )}
+        errors = {metric: [] for metric in series}
         for rate in fault_rates:
             key = f"{alg}@fault={rate:.2f}"
             row = next((r for r in rows if r["algorithm"] == key), None)
-            miss.append(_float(row, "realized_miss_ratio") if row else 0)
-            miss_err.append(_std(row, "realized_miss_ratio") if row else 0)
-            traffic.append(_float(row, "isl_traffic_bits") if row else 0)
-            traffic_err.append(_std(row, "isl_traffic_bits") if row else 0)
+            for metric in series:
+                series[metric].append(_float(row, metric) if row else 0)
+                errors[metric].append(
+                    _ci95(row, metric) if row else 0
+                )
         style = dict(label=ALG_LABELS.get(alg, alg),
                      color=ALG_COLORS.get(alg, "#888"), marker="o", capsize=3,
                      linewidth=2.5 if alg == "ORDI" else 1.5)
-        ax1.errorbar(fault_rates, miss, yerr=miss_err, **style)
-        ax2.errorbar(fault_rates, traffic, yerr=traffic_err, **style)
+        axes[0].errorbar(
+            fault_rates, series["realized_miss_ratio"],
+            yerr=errors["realized_miss_ratio"], **style,
+        )
+        fault_miss = [
+            hard + source for hard, source in zip(
+                series["hard_fault_miss_ratio"],
+                series["source_fault_miss_ratio"],
+            )
+        ]
+        fault_err = [
+            hard + source for hard, source in zip(
+                errors["hard_fault_miss_ratio"],
+                errors["source_fault_miss_ratio"],
+            )
+        ]
+        axes[1].errorbar(fault_rates, fault_miss, yerr=fault_err, **style)
+        axes[2].errorbar(
+            fault_rates, np.array(series["isl_traffic_bits_per_delivered_tile"]) / 1e6,
+            yerr=np.array(errors["isl_traffic_bits_per_delivered_tile"]) / 1e6,
+            **style,
+        )
+        axes[3].errorbar(
+            fault_rates, series["energy_j_per_delivered_tile"],
+            yerr=errors["energy_j_per_delivered_tile"], **style,
+        )
 
-    ax1.set_xlabel("Fault Rate"); ax1.set_ylabel("Deadline Miss Ratio (↓)")
-    ax2.set_xlabel("Fault Rate"); ax2.set_ylabel("ISL Traffic (bits) (↓)")
-    ax1.legend(fontsize=8); ax2.legend(fontsize=8)
-    ax1.set_ylim(bottom=0); ax2.set_ylim(bottom=0)
+    titles = (
+        "Realized Deadline Miss Ratio (↓)",
+        "Hard + Source-Fault Miss Ratio (↓)",
+        "ISL Traffic / Delivered Tile (Mbit) (↓)",
+        "Energy / Delivered Tile (J) (↓)",
+    )
+    for ax, title in zip(axes, titles):
+        ax.set_xlabel("Fault-event probability per minute")
+        ax.set_ylabel(title)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
 
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E2_fault_intensity.png")
@@ -233,21 +279,61 @@ def plot_E3():
     if not rows:
         print("No E3 data"); return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-    labels = [r["algorithm"] for r in rows]
-    x = np.arange(len(labels))
-    colors = [ALG_COLORS.get(label.split("@")[0], "#888") for label in labels]
-    for ax, metric, title in (
-        (ax1, "realized_miss_ratio", "Deadline Miss Ratio (↓)"),
-        (ax2, "isl_traffic_bits", "ISL Traffic (bits) (↓)"),
-    ):
-        vals = [_float(row, metric) for row in rows]
-        errs = [_std(row, metric) for row in rows]
-        ax.bar(x, vals, color=colors, yerr=errs, capsize=3)
+    algs = ["ORDI", "full_replication", "random_replication"]
+    labels = ("0plane", "1plane", "2planes")
+    x = np.arange(3)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.ravel()
+    metrics = (
+        ("realized_miss_ratio", 1.0, "Realized Deadline Miss Ratio (↓)"),
+        ("hard_plus_source_fault", 1.0,
+         "Hard + Source-Fault Miss Ratio (↓)"),
+        ("isl_traffic_bits_per_delivered_tile", 1e6,
+         "ISL Traffic / Delivered Tile (Mbit) (↓)"),
+        ("energy_j_per_delivered_tile", 1.0,
+         "Energy / Delivered Tile (J) (↓)"),
+        )
+    for alg in algs:
+        matched = [
+            next((row for row in rows
+                  if row["algorithm"] == f"{alg}@{label}"), None)
+            for label in labels
+        ]
+        for ax, (metric, scale, title) in zip(axes, metrics):
+            if metric == "hard_plus_source_fault":
+                values = [
+                    (_float(row, "hard_fault_miss_ratio")
+                     + _float(row, "source_fault_miss_ratio")) / scale
+                    if row else 0 for row in matched
+                ]
+                errors = [
+                    (_ci95(row, "hard_fault_miss_ratio")
+                     + _ci95(row, "source_fault_miss_ratio")) / scale
+                    if row else 0 for row in matched
+                ]
+            else:
+                values = [
+                    _float(row, metric) / scale if row else 0
+                    for row in matched
+                ]
+                errors = [
+                    _ci95(row, metric) / scale if row else 0
+                    for row in matched
+                ]
+            ax.errorbar(
+                x, values, yerr=errors, marker="o", capsize=3,
+                color=ALG_COLORS.get(alg, "#888"),
+                label=ALG_LABELS.get(alg, alg),
+                linewidth=2.5 if alg == "ORDI" else 1.5,
+            )
+            ax.set_title(title)
+    for ax in axes:
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-        ax.set_title(title)
+        ax.set_xticklabels(("0", "1", "2"))
+        ax.set_xlabel("Failed orbital planes")
         ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
 
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E3_correlated.png")
@@ -264,33 +350,67 @@ def plot_E4():
         print("No E4 data"); return
 
     algs = ["ORDI", "seco_adapted"]
-    sizes = sorted(set(
-        int(r["algorithm"].split("n=")[1]) for r in rows if "n=" in r["algorithm"]
+    request_rates = sorted(set(
+        int(r["algorithm"].split("requests=")[1])
+        for r in rows if "requests=" in r["algorithm"]
     ))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.ravel()
 
     for alg in algs:
-        miss, miss_err, traffic, traffic_err = [], [], [], []
-        for n in sizes:
-            key = f"{alg}@n={n}"
+        matched = []
+        for request_rate in request_rates:
+            key = f"{alg}@requests={request_rate}"
             row = next((r for r in rows if r["algorithm"] == key), None)
-            miss.append(_float(row, "realized_miss_ratio") if row else 0)
-            miss_err.append(_std(row, "realized_miss_ratio") if row else 0)
-            traffic.append(_float(row, "isl_traffic_bits") if row else 0)
-            traffic_err.append(_std(row, "isl_traffic_bits") if row else 0)
+            matched.append(row)
+        offered = [_float(row, "offered_requests_per_orbit") for row in matched]
         style = dict(label=ALG_LABELS.get(alg, alg),
                      color=ALG_COLORS.get(alg, "#888"), linewidth=2,
                      marker="s", capsize=3)
-        ax1.errorbar(sizes, miss, yerr=miss_err, **style)
-        ax2.errorbar(sizes, traffic, yerr=traffic_err, **style)
+        plot_metrics = (
+            ("realized_miss_ratio", 1.0),
+            ("realized_delivered_tiles_per_orbit", 1.0),
+            ("scheduling_time_p95_s", 1.0),
+            ("helper_utilization", 1.0),
+            ("isl_traffic_bits_per_delivered_tile", 1e6),
+            ("energy_j_per_delivered_tile", 1.0),
+        )
+        for ax, (metric, scale) in zip(axes, plot_metrics):
+            values = [_float(row, metric) / scale for row in matched]
+            errors = [
+                _ci95(row, metric) / scale
+                for row in matched
+            ]
+            ax.errorbar(offered, values, yerr=errors, **style)
 
-    ax1.set_xlabel("Number of Satellites")
-    ax1.set_ylabel("Deadline Miss Ratio (↓)")
-    ax2.set_xlabel("Number of Satellites")
-    ax2.set_ylabel("ISL Traffic (bits) (↓)")
-    for ax in (ax1, ax2):
-        ax.legend(); ax.grid(True, alpha=0.3)
+    reference_rows = [
+        next(row for row in rows
+             if row["algorithm"] == f"ORDI@requests={request_rate}")
+        for request_rate in request_rates
+    ]
+    axes[1].plot(
+        [_float(row, "offered_requests_per_orbit") for row in reference_rows],
+        [_float(row, "offered_tiles_per_orbit") for row in reference_rows],
+        color="#555", linestyle="--", linewidth=1.2,
+        label="All offered tiles delivered",
+    )
+
+    titles = (
+        "Realized Deadline Miss Ratio (↓)",
+        "Delivered Tiles / Orbit (↑)",
+        "P95 Scheduling Time / Epoch (s) (↓)",
+        "Helper Utilization (↑)",
+        "ISL Traffic / Delivered Tile (Mbit) (↓)",
+        "Energy / Delivered Tile (J) (↓)",
+    )
+    for ax, title in zip(axes, titles):
+        ax.set_xlabel("Actual Offered Requests / Orbit")
+        ax.set_ylabel(title)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[1].legend(fontsize=8)
     plt.tight_layout()
     path = os.path.join(FIGURES_DIR, "E4_scalability.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")

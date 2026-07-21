@@ -396,34 +396,45 @@ def random_fault_schedule(
     Generate a randomized fault schedule at a given fault_rate.
     Used for E2 (fault intensity sweep).
     """
+    if not 0.0 <= fault_rate <= 1.0:
+        raise ValueError("fault_rate must be between 0 and 1")
     rng = random.Random(seed)
     faults = []
     for epoch in range(n_epochs):
-        if rng.random() < fault_rate:
-            ft = rng.choice(RANDOM_FAULT_TYPES)
-            target = rng.choice(sat_ids)
-            if ft == "isl_disruption":
-                active_edges = []
-                if graphs and epoch < len(graphs):
-                    active_edges = [
-                        (a, b) for a, b, _rate, _cap, kind in graphs[epoch].edges
-                        if kind == "isl" and a in sat_ids and b in sat_ids
-                    ]
-                if active_edges:
-                    target, other = rng.choice(active_edges)
-                else:
-                    other = rng.choice([s for s in sat_ids if s != target])
-                faults.append(FaultEvent(ft, epoch, 2, [f"{target}:{other}"]))
-            elif ft == "ground_contact_miss":
-                active_sources = []
-                if graphs and epoch < len(graphs):
-                    active_sources = [
-                        a for a, _b, _rate, _cap, kind in graphs[epoch].edges
-                        if kind == "downlink" and a in sat_ids
-                    ]
-                if active_sources:
-                    target = rng.choice(active_sources)
-                faults.append(FaultEvent(ft, epoch, rng.randint(1, 3), [target]))
+        # Draw the complete candidate before applying the intensity threshold.
+        # With a shared seed, every lower-rate schedule is therefore a strict
+        # subset of every higher-rate schedule instead of consuming a different
+        # RNG stream after its first additional event.
+        trigger = rng.random()
+        ft = rng.choice(RANDOM_FAULT_TYPES)
+        target = rng.choice(sat_ids)
+        duration = rng.randint(1, 3)
+        if ft == "isl_disruption":
+            active_edges = []
+            if graphs and epoch < len(graphs):
+                active_edges = [
+                    (a, b) for a, b, _rate, _cap, kind in graphs[epoch].edges
+                    if kind == "isl" and a in sat_ids and b in sat_ids
+                ]
+            if active_edges:
+                target, other = rng.choice(active_edges)
             else:
-                faults.append(FaultEvent(ft, epoch, rng.randint(1, 3), [target]))
+                other = rng.choice([s for s in sat_ids if s != target])
+            candidate = FaultEvent(
+                ft, epoch, 2, [f"{target}:{other}"]
+            )
+        elif ft == "ground_contact_miss":
+            active_sources = []
+            if graphs and epoch < len(graphs):
+                active_sources = [
+                    a for a, _b, _rate, _cap, kind in graphs[epoch].edges
+                    if kind == "downlink" and a in sat_ids
+                ]
+            if active_sources:
+                target = rng.choice(active_sources)
+            candidate = FaultEvent(ft, epoch, duration, [target])
+        else:
+            candidate = FaultEvent(ft, epoch, duration, [target])
+        if trigger < fault_rate:
+            faults.append(candidate)
     return faults

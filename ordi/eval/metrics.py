@@ -54,6 +54,15 @@ class EpochMetrics:
     n_replicas_avg: float = 0.0
     n_tiles_total: int = 0
     n_tiles_feasible: int = 0
+    n_requests_total: int = 0
+    offered_requests_per_orbit: float = 0.0
+    offered_tiles_per_orbit: float = 0.0
+    delivered_tiles_per_orbit: float = 0.0
+    realized_delivered_tiles_per_orbit: float = 0.0
+    scheduling_time_total_s: float = 0.0
+    scheduling_time_p95_s: float = 0.0
+    fault_event_count: float = 0.0
+    fault_target_minutes: float = 0.0
     # Monte Carlo realized outcomes (sampled from the reliability model rather
     # than scored on the modeled expectation z_kv). Populated by
     # compute_realized_metrics; left at 0 when realized scoring is not run.
@@ -64,6 +73,7 @@ class EpochMetrics:
     compute_queue_miss_ratio: float = 0.0
     policy_miss_ratio: float = 0.0
     hard_fault_miss_ratio: float = 0.0
+    source_fault_miss_ratio: float = 0.0
     soft_failure_miss_ratio: float = 0.0
 
 
@@ -214,6 +224,7 @@ def compute_metrics(
 
     m.n_tiles_total = n_tiles
     m.n_tiles_feasible = n_tiles - n_miss
+    m.n_requests_total = len(tasks)
     m.deadline_miss_ratio = n_miss / n_tiles if n_tiles > 0 else 0.0
     m.delivered_utility = utility_sum
     m.partial_coverage = sum(partial_coverages) / len(partial_coverages) if partial_coverages else 0.0
@@ -405,7 +416,7 @@ def compute_realized_metrics(
     experiment. Link and downlink outcomes are sampled once per scheduled
     transfer, keyed by its completion epoch. Draws remain shared by replicas
     using the same component in the same epoch, preserving structural
-    correlation without turning a three-orbit run into one Bernoulli event.
+    correlation without turning a multi-orbit run into one Bernoulli event.
     """
     # Deterministic cost metrics + structure come from the modeled pass.
     base = compute_metrics(result, tasks, 0.0, {}, alpha)
@@ -601,6 +612,12 @@ def aggregate_metrics(epoch_metrics: List[EpochMetrics]) -> Dict[str, float]:
         "contact_miss_ratio", "compute_queue_miss_ratio",
         "policy_miss_ratio",
         "hard_fault_miss_ratio", "soft_failure_miss_ratio",
+        "source_fault_miss_ratio",
+        "n_requests_total", "offered_requests_per_orbit",
+        "offered_tiles_per_orbit", "delivered_tiles_per_orbit",
+        "realized_delivered_tiles_per_orbit",
+        "scheduling_time_total_s", "scheduling_time_p95_s",
+        "fault_event_count", "fault_target_minutes",
     ]
     out: Dict[str, float] = {}
     for k in keys:

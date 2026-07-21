@@ -3,7 +3,8 @@ from inspect import signature
 
 from ordi.eval import experiments
 from ordi.eval.experiments import (
-    _E1_BUILD_KWARGS, _E1_FAULT_RATE, _E4_CONFIGS, _EVALUATION_GS,
+    _E1_BUILD_KWARGS, _E1_FAULT_RATE, _E2_FAULT_RATES,
+    _E4_REQUEST_RATES, _EVALUATION_GS, SIM_DURATION_S, SIM_ORBITS,
     _four_neighbor_walker_pairs,
     _intensify_one_area_burst, _intensify_repeated_area_bursts, run_E1,
 )
@@ -44,6 +45,8 @@ def test_evaluation_deadlines_and_request_rate_match_workload_design():
         "ship": 3, "wildfire": 4, "change": 8, "cloud_filter": 8,
     }
     assert _E1_BUILD_KWARGS["background_compute_utilization"] == 0.15
+    assert SIM_ORBITS == 5
+    assert SIM_DURATION_S == 5 * _E1_BUILD_KWARGS["orbit_period_s"]
     rates = {
         _E1_BUILD_KWARGS["satellite_params_factory"](f"SAT_00_{i:02d}")
         .compute_rate_gflops
@@ -89,7 +92,9 @@ def test_e2_changes_fault_rate_from_the_e1_setup(monkeypatch):
     build_kwargs, jobs, seed = configs[0]
     assert build_kwargs == _E1_BUILD_KWARGS
     assert seed == 7
-    assert {job[3][0][1] for job in jobs} == {0.0, 0.25, 0.50}
+    assert signature(experiments.run_E2).parameters["n_seeds"].default == 8
+    assert {job[3][0][1] for job in jobs} == set(_E2_FAULT_RATES)
+    assert _E1_FAULT_RATE in _E2_FAULT_RATES
 
 
 def test_e3_changes_only_the_fault_scenario_from_the_e1_setup(monkeypatch):
@@ -99,22 +104,27 @@ def test_e3_changes_only_the_fault_scenario_from_the_e1_setup(monkeypatch):
     build_kwargs, jobs, seed = configs[0]
     assert build_kwargs == _E1_BUILD_KWARGS
     assert seed == 7
+    assert signature(experiments.run_E3).parameters["n_seeds"].default == 8
     assert all(len(job) == 4 for job in jobs)
-    assert {job[3][0][0] for job in jobs} == {"plane_outage"}
+    assert {spec[0] for job in jobs for spec in job[3]} == {"plane_outage"}
+    assert any(not job[3] for job in jobs)
 
 
-def test_e4_changes_only_constellation_size_from_the_e1_setup(monkeypatch):
+def test_e4_changes_only_request_rate_from_the_e1_setup(monkeypatch):
     configs = _capture_experiment_configs(monkeypatch, experiments.run_E4)
 
-    assert _E4_CONFIGS == {12: (3, 4), 24: (3, 8), 36: (3, 12)}
-    assert len(configs) == 3
+    assert _E4_REQUEST_RATES == (20, 40, 60, 80)
+    assert signature(experiments.run_E4).parameters["n_seeds"].default == 8
+    assert len(configs) == 4
     for build_kwargs, jobs, seed in configs:
         changed = {
             key: value for key, value in build_kwargs.items()
             if _E1_BUILD_KWARGS[key] != value
         }
-        assert set(changed) <= {"sats_per_plane"}
+        assert set(changed) <= {"arrival_rate"}
         assert build_kwargs["n_planes"] == _E1_BUILD_KWARGS["n_planes"]
+        assert build_kwargs["sats_per_plane"] == _E1_BUILD_KWARGS["sats_per_plane"]
+        assert build_kwargs["arrival_rate"] in _E4_REQUEST_RATES
         assert all(job[3] == [("random_schedule", _E1_FAULT_RATE, 7)]
                    for job in jobs)
         assert seed == 7

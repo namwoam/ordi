@@ -23,7 +23,7 @@ tasks:
       - uv run python -m ordi.main run E3
 
   e4:
-    desc: "E4 - Scalability: ORDI vs greedy nonredundant across 12-36 satellites"
+    desc: "E4 - Scalability: ORDI vs greedy nonredundant across request loads"
     cmds:
       - uv run python -m ordi.main run E4
 
