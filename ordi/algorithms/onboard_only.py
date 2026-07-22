@@ -1,5 +1,5 @@
 from .schema import Assignment, Decision
-from ._common import enumerate_placements, source_only_view
+from ._common import deadline_expired, enumerate_placements, source_only_view
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 
 class OnboardOnly:
@@ -8,6 +8,7 @@ class OnboardOnly:
     def schedule(self, request):
         out=[]
         for task in request.tasks:
+            if deadline_expired(request, task): continue
             local=source_only_view(request,task.source_sat)
             state=local.satellites.get(task.source_sat)
             if state and state.available:

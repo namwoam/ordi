@@ -4,6 +4,31 @@ from ordi.algorithms import (ALL_ALGORITHMS, ContactWindow, Decision, EpochInput
 from ordi.eval.metrics import EpochMetrics
 
 
+def test_all_algorithms_prune_expired_tasks_before_planning():
+    tile = SimpleNamespace(
+        tile_id=0, n_replicas_max=2, d_in_bits=1_000.0,
+        d_out_bits=100.0, compute_ops=1e6, utility=1.0,
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="SAT_00_00", deadline=120.0,
+        tiles=[tile],
+    )
+    states = {
+        "SAT_00_00": SatelliteView(
+            "SAT_00_00", True, 1e9, 9_000, 10_000, 25, 0,
+        ),
+    }
+    request = EpochInput(
+        2, 120.0, [task], states, {}, frozenset({"ground"}),
+        (ContactWindow(
+            "SAT_00_00", "ground", 120, 180, 1e9, "downlink",
+        ),),
+    )
+
+    for algorithm in ALL_ALGORITHMS.values():
+        assert algorithm().schedule(request).assignments == ()
+
+
 def test_focused_evaluation_suite_exposes_only_four_distinct_questions():
     from ordi.eval.experiments import ALL_EXPERIMENTS
 

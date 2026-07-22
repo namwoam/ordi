@@ -12,7 +12,10 @@ import math
 import random
 
 from .schema import Assignment, Decision, NodeDecision, WorkItem
-from ._common import enumerate_placements, group_success, groups_success, plane
+from ._common import (
+    deadline_expired, enumerate_placements, group_success, groups_success,
+    plane,
+)
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
@@ -449,6 +452,8 @@ class ORDI:
         assignments = []
         advertisements = self.messages.prepare_epoch(request)
         for task in request.tasks:
+            if deadline_expired(request, task):
+                continue
             for tile in task.tiles:
                 # Rebuild the effective view after every committed tile so
                 # subsequent candidates see newly consumed contacts/compute.

@@ -59,7 +59,12 @@ def _contacts_by_source(contacts):
     _CONTACT_INDEX_CACHE[key]=(contacts,result)
     return result
 
-def earliest_route(request, source, targets, bits, start=None):
+def deadline_expired(request, task):
+    """Whether no on-time delivery remains possible for a task."""
+    return task.deadline <= request.sim_time + 1e-9
+
+
+def earliest_route(request, source, targets, bits, start=None, latest=None):
     targets=set(targets)
     if source in targets: return Route(start or request.sim_time,1.0,(source,),bits)
     start=request.sim_time if start is None else start
@@ -69,20 +74,24 @@ def earliest_route(request, source, targets, bits, start=None):
     while queue:
         now,node=heapq.heappop(queue)
         if now!=best[node]: continue
+        if latest is not None and now > latest + 1e-9: continue
         if node in targets: return Route(now,rel[node],paths[node],bits)
         for c in contacts_by_source.get(node,()):
             if c.closes<now: continue
             depart=max(now,c.opens); finish=depart+bits/max(c.rate_bps,1.0)
             if finish>c.closes: continue
+            if latest is not None and finish > latest + 1e-9: continue
             if finish<best.get(c.target,math.inf):
                 best[c.target]=finish; rel[c.target]=rel[node]*c.reliability
                 paths[c.target]=paths[node]+(c.target,); heapq.heappush(queue,(finish,c.target))
     return None
 
-def earliest_downlink(request, source, bits, start=None):
-    return earliest_route(request,source,request.ground_stations,bits,start)
+def earliest_downlink(request, source, bits, start=None, latest=None):
+    return earliest_route(
+        request, source, request.ground_stations, bits, start, latest
+    )
 
-def earliest_direct_downlink(request, source, bits, start=None):
+def earliest_direct_downlink(request, source, bits, start=None, latest=None):
     """Earliest source-to-ground contact without an ISL relay."""
     start=request.sim_time if start is None else start
     feasible=[]
@@ -91,6 +100,8 @@ def earliest_direct_downlink(request, source, bits, start=None):
             continue
         depart=max(start,contact.opens)
         finish=depart+bits/max(contact.rate_bps,1.0)
+        if latest is not None and finish > latest + 1e-9:
+            continue
         if finish<=contact.closes:
             feasible.append(Route(finish,contact.reliability,
                                   (source,contact.target),bits))
@@ -101,6 +112,8 @@ def enumerate_placements(request, task, tile, allow_source=True,
                          output_fraction=1.0,
                          protocol_header_bits=0.0):
     deadline=task.deadline; out=[]
+    if deadline_expired(request, task):
+        return out
     source_state=request.satellites.get(task.source_sat)
     if source_state is None or not source_state.available:
         return out
@@ -111,21 +124,33 @@ def enumerate_placements(request, task, tile, allow_source=True,
         input_transfer_bits=input_bits+protocol_header_bits
         output_transfer_bits=output_bits+protocol_header_bits
         work=tile.compute_ops*work_fraction
+        optimistic_compute_done = (
+            request.sim_time
+            + (hstate.queued_flops + work)
+            / max(hstate.compute_rate, 1.0)
+        )
+        if optimistic_compute_done > deadline + 1e-9:
+            continue
         route_in=earliest_route(
-            request,task.source_sat,{helper},input_transfer_bits
+            request, task.source_sat, {helper}, input_transfer_bits,
+            latest=deadline,
         )
         if route_in is None: continue
         compute_start=route_in.arrival
         compute_time=(hstate.queued_flops+work)/max(hstate.compute_rate,1.0)
         compute_done=compute_start+compute_time
+        if compute_done > deadline + 1e-9:
+            continue
         for agg,astate in request.satellites.items():
             if not astate.available: continue
             route_out=earliest_route(
-                request,helper,{agg},output_transfer_bits,compute_done
+                request, helper, {agg}, output_transfer_bits, compute_done,
+                deadline,
             )
             if route_out is None: continue
             down=earliest_downlink(
-                request,agg,output_transfer_bits,route_out.arrival
+                request, agg, output_transfer_bits, route_out.arrival,
+                deadline,
             )
             if down is None or down.arrival>deadline: continue
             isl_bits=(input_transfer_bits*max(len(route_in.path)-1,0)

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from .schema import Assignment, Decision
 from ._common import (
-    advertisement_metadata, enumerate_placements, protocol_trace,
+    advertisement_metadata, deadline_expired, enumerate_placements, protocol_trace,
     tile_success,
 )
 from ordi.eval.validation import InvalidDecisionError
@@ -21,6 +21,8 @@ class FullReplication:
         advertisements = self.messages.prepare_epoch(request)
         assignments = []
         for task in request.tasks:
+            if deadline_expired(request, task):
+                continue
             local = self.messages.local_view(request, task.source_sat)
             for tile in task.tiles:
                 choices = sorted(

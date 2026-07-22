@@ -1,5 +1,5 @@
 from .schema import Assignment, Decision
-from ._common import earliest_direct_downlink, source_only_view
+from ._common import deadline_expired, earliest_direct_downlink, source_only_view
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
 from ordi.sim.ground import H100_SXM_PROFILE
 
@@ -9,11 +9,15 @@ class DirectDownlink:
     def schedule(self, request):
         out=[]
         for task in request.tasks:
+            if deadline_expired(request, task): continue
             local=source_only_view(request,task.source_sat)
             state=local.satellites.get(task.source_sat)
             if not state or not state.available: continue
             for tile in task.tiles:
-                route=earliest_direct_downlink(local,task.source_sat,tile.d_in_bits)
+                route=earliest_direct_downlink(
+                    local, task.source_sat, tile.d_in_bits,
+                    latest=task.deadline,
+                )
                 if route and route.arrival<=task.deadline:
                     assignment=Assignment(task.task_id,tile.tile_id,task.source_sat,
                         downlink_only=True,metadata={"latency":route.arrival-request.sim_time,
