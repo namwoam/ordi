@@ -7,11 +7,12 @@ from ordi.algorithms import (
     MessageEvent, SatelliteView,
 )
 from ordi.algorithms._common import Placement, group_success
+from ordi.eval import experiments as experiments_module
 from ordi.eval.experiments import (
     _assignment_group_viability, _consumed_attempt_costs, _epoch_input,
     _simulate_stateful,
 )
-from ordi.eval.metrics import compute_metrics
+from ordi.eval.metrics import EpochMetrics, compute_metrics
 from ordi.faults.injector import FaultEvent, FaultInjector
 from ordi.orbit._contact_types import ContactEvent
 from ordi.orbit.graph import build_epoch_graphs
@@ -256,3 +257,23 @@ def test_modeled_reliability_counts_time_and_intermediate_relays():
     )
 
     assert group_success(request, task, (placement,)) == pytest.approx(0.25)
+
+
+def test_stateful_passes_configured_epoch_to_realized_scoring(monkeypatch):
+    captured = {}
+
+    def fake_realized(*_args, **kwargs):
+        captured.update(kwargs)
+        return EpochMetrics(epoch=0)
+
+    monkeypatch.setattr(
+        experiments_module, "compute_realized_metrics", fake_realized
+    )
+    _simulate_stateful(
+        lambda epoch, _tasks: Decision(epoch), [], [], {},
+        ExperimentConfig(epoch_length=120.0, simulation_epochs=1),
+        reliability=ReliabilityModel(), realized_trials=1,
+        state_driver=lambda *_args: None,
+    )
+
+    assert captured["reliability_epoch_s"] == 120.0

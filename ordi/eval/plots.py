@@ -36,7 +36,7 @@ ALG_LABELS = {
 }
 
 E1_PLOT_METRICS = (
-    ("realized_miss_ratio", 1.0, "Deadline Miss Ratio (↓)"),
+    ("deadline_miss_ratio", 1.0, "Deadline Miss Ratio (↓)"),
     (
         "delivery_latency_p95_s",
         60.0,

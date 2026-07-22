@@ -5,7 +5,9 @@ import pytest
 from ordi.algorithms import (
     Assignment, ContactWindow, EpochInput, SatelliteView, SECOAdapted,
 )
+from ordi.algorithms.seco_adapted import _speculative_terminal_slot
 from ordi.eval.experiments import _advance_synthetic_states
+from ordi.eval.validation import _terminal_slot
 
 
 def _state(name, rate=1e9, battery=10_000.0):
@@ -85,6 +87,41 @@ def test_seco_reserves_contact_capacity_between_tiles():
     assert len(result.assignments) == 1
 
 
+def test_seco_shortlist_filters_helpers_without_return_handshake():
+    states = {
+        "src": _state("src", rate=1.0),
+        "bad": _state("bad", rate=2e9),
+        "good": _state("good", rate=1e9),
+    }
+    contacts = (
+        # Bad is the fastest compute node but cannot return the split-accept
+        # handshake, so it must not consume the fixed exact-planning budget.
+        ContactWindow("src", "bad", 0, 20, 1e6, "isl"),
+        ContactWindow("bad", "ground", 0, 20, 1e6, "downlink"),
+        ContactWindow("src", "good", 0, 20, 1e6, "isl"),
+        ContactWindow("good", "src", 0, 20, 1e6, "isl"),
+        ContactWindow("good", "ground", 0, 20, 1e6, "downlink"),
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=20.0,
+        tiles=[_tile(work=1e6)],
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
+    )
+    scheduler = SECOAdapted(split_options=(1,), candidate_limit=1)
+    scheduler.messages.seed_knowledge(
+        "src", states, generated_at=-60.0, delivered_at=0.0
+    )
+
+    assignment = scheduler.schedule(request).assignments[0]
+
+    assert assignment.helpers == ("good",)
+    assert assignment.metadata["planning_method"] == (
+        "layered_graph_shortlist"
+    )
+
+
 def test_partition_fractions_drive_physical_workload():
     # Use lightweight state doubles because this test targets workload
     # translation, not Basilisk state integration.
@@ -112,3 +149,26 @@ def test_partition_fractions_drive_physical_workload():
     assert workloads["h1"].compute_flops == pytest.approx(1.05e9)
     assert workloads["h2"].compute_flops == pytest.approx(1.05e9)
     assert workloads["src"].tx_bits == pytest.approx(1.05 * tile.d_in_bits)
+
+
+@pytest.mark.parametrize(
+    ("calendars", "terminals", "earliest", "duration", "latest"),
+    [
+        ({}, ("a", "b"), 0.0, 2.0, 10.0),
+        ({"a": [(0.0, 2.0)]}, ("a", "b"), 0.0, 2.0, 10.0),
+        ({"a": [(0.0, 3.0), (7.0, 9.0)],
+          "b": [(2.0, 5.0)]}, ("a", "b"), 0.0, 2.0, 10.0),
+        ({"a": [(1.0, 8.0)], "b": [(2.0, 3.0), (8.0, 9.0)]},
+         ("a", "b"), 0.0, 2.0, 10.0),
+        ({"a": [(0.0, 5.0)], "b": [(5.0, 10.0)]},
+         ("a", "b"), 0.0, 1.0, 10.0),
+    ],
+)
+def test_seco_speculative_terminal_slot_matches_validator_semantics(
+        calendars, terminals, earliest, duration, latest):
+    expected = _terminal_slot(
+        calendars, terminals, earliest, duration, latest
+    )
+    assert _speculative_terminal_slot(
+        calendars, terminals, earliest, duration, latest
+    ) == expected

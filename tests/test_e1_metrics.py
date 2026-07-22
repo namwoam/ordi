@@ -77,22 +77,24 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
 
 def test_e1_exports_reliability_latency_cost_and_decentralization_metrics():
     required = {
-        "realized_miss_ratio", "delivery_latency_p95_s",
+        "deadline_miss_ratio", "delivery_latency_p95_s",
         "isl_traffic_bits_per_delivered_tile", "control_traffic_ratio",
         "energy_j_per_delivered_tile", "compute_load_balance",
         "helper_acceptance_ratio", "state_age_p95_s",
         "contact_miss_ratio", "compute_queue_miss_ratio",
         "policy_miss_ratio",
-        "hard_fault_miss_ratio", "soft_failure_miss_ratio",
+        "hard_fault_miss_ratio",
     }
     assert required <= set(E1_METRIC_KEYS)
+    assert "realized_miss_ratio" not in E1_METRIC_KEYS
+    assert "soft_failure_miss_ratio" not in E1_METRIC_KEYS
 
 
 def test_e1_plot_exposes_important_operational_metrics():
     plotted = {metric for metric, _scale, _title in E1_PLOT_METRICS}
 
     assert plotted == {
-        "realized_miss_ratio",
+        "deadline_miss_ratio",
         "delivery_latency_p95_s",
         "isl_traffic_bits_per_delivered_tile",
         "downlink_bits_per_delivered_tile",

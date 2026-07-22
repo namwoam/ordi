@@ -12,6 +12,7 @@ link/compute capacity. Basilisk alone evolves physical energy state.
 """
 from __future__ import annotations
 
+from bisect import insort
 from dataclasses import dataclass, replace
 import heapq
 import math
@@ -21,7 +22,6 @@ from ._common import (
     Placement, advertisement_metadata, group_success, protocol_trace,
 )
 from ordi.eval.validation import InvalidDecisionError
-from ordi.eval.validation import _terminal_slot
 from ordi.sim.messaging import MessageSimulator
 
 
@@ -97,17 +97,56 @@ class SplitPlan:
     ledger_after: ResourceLedger
 
 
+_CONTACT_INDEX_CACHE = {}
+
+
+def _contacts_by_source(contacts):
+    """Index one immutable local contact view once for all route searches."""
+    key = id(contacts)
+    cached = _CONTACT_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is contacts:
+        return cached[1]
+    indexed = {}
+    for index, contact in enumerate(contacts):
+        indexed.setdefault(contact.source, []).append((index, contact))
+    result = {
+        source: tuple(sorted(windows, key=lambda item: item[1].opens))
+        for source, windows in indexed.items()
+    }
+    if len(_CONTACT_INDEX_CACHE) >= 128:
+        _CONTACT_INDEX_CACHE.clear()
+    _CONTACT_INDEX_CACHE[key] = (contacts, result)
+    return result
+
+
+def _speculative_terminal_slot(calendars, terminals, earliest, duration, latest):
+    """Earliest common terminal gap over SECO's sorted local calendars."""
+    first = calendars.get(terminals[0], ()) if terminals else ()
+    second = calendars.get(terminals[1], ()) if len(terminals) > 1 else ()
+    i = j = 0
+    start = earliest
+    while i < len(first) or j < len(second):
+        if j >= len(second) or (i < len(first) and first[i] <= second[j]):
+            reserved_start, reserved_finish = first[i]
+            i += 1
+        else:
+            reserved_start, reserved_finish = second[j]
+            j += 1
+        if reserved_finish <= start + 1e-9:
+            continue
+        if start + duration <= reserved_start + 1e-9:
+            break
+        start = reserved_finish
+    return start if start + duration <= latest + 1e-9 else None
+
+
 def _route(request, ledger, source, targets, bits, start):
     """Earliest route whose contacts still have time and bit capacity."""
     targets = set(targets)
     if source in targets:
         return ReservedRoute(start, 1.0, (source,), (), (), bits)
 
-    by_source: dict[str, list[tuple[int, object]]] = {}
-    for index, contact in enumerate(request.contacts):
-        by_source.setdefault(contact.source, []).append((index, contact))
-    for windows in by_source.values():
-        windows.sort(key=lambda item: item[1].opens)
+    by_source = _contacts_by_source(request.contacts)
 
     best = {source: start}
     reliability = {source: 1.0}
@@ -132,7 +171,7 @@ def _route(request, ledger, source, targets, bits, start):
                 endpoint for endpoint in (contact.source, contact.target)
                 if endpoint in request.satellites
             )
-            depart = _terminal_slot(
+            depart = _speculative_terminal_slot(
                 ledger.terminal_intervals, terminals,
                 max(now, contact.opens, ledger.contact_ready_at[index]),
                 duration, contact.closes,
@@ -159,13 +198,77 @@ def _reserve_route(request, ledger, route):
         contact = request.contacts[index]
         start = finish - route.bits / max(contact.rate_bps, 1.0)
         if contact.source in request.satellites:
-            ledger.terminal_intervals.setdefault(contact.source, []).append(
-                (start, finish)
+            insort(
+                ledger.terminal_intervals.setdefault(contact.source, []),
+                (start, finish),
             )
         if contact.target in request.satellites:
-            ledger.terminal_intervals.setdefault(contact.target, []).append(
-                (start, finish)
+            insort(
+                ledger.terminal_intervals.setdefault(contact.target, []),
+                (start, finish),
             )
+
+
+def _relaxed_arrivals(request, ledger, source, bits, start):
+    """Layered-graph arrival bounds without speculative terminal calendars.
+
+    This inexpensive routing layer shortlists compute nodes. It respects
+    contact windows and residual per-contact capacity, while leaving terminal
+    contention to the exact ledger evaluation below.
+    """
+    best = {source: start}
+    queue = [(start, source)]
+    by_source = _contacts_by_source(request.contacts)
+    while queue:
+        now, node = heapq.heappop(queue)
+        if now != best[node]:
+            continue
+        for index, contact in by_source.get(node, ()):
+            if ledger.contact_residual_bits[index] + 1e-9 < bits:
+                continue
+            duration = bits / max(contact.rate_bps, 1.0)
+            finish = max(
+                now, contact.opens, ledger.contact_ready_at[index]
+            ) + duration
+            if finish > contact.closes + 1e-9:
+                continue
+            if finish < best.get(contact.target, math.inf):
+                best[contact.target] = finish
+                heapq.heappush(queue, (finish, contact.target))
+    return best
+
+
+def _relaxed_reverse_costs(request, ledger, bits, targets):
+    """Optimistic serialization cost from every node to any target."""
+    reverse = {}
+    for index, contact in enumerate(request.contacts):
+        if ledger.contact_residual_bits[index] + 1e-9 < bits:
+            continue
+        duration = bits / max(contact.rate_bps, 1.0)
+        if contact.opens + duration > contact.closes + 1e-9:
+            continue
+        reverse.setdefault(contact.target, []).append(
+            (contact.source, duration)
+        )
+    best = {target: 0.0 for target in targets}
+    queue = [(0.0, target) for target in targets]
+    heapq.heapify(queue)
+    while queue:
+        cost, node = heapq.heappop(queue)
+        if cost != best[node]:
+            continue
+        for predecessor, duration in reverse.get(node, ()):
+            candidate = cost + duration
+            if candidate < best.get(predecessor, math.inf):
+                best[predecessor] = candidate
+                heapq.heappush(queue, (candidate, predecessor))
+    return best
+
+
+def _relaxed_ground_costs(request, ledger, bits):
+    return _relaxed_reverse_costs(
+        request, ledger, bits, request.ground_stations
+    )
 
 
 class SECOAdapted:
@@ -173,14 +276,64 @@ class SECOAdapted:
 
     name = "seco_adapted"
 
-    def __init__(self, split_options=(1, 2, 4), halo_fraction=0.05):
+    def __init__(self, split_options=(1, 2, 4), halo_fraction=0.05,
+                 candidate_limit=4):
         self.split_options = tuple(sorted(set(split_options)))
         self.halo_fraction = halo_fraction
+        self.candidate_limit = max(1, int(candidate_limit))
         self.messages = MessageSimulator()
+
+    def _rank_helpers(self, request, task, tile, ledger, work_fraction,
+                      input_fraction, output_fraction,
+                      excluded_helpers=frozenset()):
+        """Rank the compute layer using relaxed input/compute/output costs."""
+        header_bits = self.messages.header_bits
+        request_arrivals = _relaxed_arrivals(
+            request, ledger, task.source_sat, header_bits,
+            request.sim_time,
+        )
+        response_costs = _relaxed_reverse_costs(
+            request, ledger, header_bits, (task.source_sat,)
+        )
+        arrivals = _relaxed_arrivals(
+            request, ledger, task.source_sat,
+            tile.d_in_bits * input_fraction + header_bits,
+            request.sim_time,
+        )
+        ground_costs = _relaxed_ground_costs(
+            request, ledger,
+            tile.d_out_bits * output_fraction + header_bits,
+        )
+        ranked = []
+        work = tile.compute_ops * work_fraction
+        for helper, state in request.satellites.items():
+            if not state.available or helper in excluded_helpers:
+                continue
+            arrival = arrivals.get(helper)
+            ground_cost = ground_costs.get(helper)
+            request_arrival = request_arrivals.get(helper)
+            response_cost = response_costs.get(helper)
+            if (
+                arrival is None or ground_cost is None
+                or request_arrival is None or response_cost is None
+            ):
+                continue
+            # Include both halves of the split handshake in the compute-layer
+            # lower bound. Exact contact timing and contention remain the
+            # responsibility of _part_candidate.
+            arrival = max(
+                arrival, request_arrival + response_cost
+            )
+            compute_done = max(
+                arrival, ledger.compute_ready_at[helper]
+            ) + work / max(state.compute_rate, 1.0)
+            ranked.append((compute_done + ground_cost, helper))
+        ranked.sort()
+        return tuple(helper for _, helper in ranked)
 
     def _part_candidate(self, request, task, tile, ledger, work_fraction,
                         input_fraction, output_fraction,
-                        excluded_helpers=frozenset()):
+                        excluded_helpers=frozenset(), candidate_helpers=None):
         best = None
         source_state = request.satellites.get(task.source_sat)
         if source_state is None or not source_state.available:
@@ -191,7 +344,12 @@ class SECOAdapted:
         header_bits = self.messages.header_bits
         work = tile.compute_ops * work_fraction
 
-        for helper, hstate in request.satellites.items():
+        helpers = (
+            request.satellites
+            if candidate_helpers is None else candidate_helpers
+        )
+        for helper in helpers:
+            hstate = request.satellites[helper]
             if not hstate.available or helper in excluded_helpers:
                 continue
             trial = ledger.clone()
@@ -266,11 +424,23 @@ class SECOAdapted:
         work_fraction = input_fraction
         trial = ledger.clone()
         parts = []
+        # One fixed, handshake-aware compute-layer shortlist per split plan.
+        # Exact feasibility is deliberately bounded: a sparse contact graph
+        # must not turn a failed first batch back into an all-helper scan.
+        ranked = self._rank_helpers(
+            request, task, tile, trial, work_fraction,
+            input_fraction, output_fraction,
+        )
+        shortlist_size = max(self.candidate_limit, 2 * split_count)
+        shortlist = ranked[:shortlist_size]
         for _ in range(split_count):
+            excluded = frozenset(part.helper for part in parts)
+            candidates = tuple(
+                helper for helper in shortlist if helper not in excluded
+            )
             chosen = self._part_candidate(
                 request, task, tile, trial, work_fraction,
-                input_fraction, output_fraction,
-                frozenset(part.helper for part in parts),
+                input_fraction, output_fraction, excluded, candidates,
             )
             if chosen is None:
                 return None
@@ -351,6 +521,8 @@ class SECOAdapted:
                         "partitioned": q > 1,
                         "effective_replicas": 1.0,
                         "time_objective": plan.completion - request.sim_time,
+                        "planning_method": "layered_graph_shortlist",
+                        "candidate_limit": self.candidate_limit,
                         "helper_handshake": True,
                         "helper_request_kind": "split",
                         "state_observer": source,

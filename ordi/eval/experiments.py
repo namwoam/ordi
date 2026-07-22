@@ -73,7 +73,7 @@ SIM_ORBITS = 5
 REFERENCE_ORBIT_PERIOD_S = 5_670.0
 # Task arrivals stop here; execution continues until admitted deadlines drain.
 SIM_DURATION_S = SIM_ORBITS * REFERENCE_ORBIT_PERIOD_S
-EPOCH_LENGTH_S = 60.0
+EPOCH_LENGTH_S = 120.0
 N_EPOCHS = int(SIM_DURATION_S / EPOCH_LENGTH_S)
 T_SIM_START = 0.0
 
@@ -90,7 +90,7 @@ _EVALUATION_GS = [
 
 def _worker_count(n_jobs: int) -> int:
     """Bound process concurrency to avoid memory/CPU starvation in orbit builds."""
-    configured = int(os.environ.get("ORDI_MAX_WORKERS", "8"))
+    configured = int(os.environ.get("ORDI_MAX_WORKERS", "12"))
     return max(1, min(n_jobs, configured))
 
 
@@ -884,7 +884,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
 
     simulation_epochs = cfg.simulation_epochs or N_EPOCHS
     for epoch in range(simulation_epochs):
-        ep_start = T_SIM_START + epoch * EPOCH_LENGTH_S
+        ep_start = T_SIM_START + epoch * cfg.epoch_length
         if injector:
             injector.apply_epoch(epoch)
         # Overwrite satellite state from a real-telemetry trace (if driving the
@@ -1061,6 +1061,7 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         rm = compute_realized_metrics(
             res, tasks, reliability, cfg.alpha,
             n_trials=realized_trials, seed=realized_seed,
+            reliability_epoch_s=cfg.epoch_length,
         )
         m.realized_miss_ratio = rm.realized_miss_ratio
         m.realized_utility = rm.realized_utility
@@ -1071,6 +1072,13 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         m.soft_failure_miss_ratio = max(
             0.0, m.realized_miss_ratio - m.deadline_miss_ratio
         )
+    else:
+        # With post-hoc sampling disabled, the realized fields represent the
+        # observable operational outcome rather than an unreported zero.
+        m.realized_miss_ratio = m.deadline_miss_ratio
+        m.realized_utility = m.delivered_utility
+        m.realized_coverage = m.partial_coverage
+        m.realized_delivered_tiles_per_orbit = m.delivered_tiles_per_orbit
     return m
 
 
@@ -1310,7 +1318,9 @@ def _parallel_run_algorithm(args: Tuple) -> Tuple[str, List[EpochMetrics]]:
 
     m = _simulate_stateful(
         schedule_fn, tasks, sat_ids, local_states, cfg, injector,
-        reliability=local_rel, realized_seed=seed,
+        reliability=local_rel,
+        realized_trials=cfg.posthoc_reliability_trials,
+        realized_seed=seed,
         outcome_callback=getattr(sched, "observe_assignment_outcome", None),
         cancellation_callback=cancel_assignment,
     )
@@ -1567,13 +1577,12 @@ _E1_BUILD_KWARGS = dict(n_planes=3, sats_per_plane=12,
 _E1_FAULT_RATE = 0.02
 
 E1_METRIC_KEYS = [
-    "realized_miss_ratio",
+    "deadline_miss_ratio",
     "contact_miss_ratio",
     "compute_queue_miss_ratio",
     "policy_miss_ratio",
     "hard_fault_miss_ratio",
     "source_fault_miss_ratio",
-    "soft_failure_miss_ratio",
     "delivery_latency_p50_s",
     "delivery_latency_p95_s",
     "isl_traffic_bits_per_delivered_tile",
@@ -1591,8 +1600,8 @@ E1_METRIC_KEYS = [
     "state_age_p95_s",
 ]
 
-def run_E1(seed=0, n_seeds=8,
-           fault_rate=_E1_FAULT_RATE) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=8, fault_rate=_E1_FAULT_RATE,
+           evaluate_soft_failures=False) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -1609,8 +1618,9 @@ def run_E1(seed=0, n_seeds=8,
 
     E1 uses ten globally distributed ground stations and a 10° minimum
     elevation angle. Optical terminals form a fore/aft and adjacent-plane
-    four-neighbor mesh. E1 assumes clear-sky 99.5% ISL, 98%
-    downlink, and 99.9% node reliability for realized delivery trials.
+    four-neighbor mesh. Clear-sky 99.5% ISL, 98% downlink, and 99.9% node
+    reliability remain available to reliability-aware scheduling policies.
+    They are used for post-hoc delivery trials only when explicitly enabled.
 
     B1 (DirectDownlink) is an end-to-end ground-processing baseline: it waits
     for the source satellite to enter a GS contact, downlinks the raw tile, and
@@ -1627,8 +1637,11 @@ def run_E1(seed=0, n_seeds=8,
     task arrivals, deadline draws) and draws a deterministic random fault
     schedule shared by every policy in that seed. The default 0.02 per-epoch
     fault probability retains fault exposure without allowing robustness to
-    dominate the compute-placement comparison. E2 and E3 retain the stronger
-    fault-stress settings. The CSV reports across-seed mean and std.
+    dominate the compute-placement comparison. Post-hoc soft-failure sampling
+    is disabled by default because policies cannot observe or recover from
+    those samples; pass evaluate_soft_failures=True for supplemental risk
+    estimates. E2 and E3 retain the stronger fault-stress settings. The CSV
+    reports across-seed mean and std.
     """
     print(f"E1: Core performance (3×12 Walker at 475 km, 10 global GS, "
           f"3–8 GFLOP/s, 10° GS elevation, 10-request/orbit hotspots, "
@@ -1639,7 +1652,12 @@ def run_E1(seed=0, n_seeds=8,
     config_args = []
     for s in range(n_seeds):
         fault_specs = [("random_schedule", fault_rate, seed + s)]
-        jobs = [(f"{alg}#s{s}", alg, cls, fault_specs)
+        cfg_overrides = {
+            "posthoc_reliability_trials": (
+                500 if evaluate_soft_failures else 0
+            )
+        }
+        jobs = [(f"{alg}#s{s}", alg, cls, fault_specs, cfg_overrides)
                 for alg, cls in alg_classes]
         config_args.append((build_kwargs, jobs, seed + s))
 
@@ -1764,7 +1782,7 @@ def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     """
     Correlated orbital-plane outages probing replica-placement quality.
 
-    Sustained 40-epoch outages hit zero, one, or two adjacent planes. Outages
+    Sustained 40-minute outages hit zero, one, or two adjacent planes. Outages
     sample five orbital phases, while matched environment seeds vary orbital
     phasing, plane labels, task sources, and deadlines.
 
@@ -1783,7 +1801,7 @@ def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     # One 40-minute outage per arrival orbit, shifted through the orbit phase.
     # Epochs correspond approximately to +10, +25, +40, +55, and +70 minutes
     # within successive 94.5-minute orbits.
-    outage_starts = (10, 120, 229, 339, 448)
+    outage_starts = (5, 60, 115, 170, 224)
     scenarios = {
         "0plane": [()],
         "1plane": [(case % 3,) for case in range(len(outage_starts))],
@@ -1802,7 +1820,7 @@ def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
                 effective_planes = tuple((plane + s) % 3 for plane in planes)
                 spec = (
                     [] if not planes
-                    else [("plane_outage", start, 40, effective_planes)]
+                    else [("plane_outage", start, 20, effective_planes)]
                 )
                 for alg_name, cls in alg_classes:
                     position = (
