@@ -122,6 +122,44 @@ def test_seco_shortlist_filters_helpers_without_return_handshake():
     )
 
 
+def test_seco_prunes_optimistically_late_helpers_before_exact_search(
+        monkeypatch):
+    states = {
+        "src": _state("src", rate=1.0),
+        "helper": _state("helper", rate=1.0),
+    }
+    contacts = (
+        ContactWindow("src", "helper", 0, 20, 1e9, "isl"),
+        ContactWindow("helper", "src", 0, 20, 1e9, "isl"),
+        ContactWindow("helper", "ground", 0, 20, 1e9, "downlink"),
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", deadline=10.0,
+        tiles=[_tile(work=100.0)],
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts
+    )
+    scheduler = SECOAdapted(split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "src", states, generated_at=-60.0, delivered_at=0.0
+    )
+    exact_calls = 0
+    original = scheduler._part_candidate
+
+    def counted(*args, **kwargs):
+        nonlocal exact_calls
+        exact_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_part_candidate", counted)
+
+    result = scheduler.schedule(request)
+
+    assert result.assignments == ()
+    assert exact_calls == 0
+
+
 def test_partition_fractions_drive_physical_workload():
     # Use lightweight state doubles because this test targets workload
     # translation, not Basilisk state integration.

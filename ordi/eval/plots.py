@@ -36,7 +36,11 @@ ALG_LABELS = {
 }
 
 E1_PLOT_METRICS = (
-    ("deadline_miss_ratio", 1.0, "Deadline Miss Ratio (↓)"),
+    (
+        "deadline_miss_ratio",
+        1.0,
+        "Operational Deadline Miss Ratio (↓)",
+    ),
     (
         "delivery_latency_p95_s",
         60.0,
@@ -179,7 +183,7 @@ def plot_E1_miss_decomposition(rows=None):
         bottom += values
     ax.set_xticks(range(len(rows)))
     ax.set_xticklabels(labels, rotation=30, ha="right")
-    ax.set_ylabel("Deadline miss ratio")
+    ax.set_ylabel("Operational deadline miss ratio")
     ax.set_title("E1 Miss-Cause Decomposition")
     ax.set_ylim(0.0, max(0.5, float(max(bottom, default=0.0)) * 1.15))
     ax.grid(axis="y", alpha=0.25, linewidth=0.6)
@@ -198,7 +202,9 @@ def plot_E2():
     if not rows:
         print("No E2 data"); return
 
-    algs = ["ORDI", "seco_adapted", "full_replication"]
+    algs = [
+        "ORDI", "seco_adapted", "full_replication", "onboard_only",
+    ]
     fault_rates = sorted(set(
         float(r["algorithm"].split("fault=")[1]) for r in rows
         if "fault=" in r["algorithm"]
@@ -349,7 +355,9 @@ def plot_E4():
     if not rows:
         print("No E4 data"); return
 
-    algs = ["ORDI", "seco_adapted"]
+    algs = [
+        "ORDI", "seco_adapted", "full_replication", "onboard_only",
+    ]
     request_rates = sorted(set(
         int(r["algorithm"].split("requests=")[1])
         for r in rows if "requests=" in r["algorithm"]
@@ -397,7 +405,7 @@ def plot_E4():
     )
 
     titles = (
-        "Realized Deadline Miss Ratio (↓)",
+        "Operational Deadline Miss Ratio (↓)",
         "Delivered Tiles / Orbit (↑)",
         "P95 Scheduling Time / Epoch (s) (↓)",
         "Helper Utilization (↑)",

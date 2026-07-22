@@ -329,7 +329,14 @@ class SECOAdapted:
             ) + work / max(state.compute_rate, 1.0)
             ranked.append((compute_done + ground_cost, helper))
         ranked.sort()
-        return tuple(helper for _, helper in ranked)
+        # The layered estimate deliberately ignores terminal contention and
+        # downlink-window waiting, so it is an optimistic completion bound.
+        # If that bound already misses the deadline, exact route reservation
+        # cannot recover the helper and would only waste planning time.
+        return tuple(
+            helper for completion, helper in ranked
+            if completion <= task.deadline + 1e-9
+        )
 
     def _part_candidate(self, request, task, tile, ledger, work_fraction,
                         input_fraction, output_fraction,
@@ -433,6 +440,8 @@ class SECOAdapted:
         )
         shortlist_size = max(self.candidate_limit, 2 * split_count)
         shortlist = ranked[:shortlist_size]
+        if len(shortlist) < split_count:
+            return None
         for _ in range(split_count):
             excluded = frozenset(part.helper for part in parts)
             candidates = tuple(
@@ -501,6 +510,8 @@ class SECOAdapted:
             ))
 
             for task, tile in unscheduled:
+                if task.deadline <= request.sim_time + 1e-9:
+                    continue
                 plan = self._best_plan(local, task, tile, ledger)
                 if plan is None:
                     continue

@@ -120,7 +120,10 @@ def test_e2_changes_fault_rate_from_the_e1_setup(monkeypatch):
     build_kwargs, jobs, seed = configs[0]
     assert build_kwargs == _E1_BUILD_KWARGS
     assert seed == 7
-    assert signature(experiments.run_E2).parameters["n_seeds"].default == 8
+    assert signature(experiments.run_E2).parameters["n_seeds"].default == 4
+    assert {job[1] for job in jobs} == {
+        "ORDI", "seco_adapted", "full_replication", "onboard_only",
+    }
     assert {job[3][0][1] for job in jobs} == set(_E2_FAULT_RATES)
     assert _E1_FAULT_RATE in _E2_FAULT_RATES
 
@@ -142,7 +145,7 @@ def test_e4_changes_only_request_rate_from_the_e1_setup(monkeypatch):
     configs = _capture_experiment_configs(monkeypatch, experiments.run_E4)
 
     assert _E4_REQUEST_RATES == (20, 40, 60, 80)
-    assert signature(experiments.run_E4).parameters["n_seeds"].default == 8
+    assert signature(experiments.run_E4).parameters["n_seeds"].default == 4
     assert len(configs) == 4
     for build_kwargs, jobs, seed in configs:
         changed = {
@@ -153,6 +156,9 @@ def test_e4_changes_only_request_rate_from_the_e1_setup(monkeypatch):
         assert build_kwargs["n_planes"] == _E1_BUILD_KWARGS["n_planes"]
         assert build_kwargs["sats_per_plane"] == _E1_BUILD_KWARGS["sats_per_plane"]
         assert build_kwargs["arrival_rate"] in _E4_REQUEST_RATES
+        assert {job[1] for job in jobs} == {
+            "ORDI", "seco_adapted", "full_replication", "onboard_only",
+        }
         assert all(job[3] == [("random_schedule", _E1_FAULT_RATE, 7)]
                    for job in jobs)
         assert seed == 7

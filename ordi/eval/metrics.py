@@ -111,7 +111,6 @@ def compute_metrics(
             tile_lookup[(task.task_id, tile.tile_id)] = (task, tile)
 
     n_tiles = sum(len(t.tiles) for t in tasks)
-    n_miss = 0
     utility_sum = 0.0
     partial_coverages = []
     recovery_lats = []
@@ -120,7 +119,10 @@ def compute_metrics(
     helper_accepts = 0
 
     task_delivered: Dict[int, int] = {}
-    task_total: Dict[int, int] = {}
+    task_total: Dict[int, int] = {
+        task.task_id: len(task.tiles) for task in tasks
+    }
+    delivered_keys = set()
 
     for assignment in result.assignments:
         key = (assignment.task_id, assignment.tile_id)
@@ -130,17 +132,27 @@ def compute_metrics(
         m.energy_joules += max(0.0, float(
             assignment.metadata.get("ground_compute_energy_j", 0.0)
         ))
-        task_total[task_obj.task_id] = task_total.get(task_obj.task_id, 0) + 1
-
         reliability = float(assignment.metadata.get(
             "reliability", assignment.metadata.get("reconstruction_probability", 0.0)
         ))
-        latency = float(assignment.metadata.get("latency", math.inf))
+        service_latency = float(assignment.metadata.get("latency", math.inf))
+        delivery_time = float(assignment.metadata.get(
+            "delivery_time",
+            epoch_start + service_latency,
+        ))
+        release_time = float(getattr(task_obj, "release_time", epoch_start))
+        latency = max(0.0, delivery_time - release_time)
+        delivered_on_time = (
+            reliability > 0.0
+            and math.isfinite(delivery_time)
+            and delivery_time <= float(
+                getattr(task_obj, "deadline", math.inf)
+            ) + 1e-9
+        )
         if "max_state_age_s" in assignment.metadata:
             state_ages.append(float(assignment.metadata["max_state_age_s"]))
-        if reliability <= 0.0 or math.isinf(latency):
-            n_miss += 1
-        else:
+        if delivered_on_time and key not in delivered_keys:
+            delivered_keys.add(key)
             utility_sum += tile.utility * reliability * math.exp(
                 -alpha * latency
             )
@@ -207,7 +219,7 @@ def compute_metrics(
         # Normal inference schedulers downlink the compact result; direct and
         # compression baselines record their raw/compressed size explicitly.
         # Basilisk accounts for the corresponding transmitter power.
-        if reliability > 0.0 and not math.isinf(latency):
+        if reliability > 0.0 and math.isfinite(delivery_time):
             downlink_bits = float(assignment.metadata.get(
                 "protocol_ground_bits",
                 assignment.metadata.get(
@@ -222,6 +234,7 @@ def compute_metrics(
         delivered = task_delivered.get(tid, 0)
         partial_coverages.append(delivered / total if total > 0 else 0.0)
 
+    n_miss = n_tiles - len(delivered_keys)
     m.n_tiles_total = n_tiles
     m.n_tiles_feasible = n_tiles - n_miss
     m.n_requests_total = len(tasks)

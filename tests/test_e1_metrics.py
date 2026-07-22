@@ -75,6 +75,35 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
     assert metrics.state_age_p95_s == pytest.approx(14.5)
 
 
+def test_latency_is_release_to_delivery_and_late_or_missing_tiles_miss():
+    tiles = [SimpleNamespace(
+        tile_id=index, compute_ops=1_000.0, d_in_bits=100.0,
+        d_out_bits=20.0, utility=1.0,
+    ) for index in range(3)]
+    task = SimpleNamespace(
+        task_id=1, source_sat="src", release_time=100.0,
+        deadline=200.0, tiles=tiles,
+    )
+    assignments = (
+        Assignment(1, 0, "src", helpers=("h",), aggregators=("h",),
+                   metadata={"reliability": 1.0, "latency": 20.0,
+                             "delivery_time": 170.0}),
+        Assignment(1, 1, "src", helpers=("h",), aggregators=("h",),
+                   metadata={"reliability": 1.0, "latency": 10.0,
+                             "delivery_time": 210.0}),
+    )
+
+    metrics = compute_metrics(
+        Decision(1, assignments), [task], 160.0, {"h": 10_000.0},
+    )
+
+    assert metrics.deadline_miss_ratio == pytest.approx(2.0 / 3.0)
+    assert metrics.n_tiles_feasible == 1
+    assert metrics.partial_coverage == pytest.approx(1.0 / 3.0)
+    assert metrics.delivery_latency_p50_s == pytest.approx(70.0)
+    assert metrics.delivery_latency_p95_s == pytest.approx(70.0)
+
+
 def test_e1_exports_reliability_latency_cost_and_decentralization_metrics():
     required = {
         "deadline_miss_ratio", "delivery_latency_p95_s",

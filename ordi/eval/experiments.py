@@ -1675,7 +1675,7 @@ def run_E1(seed=0, n_seeds=8,
 _E2_FAULT_RATES = (0.0, _E1_FAULT_RATE, 0.10, 0.25, 0.50)
 
 
-def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E2(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
     """
     Fault intensity sweep averaging over BOTH randomness sources: each seed
     rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
@@ -1686,7 +1686,8 @@ def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     fault_rates = _E2_FAULT_RATES
     alg_classes = [("ORDI", ORDI),
                    ("seco_adapted", SECOAdapted),
-                   ("full_replication", FullReplication)]
+                   ("full_replication", FullReplication),
+                   ("onboard_only", OnboardOnly)]
 
     config_args = []
     for s in range(n_seeds):
@@ -1726,13 +1727,15 @@ def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 _E4_REQUEST_RATES = (20, 40, 60, 80)
 
 
-def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
+def run_E4(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
     print(f"E4: Request-load scalability sweep ({n_seeds} seeds)")
 
     # Keep E1's 3×12 constellation fixed and rebuild per (request rate, seed).
-    # The two algorithms share each build, including its tasks and fault draw.
+    # All algorithms share each build, including its tasks and fault draw.
     alg_classes = [("ORDI", ORDI),
-                   ("seco_adapted", SECOAdapted)]
+                   ("seco_adapted", SECOAdapted),
+                   ("full_replication", FullReplication),
+                   ("onboard_only", OnboardOnly)]
     config_args = []
     for request_rate in _E4_REQUEST_RATES:
         for s in range(n_seeds):
