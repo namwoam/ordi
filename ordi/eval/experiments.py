@@ -1394,10 +1394,13 @@ def _resolve_fault_specs(fault_specs, sat_ids, tasks,
 
 
 def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
-    """Worker for synthetic sweeps that rebuild the sim per configuration:
-    build the environment in-process, then run that config's algorithms
-    sequentially via _parallel_run_algorithm (sharing through _WORKER_SHARED).
-    Keeping build + jobs in one worker avoids shipping the big sim objects.
+    """Worker for one synthetic sweep's seed-algorithm pair.
+
+    The environment is built in-process, then that algorithm's scenario jobs
+    run sequentially via _parallel_run_algorithm (sharing through
+    _WORKER_SHARED). Keeping build + jobs in one worker avoids shipping the big
+    sim objects while allowing different algorithms for the same seed to run
+    concurrently.
 
     jobs: (key, alg_name, scheduler_class[, fault_specs[, cfg_overrides]]);
     see _resolve_fault_specs for the spec forms. cfg_overrides is an optional
@@ -1422,26 +1425,55 @@ def _build_and_run_config(args: Tuple) -> List[Tuple[str, List[EpochMetrics]]]:
     return out
 
 
+def _seed_algorithm_configs(config_args: List[Tuple]) -> List[Tuple]:
+    """Split configurations into independently schedulable algorithm groups.
+
+    A sweep can contain several scenario jobs for the same algorithm (for
+    example E2's fault rates). Those stay together so the worker builds that
+    seed's simulation only once. Different algorithms become distinct work
+    items and can therefore occupy different processes concurrently.
+    """
+    work_items = []
+    for build_kwargs, jobs, seed in config_args:
+        grouped_jobs = {}
+        for job in jobs:
+            grouped_jobs.setdefault(job[1], []).append(job)
+        work_items.extend(
+            (build_kwargs, algorithm_jobs, seed)
+            for algorithm_jobs in grouped_jobs.values()
+        )
+    return work_items
+
+
 def _run_configs_parallel(config_args: List[Tuple],
                           desc: str = "") -> Dict[str, List[EpochMetrics]]:
-    """Run _build_and_run_config over configurations concurrently.
-    config_args items: (build_kwargs, [(key, alg_name, scheduler_class)], seed)."""
+    """Run one worker per configuration-seed-algorithm group.
+
+    config_args items: (build_kwargs, [(key, alg_name, scheduler_class)], seed).
+    Multiple scenario jobs for one seed and algorithm remain in the same worker.
+    """
     try:
         from ordi.orbit._dijkstra_numba import warmup_jit
         warmup_jit()
     except ImportError:
         pass
 
+    work_items = _seed_algorithm_configs(config_args)
     results: Dict[str, List[EpochMetrics]] = {}
-    n = len(config_args)
+    n = len(work_items)
+    if not n:
+        return results
     if _worker_count(n) == 1:
-        for args in tqdm(config_args, desc=desc, unit="config"):
+        for args in tqdm(work_items, desc=desc, unit="seed-algorithm"):
             for key, metrics in _build_and_run_config(args):
                 results[key] = metrics
-        return results
+        return {job[0]: results[job[0]]
+                for (_bk, jobs, _seed) in config_args
+                for job in jobs}
     with ProcessPoolExecutor(max_workers=_worker_count(n)) as pool:
-        futures = [pool.submit(_build_and_run_config, args) for args in config_args]
-        for fut in tqdm(as_completed(futures), total=n, desc=desc, unit="config"):
+        futures = [pool.submit(_build_and_run_config, args) for args in work_items]
+        for fut in tqdm(as_completed(futures), total=n, desc=desc,
+                        unit="seed-algorithm"):
             for key, metrics in fut.result():
                 results[key] = metrics
     # Reorder finish-order results to submission order for stable CSV rows.

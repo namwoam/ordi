@@ -6,7 +6,8 @@ from ordi.eval.experiments import (
     _E1_BUILD_KWARGS, _E1_FAULT_RATE, _E2_FAULT_RATES,
     _E4_REQUEST_RATES, _EVALUATION_GS, SIM_DURATION_S, SIM_ORBITS,
     _four_neighbor_walker_pairs,
-    _intensify_one_area_burst, _intensify_repeated_area_bursts, run_E1,
+    _intensify_one_area_burst, _intensify_repeated_area_bursts,
+    _seed_algorithm_configs, run_E1,
 )
 from ordi.orbit.contacts import DEFAULT_GROUND_STATIONS
 from ordi.tasks.generator import generate_tasks
@@ -83,6 +84,33 @@ def _capture_experiment_configs(monkeypatch, runner):
     monkeypatch.setattr(experiments, "_save_csv", lambda *args, **kwargs: None)
     runner(seed=7, n_seeds=1)
     return captured
+
+
+def test_parallel_work_is_grouped_by_seed_and_algorithm():
+    build = {"arrival_rate": 20.0}
+    ordi = object()
+    seco = object()
+    configs = [
+        (build, [
+            ("ORDI@low#s0", "ORDI", ordi, ["low"]),
+            ("seco@low#s0", "seco", seco, ["low"]),
+            ("ORDI@high#s0", "ORDI", ordi, ["high"]),
+        ], 7),
+        (build, [
+            ("ORDI@low#s1", "ORDI", ordi, ["low"]),
+            ("seco@low#s1", "seco", seco, ["low"]),
+        ], 8),
+    ]
+
+    work_items = _seed_algorithm_configs(configs)
+
+    assert [(seed, [job[0] for job in jobs])
+            for _kwargs, jobs, seed in work_items] == [
+        (7, ["ORDI@low#s0", "ORDI@high#s0"]),
+        (7, ["seco@low#s0"]),
+        (8, ["ORDI@low#s1"]),
+        (8, ["seco@low#s1"]),
+    ]
 
 
 def test_e2_changes_fault_rate_from_the_e1_setup(monkeypatch):
