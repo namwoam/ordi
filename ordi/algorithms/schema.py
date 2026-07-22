@@ -61,9 +61,9 @@ class ExperimentConfig:
     # every internal boundary, so total input and compute grow with the split.
     seco_split_options: tuple[int, ...] = (1, 2, 4)
     split_halo_fraction: float = 0.05
-    # Post-hoc Monte Carlo reliability scoring. E1 overrides this to zero by
-    # default because its observable timeline faults already exercise recovery.
-    posthoc_reliability_trials: int = 500
+    # Post-hoc Monte Carlo scoring is an opt-in diagnostic, not an experiment
+    # outcome: policies cannot observe or recover from those sampled failures.
+    posthoc_reliability_trials: int = 0
     # Recurring non-ORDI accelerator demand. The physical queue receives this
     # fraction of one epoch's capacity before each scheduling round.
     background_compute_utilization: float = 0.0

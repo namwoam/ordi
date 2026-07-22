@@ -1,4 +1,5 @@
 from dataclasses import replace
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,8 @@ from ordi.algorithms import (
     ContactWindow, EpochInput, FullReplication, RandomReplication,
     SatelliteView, SECOAdapted,
 )
+from ordi.algorithms._common import Placement
+from ordi.algorithms.random_replication import _best_placements_by_helper
 
 
 def _request(epoch=0, sim_time=0.0, helper_available=True):
@@ -35,6 +38,52 @@ def _request(epoch=0, sim_time=0.0, helper_available=True):
         epoch, sim_time, [task], states, {},
         frozenset({"ground"}), contacts,
     )
+
+
+def _placement(helper, aggregator, latency, comm_bits=100.0,
+               reliability=0.99):
+    return Placement(
+        helper, aggregator, latency, reliability, comm_bits,
+        ("src", helper), (helper, aggregator), (aggregator, "ground"),
+    )
+
+
+def test_random_replication_normalizes_routes_before_sampling_helpers():
+    slow_first = _placement("h1", "a0", 8.0, comm_bits=50.0)
+    fast_later = _placement("h1", "a1", 3.0, comm_bits=100.0)
+    other = _placement("h2", "a2", 4.0)
+    third = _placement("h3", "a3", 5.0)
+
+    forward = _best_placements_by_helper(
+        (slow_first, third, other, fast_later)
+    )
+    reverse = _best_placements_by_helper(
+        (fast_later, other, third, slow_first)
+    )
+
+    assert tuple(item.helper for item in forward) == ("h1", "h2", "h3")
+    assert forward == reverse
+    assert forward[0] is fast_later
+    selected_forward = random.Random(7).sample(forward, 2)
+    selected_reverse = random.Random(7).sample(reverse, 2)
+    assert selected_forward == selected_reverse
+    assert len({item.helper for item in selected_forward}) == 2
+
+
+def test_random_replication_route_ties_use_communication_then_reliability():
+    high_traffic = _placement("h1", "a0", 3.0, comm_bits=200.0)
+    unreliable = _placement(
+        "h1", "a1", 3.0, comm_bits=100.0, reliability=0.8
+    )
+    reliable = _placement(
+        "h1", "a2", 3.0, comm_bits=100.0, reliability=0.95
+    )
+
+    selected, = _best_placements_by_helper(
+        (high_traffic, unreliable, reliable)
+    )
+
+    assert selected is reliable
 
 
 @pytest.mark.parametrize("policy_type", [FullReplication, RandomReplication])

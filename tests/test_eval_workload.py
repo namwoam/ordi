@@ -24,10 +24,6 @@ def test_evaluation_uses_six_geographically_distributed_stations():
 def test_evaluation_deadlines_and_request_rate_match_workload_design():
     assert signature(run_E1).parameters["n_seeds"].default == 8
     assert signature(run_E1).parameters["fault_rate"].default == 0.02
-    assert (
-        signature(run_E1).parameters["evaluate_soft_failures"].default
-        is False
-    )
     assert _E1_BUILD_KWARGS["n_planes"] == 3
     assert _E1_BUILD_KWARGS["sats_per_plane"] == 12
     assert _E1_BUILD_KWARGS["orbit_altitude_km"] == 475.0

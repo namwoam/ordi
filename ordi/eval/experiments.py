@@ -1496,7 +1496,6 @@ _CSV_METRIC_KEYS = [
     "deadline_miss_ratio", "delivered_utility", "partial_coverage",
     "recovery_latency", "isl_traffic_bits", "downlink_volume_bits",
     "energy_joules", "helper_utilization", "objective", "n_replicas_avg",
-    "realized_miss_ratio", "realized_utility", "realized_coverage",
 ]
 
 
@@ -1600,8 +1599,8 @@ E1_METRIC_KEYS = [
     "state_age_p95_s",
 ]
 
-def run_E1(seed=0, n_seeds=8, fault_rate=_E1_FAULT_RATE,
-           evaluate_soft_failures=False) -> Dict[str, List[EpochMetrics]]:
+def run_E1(seed=0, n_seeds=8,
+           fault_rate=_E1_FAULT_RATE) -> Dict[str, List[EpochMetrics]]:
     """
     Core performance comparison using the shared realistic LEO-EO setup.
 
@@ -1638,9 +1637,8 @@ def run_E1(seed=0, n_seeds=8, fault_rate=_E1_FAULT_RATE,
     schedule shared by every policy in that seed. The default 0.02 per-epoch
     fault probability retains fault exposure without allowing robustness to
     dominate the compute-placement comparison. Post-hoc soft-failure sampling
-    is disabled by default because policies cannot observe or recover from
-    those samples; pass evaluate_soft_failures=True for supplemental risk
-    estimates. E2 and E3 retain the stronger fault-stress settings. The CSV
+    is excluded because policies cannot observe or recover from those samples.
+    E2 and E3 retain the stronger injected-fault stress settings. The CSV
     reports across-seed mean and std.
     """
     print(f"E1: Core performance (3×12 Walker at 475 km, 10 global GS, "
@@ -1652,12 +1650,7 @@ def run_E1(seed=0, n_seeds=8, fault_rate=_E1_FAULT_RATE,
     config_args = []
     for s in range(n_seeds):
         fault_specs = [("random_schedule", fault_rate, seed + s)]
-        cfg_overrides = {
-            "posthoc_reliability_trials": (
-                500 if evaluate_soft_failures else 0
-            )
-        }
-        jobs = [(f"{alg}#s{s}", alg, cls, fault_specs, cfg_overrides)
+        jobs = [(f"{alg}#s{s}", alg, cls, fault_specs)
                 for alg, cls in alg_classes]
         config_args.append((build_kwargs, jobs, seed + s))
 
@@ -1719,8 +1712,8 @@ def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
     _save_csv("E2_fault_intensity", results,
               metric_keys=[
-                  "realized_miss_ratio", "hard_fault_miss_ratio",
-                  "source_fault_miss_ratio", "soft_failure_miss_ratio",
+                  "deadline_miss_ratio", "hard_fault_miss_ratio",
+                  "source_fault_miss_ratio",
                   "fault_event_count", "fault_target_minutes",
                   "isl_traffic_bits_per_delivered_tile",
                   "energy_j_per_delivered_tile", "n_replicas_avg",
@@ -1766,8 +1759,8 @@ def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
               metric_keys=[
                   "offered_requests_per_orbit",
                   "offered_tiles_per_orbit",
-                  "realized_delivered_tiles_per_orbit",
-                  "realized_miss_ratio", "scheduling_time_p95_s",
+                  "delivered_tiles_per_orbit",
+                  "deadline_miss_ratio", "scheduling_time_p95_s",
                   "scheduling_time_total_s", "helper_utilization",
                   "compute_load_balance",
                   "isl_traffic_bits_per_delivered_tile",
@@ -1857,10 +1850,9 @@ def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
 
     _save_csv("E3_correlated", results,
               metric_keys=[
-                  "realized_miss_ratio", "hard_fault_miss_ratio",
+                  "deadline_miss_ratio", "hard_fault_miss_ratio",
                   "source_fault_miss_ratio", "contact_miss_ratio",
                   "compute_queue_miss_ratio", "policy_miss_ratio",
-                  "soft_failure_miss_ratio",
                   "isl_traffic_bits_per_delivered_tile",
                   "energy_j_per_delivered_tile", "n_replicas_avg",
               ])

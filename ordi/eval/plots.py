@@ -120,7 +120,7 @@ def plot_E1():
         ax.set_xticks(range(len(algs)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
         ax.grid(axis="y", alpha=0.25, linewidth=0.6)
-        if metric in {"realized_miss_ratio", "compute_load_balance"}:
+        if metric in {"deadline_miss_ratio", "compute_load_balance"}:
             ax.set_ylim(0.0, 1.05)
         else:
             upper = max(
@@ -168,7 +168,7 @@ def plot_E1_miss_decomposition(rows=None):
         ("compute_queue_miss_ratio", "Compute queue", "#e9c46a"),
         ("policy_miss_ratio", "Policy/admission", "#2a9d8f"),
         ("hard_fault_miss_ratio", "Hard fault", "#e76f51"),
-        ("soft_failure_miss_ratio", "Soft failure", "#9b5de5"),
+        ("source_fault_miss_ratio", "Source fault", "#9b5de5"),
     )
     fig, ax = plt.subplots(figsize=(9, 4.8))
     bottom = np.zeros(len(rows))
@@ -208,7 +208,7 @@ def plot_E2():
     axes = axes.ravel()
     for alg in algs:
         series = {metric: [] for metric in (
-            "realized_miss_ratio", "hard_fault_miss_ratio",
+            "deadline_miss_ratio", "hard_fault_miss_ratio",
             "source_fault_miss_ratio",
             "isl_traffic_bits_per_delivered_tile",
             "energy_j_per_delivered_tile",
@@ -226,8 +226,8 @@ def plot_E2():
                      color=ALG_COLORS.get(alg, "#888"), marker="o", capsize=3,
                      linewidth=2.5 if alg == "ORDI" else 1.5)
         axes[0].errorbar(
-            fault_rates, series["realized_miss_ratio"],
-            yerr=errors["realized_miss_ratio"], **style,
+            fault_rates, series["deadline_miss_ratio"],
+            yerr=errors["deadline_miss_ratio"], **style,
         )
         fault_miss = [
             hard + source for hard, source in zip(
@@ -253,13 +253,13 @@ def plot_E2():
         )
 
     titles = (
-        "Realized Deadline Miss Ratio (↓)",
+        "Operational Deadline Miss Ratio (↓)",
         "Hard + Source-Fault Miss Ratio (↓)",
         "ISL Traffic / Delivered Tile (Mbit) (↓)",
         "Energy / Delivered Tile (J) (↓)",
     )
     for ax, title in zip(axes, titles):
-        ax.set_xlabel("Fault-event probability per minute")
+        ax.set_xlabel("Fault-event probability per 120 s epoch")
         ax.set_ylabel(title)
         ax.set_ylim(bottom=0)
         ax.grid(True, alpha=0.3)
@@ -285,7 +285,7 @@ def plot_E3():
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes = axes.ravel()
     metrics = (
-        ("realized_miss_ratio", 1.0, "Realized Deadline Miss Ratio (↓)"),
+        ("deadline_miss_ratio", 1.0, "Operational Deadline Miss Ratio (↓)"),
         ("hard_plus_source_fault", 1.0,
          "Hard + Source-Fault Miss Ratio (↓)"),
         ("isl_traffic_bits_per_delivered_tile", 1e6,
@@ -369,8 +369,8 @@ def plot_E4():
                      color=ALG_COLORS.get(alg, "#888"), linewidth=2,
                      marker="s", capsize=3)
         plot_metrics = (
-            ("realized_miss_ratio", 1.0),
-            ("realized_delivered_tiles_per_orbit", 1.0),
+            ("deadline_miss_ratio", 1.0),
+            ("delivered_tiles_per_orbit", 1.0),
             ("scheduling_time_p95_s", 1.0),
             ("helper_utilization", 1.0),
             ("isl_traffic_bits_per_delivered_tile", 1e6),

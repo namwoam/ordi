@@ -12,6 +12,30 @@ from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
 
 
+def _placement_rank(placement):
+    """Neutral deterministic route quality for one randomly chosen helper."""
+    return (
+        placement.latency,
+        placement.communication_bits,
+        -placement.reliability,
+        placement.aggregator,
+        tuple(placement.route_in),
+        tuple(placement.route_out),
+        tuple(placement.route_down),
+    )
+
+
+def _best_placements_by_helper(placements):
+    """Keep each helper's fastest placement and remove enumeration-order bias."""
+    best = {}
+    for placement in placements:
+        current = best.get(placement.helper)
+        if current is None or _placement_rank(placement) < _placement_rank(
+                current):
+            best[placement.helper] = placement
+    return tuple(best[helper] for helper in sorted(best))
+
+
 class RandomReplication:
     name = "random_replication"
 
@@ -26,10 +50,9 @@ class RandomReplication:
         for task in request.tasks:
             local = self.messages.local_view(request, task.source_sat)
             for tile in task.tiles:
-                per_helper = {}
-                for placement in enumerate_placements(local, task, tile):
-                    per_helper.setdefault(placement.helper, placement)
-                pool = list(per_helper.values())
+                pool = _best_placements_by_helper(
+                    enumerate_placements(local, task, tile)
+                )
                 count = min(tile.n_replicas_max, len(pool))
                 selected = rng.sample(pool, count)
                 if not selected:

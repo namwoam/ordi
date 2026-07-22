@@ -56,16 +56,16 @@ def test_e1_report_can_exclude_ordi_utility_fields(tmp_path, monkeypatch):
     experiments._save_csv(
         "E1_core",
         {"ORDI": [EpochMetrics(
-            epoch=0, realized_miss_ratio=0.2, isl_traffic_bits=100.0,
+            epoch=0, deadline_miss_ratio=0.2, isl_traffic_bits=100.0,
             delivered_utility=9.0, objective=8.0,
         )]},
-        metric_keys=["realized_miss_ratio", "isl_traffic_bits"],
+        metric_keys=["deadline_miss_ratio", "isl_traffic_bits"],
     )
 
     header = (tmp_path / "E1_core.csv").read_text().splitlines()[0]
     assert header.split(",") == [
-        "algorithm", "sample_count", "realized_miss_ratio", "isl_traffic_bits",
-        "realized_miss_ratio_std", "isl_traffic_bits_std",
+        "algorithm", "sample_count", "deadline_miss_ratio", "isl_traffic_bits",
+        "deadline_miss_ratio_std", "isl_traffic_bits_std",
     ]
     assert "utility" not in header
     assert "objective" not in header
