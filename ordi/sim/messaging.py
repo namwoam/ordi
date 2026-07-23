@@ -63,6 +63,7 @@ class MessageSimulator:
     max_hops: int = 12
     max_split_depth: int = 3
     advertisement_bits: float = 1024.0
+    advertisement_max_hops: int = 3
     contact_ready_at: dict[tuple, float] = field(default_factory=dict)
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
@@ -90,20 +91,30 @@ class MessageSimulator:
         for sat_id, state in satellites.items():
             directory[sat_id] = (state, generated_at, delivered_at)
 
+    def _install_advertisement(self, observer, sender, view, generated_at,
+                               delivered_at):
+        """Install an advertisement unless a newer sample is already known."""
+        directory = self.knowledge.setdefault(observer, {})
+        current = directory.get(sender)
+        if current is None or generated_at > current[1]:
+            directory[sender] = (view, generated_at, delivered_at)
+
     def prepare_epoch(self, request):
-        """Deliver old advertisements and broadcast current neighbor state.
+        """Deliver old advertisements and gossip current state over ISLs.
 
         Decisions made in this epoch can only use entries delivered before
         ``request.sim_time``. Newly transmitted advertisements become visible
-        in a later epoch after their contact-constrained arrival time.
+        in a later epoch after their contact-constrained arrival time. Each
+        epoch update is forwarded at most ``advertisement_max_hops`` times and
+        accepted once per origin/receiver pair.
         """
         events = []
         remaining = []
         for delivered_at, observer, sender, view, generated_at in (
                 self.pending_advertisements):
             if delivered_at <= request.sim_time + 1e-9:
-                self.knowledge.setdefault(observer, {})[sender] = (
-                    view, generated_at, delivered_at
+                self._install_advertisement(
+                    observer, sender, view, generated_at, delivered_at
                 )
             else:
                 remaining.append(
@@ -121,58 +132,92 @@ class MessageSimulator:
             for terminal, intervals in self.terminal_intervals.items()
         }
         counter = self._next_id
-        scheduled_pairs = set()
         message_count = 0
         control_bits = 0.0
         horizon = request.sim_time + request.epoch_length
-        for contact in sorted(request.contacts, key=lambda item: item.opens):
-            pair = (contact.source, contact.target)
-            if (pair in scheduled_pairs or contact.kind != "isl"
+        outgoing = {}
+        for contact in request.contacts:
+            if (contact.kind != "isl"
                     or contact.source not in request.satellites
                     or contact.target not in request.satellites
                     or contact.opens > horizon
                     or contact.closes < request.sim_time):
                 continue
-            state = request.satellites[contact.source]
+            outgoing.setdefault(contact.source, set()).add(contact.target)
+
+        # Entries represent an advertisement becoming available at a node:
+        # (arrival time, sequence, origin, holder, previous holder, hop count).
+        frontier = []
+        sequence = 0
+        states = {}
+        for origin in sorted(request.satellites):
+            state = request.satellites[origin]
             if not state.available:
                 continue
-            try:
-                depart, finish = self._reserve_hop(
-                    request, ready, residual, terminal_intervals,
-                    contact.source, contact.target,
-                    self.advertisement_bits, request.sim_time,
-                )
-            except InvalidDecisionError:
+            states[origin] = state
+            heapq.heappush(
+                frontier,
+                (request.sim_time, sequence, origin, origin, "", 0),
+            )
+            sequence += 1
+
+        accepted = set()
+        while frontier:
+            available_at, _, origin, holder, previous, hop_count = (
+                heapq.heappop(frontier)
+            )
+            accepted_key = (origin, holder)
+            if accepted_key in accepted:
                 continue
-            message_id, counter = self._message_id(counter)
-            item = WorkItem(
-                -1, -1, contact.target, contact.source, depth=0
-            )
-            message = ProtocolMessage(
-                message_id, "state_advertisement", contact.source,
-                contact.target, item, self.advertisement_bits, 0, 0,
-                0, self.max_hops,
-                f"state:{request.epoch}:{contact.source}:{contact.target}",
-            )
-            self._record(
-                events, depart, "hop_sent", message,
-                contact.source, contact.target,
-            )
-            self._record(
-                events, finish, "hop_received", message,
-                contact.target, contact.source,
-            )
-            self._record(
-                events, finish, "delivered", message,
-                contact.target, contact.source,
-            )
-            self.pending_advertisements.append((
-                finish, contact.target, contact.source, state,
-                request.sim_time,
-            ))
-            scheduled_pairs.add(pair)
-            message_count += 1
-            control_bits += self.advertisement_bits
+            accepted.add(accepted_key)
+            if holder != origin:
+                self.pending_advertisements.append((
+                    available_at, holder, origin, states[origin],
+                    request.sim_time,
+                ))
+            if hop_count >= self.advertisement_max_hops:
+                continue
+
+            for target in sorted(outgoing.get(holder, ())):
+                if target == previous or (origin, target) in accepted:
+                    continue
+                try:
+                    depart, finish = self._reserve_hop(
+                        request, ready, residual, terminal_intervals,
+                        holder, target, self.advertisement_bits, available_at,
+                        contact_kind="isl", finish_by=horizon,
+                    )
+                except InvalidDecisionError:
+                    continue
+                message_id, counter = self._message_id(counter)
+                item = WorkItem(
+                    -1, -1, target, holder, depth=hop_count
+                )
+                message = ProtocolMessage(
+                    message_id, "state_advertisement", holder,
+                    target, item, self.advertisement_bits, 0, 0,
+                    hop_count + 1, self.advertisement_max_hops,
+                    f"state:{request.epoch}:{origin}",
+                )
+                self._record(
+                    events, depart, "hop_sent", message, holder, target,
+                )
+                self._record(
+                    events, finish, "hop_received", message, target, holder,
+                )
+                self._record(
+                    events, finish, "delivered", message, target, holder,
+                )
+                heapq.heappush(
+                    frontier,
+                    (
+                        finish, sequence, origin, target, holder,
+                        hop_count + 1,
+                    ),
+                )
+                sequence += 1
+                message_count += 1
+                control_bits += self.advertisement_bits
 
         self.contact_ready_at = ready
         self.contact_residual_bits = residual
@@ -215,10 +260,13 @@ class MessageSimulator:
 
     @staticmethod
     def _reserve_hop(request, ready, residual, terminal_intervals,
-                     source, target, bits, start):
+                     source, target, bits, start, contact_kind=None,
+                     finish_by=None):
         candidates = sorted(
             (contact for contact in request.contacts
-             if contact.source == source and contact.target == target),
+             if contact.source == source and contact.target == target
+             and (contact_kind is None or contact.kind == contact_kind)
+             and (finish_by is None or contact.opens <= finish_by)),
             key=lambda contact: contact.opens,
         )
         for contact in candidates:
@@ -237,7 +285,10 @@ class MessageSimulator:
             depart = _terminal_slot(
                 terminal_intervals, terminals,
                 max(start, contact.opens, ready.get(key, contact.opens)),
-                duration, contact.closes,
+                duration, min(
+                    contact.closes,
+                    finish_by if finish_by is not None else contact.closes,
+                ),
             )
             if depart is None:
                 continue

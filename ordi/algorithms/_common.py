@@ -43,6 +43,8 @@ def plane(sat_id):
     parts=sat_id.split("_"); return parts[1] if len(parts)>2 else sat_id
 
 _CONTACT_INDEX_CACHE={}
+_CONTACT_RELIABILITY_CACHE={}
+_ROUTE_CACHE={}
 
 def _contacts_by_source(contacts):
     """Index one immutable epoch contact set once without re-hashing it."""
@@ -59,32 +61,97 @@ def _contacts_by_source(contacts):
     _CONTACT_INDEX_CACHE[key]=(contacts,result)
     return result
 
+
+def _contact_reliabilities(contacts):
+    """Index maximum reliability by directed edge and contact class."""
+    key = id(contacts)
+    cached = _CONTACT_RELIABILITY_CACHE.get(key)
+    if cached is not None and cached[0] is contacts:
+        return cached[1]
+    indexed = {}
+    for contact in contacts:
+        edge = (contact.source, contact.target, contact.kind)
+        indexed[edge] = max(
+            indexed.get(edge, 0.0), contact.reliability
+        )
+    if len(_CONTACT_RELIABILITY_CACHE) >= 128:
+        _CONTACT_RELIABILITY_CACHE.clear()
+    _CONTACT_RELIABILITY_CACHE[key] = (contacts, indexed)
+    return indexed
+
+
 def deadline_expired(request, task):
     """Whether no on-time delivery remains possible for a task."""
     return task.deadline <= request.sim_time + 1e-9
 
 
-def earliest_route(request, source, targets, bits, start=None, latest=None):
-    targets=set(targets)
-    if source in targets: return Route(start or request.sim_time,1.0,(source,),bits)
-    start=request.sim_time if start is None else start
-    contacts_by_source=_contacts_by_source(tuple(request.contacts))
-    best={source:start}; rel={source:1.0}; paths={source:(source,)}
-    queue=[(start,source)]
+def _route_search(request, source, targets, bits, start, latest,
+                  stop_after_first):
+    """Run one temporal Dijkstra search for one or every requested target."""
+    contacts = tuple(request.contacts)
+    targets = frozenset(targets)
+    if not targets:
+        return {}
+    start = request.sim_time if start is None else start
+    cache_key = (
+        id(contacts), source, targets, float(bits), float(start),
+        None if latest is None else float(latest), stop_after_first,
+    )
+    cached = _ROUTE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is contacts:
+        return dict(cached[1])
+
+    contacts_by_source = _contacts_by_source(contacts)
+    best = {source: start}
+    rel = {source: 1.0}
+    paths = {source: (source,)}
+    queue = [(start, source)]
+    remaining = set(targets)
+    routes = {}
     while queue:
-        now,node=heapq.heappop(queue)
-        if now!=best[node]: continue
-        if latest is not None and now > latest + 1e-9: continue
-        if node in targets: return Route(now,rel[node],paths[node],bits)
-        for c in contacts_by_source.get(node,()):
-            if c.closes<now: continue
-            depart=max(now,c.opens); finish=depart+bits/max(c.rate_bps,1.0)
-            if finish>c.closes: continue
-            if latest is not None and finish > latest + 1e-9: continue
-            if finish<best.get(c.target,math.inf):
-                best[c.target]=finish; rel[c.target]=rel[node]*c.reliability
-                paths[c.target]=paths[node]+(c.target,); heapq.heappush(queue,(finish,c.target))
-    return None
+        now, node = heapq.heappop(queue)
+        if now != best[node]:
+            continue
+        if latest is not None and now > latest + 1e-9:
+            continue
+        if node in remaining:
+            routes[node] = Route(now, rel[node], paths[node], bits)
+            remaining.remove(node)
+            if stop_after_first or not remaining:
+                break
+        for contact in contacts_by_source.get(node, ()):
+            if contact.closes < now:
+                continue
+            depart = max(now, contact.opens)
+            finish = depart + bits / max(contact.rate_bps, 1.0)
+            if finish > contact.closes:
+                continue
+            if latest is not None and finish > latest + 1e-9:
+                continue
+            if finish < best.get(contact.target, math.inf):
+                best[contact.target] = finish
+                rel[contact.target] = rel[node] * contact.reliability
+                paths[contact.target] = paths[node] + (contact.target,)
+                heapq.heappush(queue, (finish, contact.target))
+
+    if len(_ROUTE_CACHE) >= 512:
+        _ROUTE_CACHE.clear()
+    _ROUTE_CACHE[cache_key] = (contacts, routes)
+    return dict(routes)
+
+
+def earliest_routes(request, source, targets, bits, start=None, latest=None):
+    """Return earliest-arrival routes to every reachable requested target."""
+    return _route_search(
+        request, source, targets, bits, start, latest, False
+    )
+
+
+def earliest_route(request, source, targets, bits, start=None, latest=None):
+    routes = _route_search(
+        request, source, targets, bits, start, latest, True
+    )
+    return next(iter(routes.values()), None)
 
 def earliest_downlink(request, source, bits, start=None, latest=None):
     return earliest_route(
@@ -111,19 +178,24 @@ def enumerate_placements(request, task, tile, allow_source=True,
                          work_fraction=1.0, input_fraction=1.0,
                          output_fraction=1.0,
                          protocol_header_bits=0.0):
-    deadline=task.deadline; out=[]
+    deadline = task.deadline
+    out = []
     if deadline_expired(request, task):
         return out
-    source_state=request.satellites.get(task.source_sat)
+    source_state = request.satellites.get(task.source_sat)
     if source_state is None or not source_state.available:
         return out
-    for helper,hstate in request.satellites.items():
-        if not hstate.available or (not allow_source and helper==task.source_sat): continue
-        input_bits=tile.d_in_bits*input_fraction
-        output_bits=tile.d_out_bits*output_fraction
-        input_transfer_bits=input_bits+protocol_header_bits
-        output_transfer_bits=output_bits+protocol_header_bits
-        work=tile.compute_ops*work_fraction
+
+    input_bits = tile.d_in_bits * input_fraction
+    output_bits = tile.d_out_bits * output_fraction
+    input_transfer_bits = input_bits + protocol_header_bits
+    output_transfer_bits = output_bits + protocol_header_bits
+    work = tile.compute_ops * work_fraction
+    helpers = []
+    for helper, hstate in request.satellites.items():
+        if (not hstate.available
+                or (not allow_source and helper == task.source_sat)):
+            continue
         optimistic_compute_done = (
             request.sim_time
             + (hstate.queued_flops + work)
@@ -131,33 +203,52 @@ def enumerate_placements(request, task, tile, allow_source=True,
         )
         if optimistic_compute_done > deadline + 1e-9:
             continue
-        route_in=earliest_route(
-            request, task.source_sat, {helper}, input_transfer_bits,
-            latest=deadline,
-        )
-        if route_in is None: continue
-        compute_start=route_in.arrival
-        compute_time=(hstate.queued_flops+work)/max(hstate.compute_rate,1.0)
-        compute_done=compute_start+compute_time
+        helpers.append((helper, hstate))
+
+    if not helpers:
+        return out
+    aggregators = [
+        agg for agg, state in request.satellites.items()
+        if state.available
+    ]
+    input_routes = earliest_routes(
+        request, task.source_sat,
+        {helper for helper, _state in helpers},
+        input_transfer_bits, latest=deadline,
+    )
+
+    for helper, hstate in helpers:
+        route_in = input_routes.get(helper)
+        if route_in is None:
+            continue
+        compute_start = route_in.arrival
+        compute_time = (
+            hstate.queued_flops + work
+        ) / max(hstate.compute_rate, 1.0)
+        compute_done = compute_start + compute_time
         if compute_done > deadline + 1e-9:
             continue
-        for agg,astate in request.satellites.items():
-            if not astate.available: continue
-            route_out=earliest_route(
-                request, helper, {agg}, output_transfer_bits, compute_done,
-                deadline,
-            )
-            if route_out is None: continue
-            down=earliest_downlink(
+        output_routes = earliest_routes(
+            request, helper, aggregators, output_transfer_bits,
+            compute_done, deadline,
+        )
+        for agg in aggregators:
+            route_out = output_routes.get(agg)
+            if route_out is None:
+                continue
+            down = earliest_downlink(
                 request, agg, output_transfer_bits, route_out.arrival,
                 deadline,
             )
-            if down is None or down.arrival>deadline: continue
-            isl_bits=(input_transfer_bits*max(len(route_in.path)-1,0)
-                      + output_transfer_bits*max(len(route_out.path)-1,0))
-            comm_bits=(
+            if down is None or down.arrival > deadline:
+                continue
+            isl_bits = (
+                input_transfer_bits * max(len(route_in.path) - 1, 0)
+                + output_transfer_bits * max(len(route_out.path) - 1, 0)
+            )
+            comm_bits = (
                 isl_bits
-                + output_transfer_bits*max(len(down.path)-1,0)
+                + output_transfer_bits * max(len(down.path) - 1, 0)
             )
             placement = Placement(
                 helper, agg, down.arrival-request.sim_time, 0.0,
@@ -178,12 +269,8 @@ def enumerate_placements(request, task, tile, allow_source=True,
 
 def _edge_reliability(request, source, target, kind):
     """Reliability of the contact class used by a selected route edge."""
-    values = [
-        contact.reliability for contact in request.contacts
-        if contact.source == source and contact.target == target
-        and contact.kind == kind
-    ]
-    return max(values, default=1.0)
+    reliabilities = _contact_reliabilities(tuple(request.contacts))
+    return reliabilities.get((source, target, kind), 1.0)
 
 
 def placement_components(request, task, placement):

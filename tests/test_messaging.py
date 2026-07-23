@@ -189,6 +189,96 @@ def test_state_advertisements_are_delayed_and_then_used_locally():
     )
 
 
+def test_state_advertisements_propagate_over_two_isl_hops():
+    states = {
+        name: SatelliteView(
+            name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            reliability=0.99,
+        )
+        for name in ("src", "relay", "remote")
+    }
+    contacts = (
+        ContactWindow("src", "relay", 0.0, 1.0, 1_000_000.0, "isl"),
+        ContactWindow("relay", "remote", 0.0, 1.0, 1_000_000.0, "isl"),
+    )
+    request = EpochInput(
+        0, 0.0, [], states, {}, frozenset(), contacts, epoch_length=1.0
+    )
+    simulator = MessageSimulator(
+        advertisement_bits=1_000.0, advertisement_max_hops=2
+    )
+
+    batch = simulator.prepare_epoch(request)
+    later = replace(request, epoch=1, sim_time=1.0)
+    simulator.prepare_epoch(later)
+
+    remote_view = simulator.local_view(later, "remote")
+    assert set(remote_view.satellites) == {"src", "relay", "remote"}
+    assert remote_view.state_age_s["src"] == pytest.approx(1.0)
+    assert batch.message_count == 3
+    assert batch.control_bits == pytest.approx(3_000.0)
+    assert sum(
+        event.event == "hop_sent" for event in batch.events
+    ) == batch.message_count
+
+
+def test_state_advertisement_hop_limit_excludes_more_distant_state():
+    states = {
+        name: SatelliteView(
+            name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            reliability=0.99,
+        )
+        for name in ("src", "relay", "remote")
+    }
+    contacts = (
+        ContactWindow("src", "relay", 0.0, 1.0, 1_000_000.0, "isl"),
+        ContactWindow("relay", "remote", 0.0, 1.0, 1_000_000.0, "isl"),
+    )
+    request = EpochInput(
+        0, 0.0, [], states, {}, frozenset(), contacts, epoch_length=1.0
+    )
+    simulator = MessageSimulator(
+        advertisement_bits=1_000.0, advertisement_max_hops=1
+    )
+
+    simulator.prepare_epoch(request)
+    later = replace(request, epoch=1, sim_time=1.0)
+    simulator.prepare_epoch(later)
+
+    remote_view = simulator.local_view(later, "remote")
+    assert set(remote_view.satellites) == {"relay", "remote"}
+
+
+def test_duplicate_advertisement_paths_are_accepted_once():
+    states = {
+        name: SatelliteView(
+            name, True, 1_000.0, 9_000.0, 10_000.0, 25.0, 0.0,
+            reliability=0.99,
+        )
+        for name in ("src", "left", "right", "dst")
+    }
+    contacts = (
+        ContactWindow("src", "left", 0.0, 1.0, 1_000_000.0, "isl"),
+        ContactWindow("src", "right", 0.0, 1.0, 1_000_000.0, "isl"),
+        ContactWindow("left", "dst", 0.0, 1.0, 1_000_000.0, "isl"),
+        ContactWindow("right", "dst", 0.0, 1.0, 1_000_000.0, "isl"),
+    )
+    request = EpochInput(
+        0, 0.0, [], states, {}, frozenset(), contacts, epoch_length=1.0
+    )
+    simulator = MessageSimulator(
+        advertisement_bits=1_000.0, advertisement_max_hops=2
+    )
+
+    simulator.prepare_epoch(request)
+
+    accepted = [
+        pending for pending in simulator.pending_advertisements
+        if pending[1] == "dst" and pending[2] == "src"
+    ]
+    assert len(accepted) == 1
+
+
 def test_local_view_preserves_contacts_through_unknown_relays():
     states = {
         name: SatelliteView(
