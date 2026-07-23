@@ -1143,14 +1143,21 @@ def _validate_feasible_subset(feasibility, request, decision):
     State advertisements are reserved once for the epoch. Each science
     assignment is then transactional: an invalid tile is dropped without
     rolling back earlier feasible tiles or aborting the complete experiment.
+    A saturated link can make even the advertisement reservation infeasible;
+    that epoch's advertisements are then dropped the same way, rather than
+    aborting the run, since ``validate_and_reserve`` only commits its trial
+    ledger back to ``self`` on success.
     """
-    feasibility.validate_and_reserve(
-        request,
-        Decision(
-            decision.epoch, (),
-            decision.metadata, decision.message_events,
-        ),
-    )
+    try:
+        feasibility.validate_and_reserve(
+            request,
+            Decision(
+                decision.epoch, (),
+                decision.metadata, decision.message_events,
+            ),
+        )
+    except InvalidDecisionError:
+        pass
     accepted = []
     for assignment in decision.assignments:
         try:
