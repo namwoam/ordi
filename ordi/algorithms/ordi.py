@@ -450,7 +450,6 @@ class ORDI:
 
     def schedule(self, request):
         assignments = []
-        advertisements = self.messages.prepare_epoch(request)
         for task in request.tasks:
             if deadline_expired(request, task):
                 continue
@@ -597,13 +596,9 @@ class ORDI:
         return Decision(
             request.epoch, tuple(assignments),
             metadata={
-                "protocol_message_count": advertisements.message_count,
-                "protocol_control_bits": advertisements.control_bits,
-                "advertisement_control_bits": advertisements.control_bits,
                 "waiting_tiles": len(self.waiting),
                 "retry_attempts": sum(
                     retry.attempts for retry in self.waiting.values()
                 ),
             },
-            message_events=advertisements.events,
         )

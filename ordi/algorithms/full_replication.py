@@ -4,8 +4,7 @@ from dataclasses import replace
 
 from .schema import Assignment, Decision
 from ._common import (
-    advertisement_metadata, deadline_expired, enumerate_placements, protocol_trace,
-    tile_success,
+    deadline_expired, enumerate_placements, protocol_trace, tile_success,
 )
 from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
@@ -18,7 +17,6 @@ class FullReplication:
         self.messages = MessageSimulator()
 
     def schedule(self, request):
-        advertisements = self.messages.prepare_epoch(request)
         assignments = []
         for task in request.tasks:
             if deadline_expired(request, task):
@@ -111,8 +109,4 @@ class FullReplication:
                     assignment, metadata=metadata,
                     message_events=execution.events,
                 ))
-        return Decision(
-            request.epoch, tuple(assignments),
-            advertisement_metadata(advertisements),
-            advertisements.events,
-        )
+        return Decision(request.epoch, tuple(assignments))

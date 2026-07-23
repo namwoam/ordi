@@ -228,23 +228,6 @@ class DecisionFeasibilityModel:
             for task in request.tasks for tile in task.tiles
         }
 
-        # State advertisements are physical ISL messages even when an epoch
-        # has no science assignment. Reserve them before policy work so every
-        # algorithm sees identical residual contact capacity.
-        reserved_advertisements = set()
-        for event in decision.message_events:
-            reservation_key = (
-                event.message_id, event.node, event.peer, event.time
-            )
-            if (event.kind != "state_advertisement"
-                    or event.event != "hop_sent"
-                    or reservation_key in reserved_advertisements):
-                continue
-            trial._reserve_hop(
-                request, event.node, event.peer, event.bits, event.time
-            )
-            reserved_advertisements.add(reservation_key)
-
         for assignment in decision.assignments:
             key = (assignment.task_id, assignment.tile_id)
             task = task_by_id.get(assignment.task_id)

@@ -88,8 +88,7 @@ class EpochInput:
     contacts: Sequence[ContactWindow] = ()
     epoch_length: float = 60.0
     weights: PolicyWeights = PolicyWeights()
-    # Populated for a node-local policy view. Missing entries mean that the
-    # observer has never received a state advertisement from that satellite.
+    # Current constellation state is shared; ages are therefore normally zero.
     state_age_s: Mapping[str, float] = field(default_factory=dict)
     observer: str | None = None
 

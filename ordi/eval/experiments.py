@@ -740,20 +740,6 @@ def _advance_synthetic_states(assignments, tasks, states, epoch_length_s,
                 if event.peer in rx_bits:
                     rx_bits[event.peer] += event.bits
 
-    # Resource advertisements occur even in epochs without science work.
-    for event in protocol_events:
-        if (event.kind == "state_advertisement"
-                and event.event == "hop_sent"):
-            if event.node in isl_tx_bits:
-                isl_tx_bits[event.node] += event.bits
-            if event.peer in rx_bits:
-                rx_bits[event.peer] += event.bits
-            from ordi.orbit._contact_types import ISL_RATE_BPS
-            add_interval(
-                event.node, event.peer, event.time,
-                event.time + event.bits / max(ISL_RATE_BPS, 1.0),
-            )
-
     # Physical evolution is deliberately delegated to Basilisk/BSK-RL.  Keep
     # this function as a workload translator for callers that own a backend.
     from ordi.sim.basilisk_backend import Workload
@@ -872,7 +858,6 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
     fault_impacted = set()
     rejection_causes = {}
     protocol_message_count = 0.0
-    protocol_control_bits = 0.0
     abandoned_costs = {
         "isl_traffic_bits": 0.0,
         "downlink_volume_bits": 0.0,
@@ -961,9 +946,6 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         protocol_message_count += float(
             result.metadata.get("protocol_message_count", 0.0)
         )
-        protocol_control_bits += float(
-            result.metadata.get("advertisement_control_bits", 0.0)
-        )
         newly_committed = []
         for a in result.assignments:
             reliability_estimate = float(a.metadata.get(
@@ -1006,7 +988,6 @@ def _simulate_stateful(schedule_fn, tasks, sat_ids, states, cfg, injector=None,
         simulation_epochs - 1, tuple(final),
         metadata={
             "protocol_message_count": protocol_message_count,
-            "advertisement_control_bits": protocol_control_bits,
             "abandoned_costs": abandoned_costs,
         },
     )
@@ -1109,8 +1090,8 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
     # A policy cannot use a contact after every pending task has expired. The
     # old all-horizon projection made each route lookup scan the remaining
     # remaining multi-orbit graph, even for tasks due within a few minutes.
-    # Always expose the current epoch's contacts so decentralized policies can
-    # exchange state advertisements even when no science task is pending.
+    # Always expose current-epoch contacts, even when no science task is
+    # pending, so future routing opportunities remain represented.
     latest_deadline = max(
         (task.deadline for task in tasks),
         default=T_SIM_START + (ep + 1) * cfg.epoch_length,
@@ -1139,9 +1120,8 @@ def _epoch_input(ep, tasks, sat_ids, states, reliability, graphs, gs_names, cfg)
 def _validate_feasible_subset(feasibility, request, decision):
     """Admit policy assignments independently through the model ledger.
 
-    State advertisements are reserved once for the epoch. Each science
-    assignment is then transactional: an invalid tile is dropped without
-    rolling back earlier feasible tiles or aborting the complete experiment.
+    Each science assignment is transactional: an invalid tile is dropped
+    without rolling back earlier feasible tiles or aborting the experiment.
     """
     feasibility.validate_and_reserve(
         request,
