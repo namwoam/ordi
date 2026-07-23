@@ -66,6 +66,7 @@ from ordi.eval.metrics import (
     compute_metrics, compute_realized_metrics, aggregate_metrics, EpochMetrics,
 )
 from ordi.eval.validation import DecisionFeasibilityModel, InvalidDecisionError
+from ordi.eval.stats import compare_all, save_comparison_csv
 from ordi.algorithms._common import earliest_route
 
 RESULTS_DIR = "results"
@@ -1522,6 +1523,39 @@ def _save_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
     print(f"  Saved: {path}")
 
 
+def _save_raw_csv(exp_id: str, results: Dict[str, List[EpochMetrics]],
+                  metric_keys: Optional[List[str]] = None):
+    """Write one row per individual run, preserving seed order for pairing.
+
+    Every ``run_E*`` collapse builds each algorithm's list with the same
+    seed-ordered loop, so row i is seed-matched across algorithms sharing a
+    condition. This raw table is what makes paired tests, bootstrap CIs, and
+    per-seed scatter/CDF plots possible (see ``ordi.eval.stats``); the
+    aggregate CSV from ``_save_csv`` only keeps mean/std and cannot support
+    them.
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"{exp_id}_raw.csv")
+    keys = _CSV_METRIC_KEYS if metric_keys is None else metric_keys
+    fields = ["algorithm", "condition", "run_index"] + list(keys)
+    rows = []
+    for alg_key, metrics in results.items():
+        alg_name, _, condition = alg_key.partition("@")
+        for index, m in enumerate(metrics):
+            row = {"algorithm": alg_name, "condition": condition,
+                   "run_index": index}
+            row.update({key: getattr(m, key, "") for key in keys})
+            rows.append(row)
+    if not rows:
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields,
+                                extrasaction="ignore", restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Saved: {path}")
+
+
 # ── E1: Core performance (ORDI vs all baselines) ─────────────────────────────
 
 # The composed reference scenario uses PlanetScope-class acquisitions on a
@@ -1667,6 +1701,10 @@ def run_E1(seed=0, n_seeds=8,
     # delivery reliability and network cost in the core comparison.
     _save_csv("E1_core", results,
               metric_keys=E1_METRIC_KEYS)
+    _save_raw_csv("E1_core", results, metric_keys=E1_METRIC_KEYS)
+    save_comparison_csv(
+        "E1_core_stats", compare_all(results, E1_METRIC_KEYS)
+    )
     return results
 
 
@@ -1675,7 +1713,7 @@ def run_E1(seed=0, n_seeds=8,
 _E2_FAULT_RATES = (0.0, _E1_FAULT_RATE, 0.10, 0.25, 0.50)
 
 
-def run_E2(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
+def run_E2(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     """
     Fault intensity sweep averaging over BOTH randomness sources: each seed
     rebuilds the environment (orbits, tasks, deadlines) AND draws a fresh
@@ -1711,14 +1749,18 @@ def run_E2(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
                 for m in raw[f"{alg_name}@fault={rate:.2f}#s{s}"]
             ]
 
-    _save_csv("E2_fault_intensity", results,
-              metric_keys=[
-                  "deadline_miss_ratio", "hard_fault_miss_ratio",
-                  "source_fault_miss_ratio",
-                  "fault_event_count", "fault_target_minutes",
-                  "isl_traffic_bits_per_delivered_tile",
-                  "energy_j_per_delivered_tile", "n_replicas_avg",
-              ])
+    e2_metric_keys = [
+        "deadline_miss_ratio", "hard_fault_miss_ratio",
+        "source_fault_miss_ratio",
+        "fault_event_count", "fault_target_minutes",
+        "isl_traffic_bits_per_delivered_tile",
+        "energy_j_per_delivered_tile", "n_replicas_avg",
+    ]
+    _save_csv("E2_fault_intensity", results, metric_keys=e2_metric_keys)
+    _save_raw_csv("E2_fault_intensity", results, metric_keys=e2_metric_keys)
+    save_comparison_csv(
+        "E2_fault_intensity_stats", compare_all(results, e2_metric_keys)
+    )
     return results
 
 
@@ -1727,7 +1769,7 @@ def run_E2(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
 _E4_REQUEST_RATES = (20, 40, 60, 80)
 
 
-def run_E4(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
+def run_E4(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
     print(f"E4: Request-load scalability sweep ({n_seeds} seeds)")
 
     # Keep E1's 3×12 constellation fixed and rebuild per (request rate, seed).
@@ -1758,17 +1800,21 @@ def run_E4(seed=0, n_seeds=4) -> Dict[str, List[EpochMetrics]]:
                 for m in raw[f"{alg_name}@requests={request_rate}#s{s}"]
             ]
 
-    _save_csv("E4_scalability", results,
-              metric_keys=[
-                  "offered_requests_per_orbit",
-                  "offered_tiles_per_orbit",
-                  "delivered_tiles_per_orbit",
-                  "deadline_miss_ratio", "scheduling_time_p95_s",
-                  "scheduling_time_total_s", "helper_utilization",
-                  "compute_load_balance",
-                  "isl_traffic_bits_per_delivered_tile",
-                  "energy_j_per_delivered_tile",
-              ])
+    e4_metric_keys = [
+        "offered_requests_per_orbit",
+        "offered_tiles_per_orbit",
+        "delivered_tiles_per_orbit",
+        "deadline_miss_ratio", "scheduling_time_p95_s",
+        "scheduling_time_total_s", "helper_utilization",
+        "compute_load_balance",
+        "isl_traffic_bits_per_delivered_tile",
+        "energy_j_per_delivered_tile",
+    ]
+    _save_csv("E4_scalability", results, metric_keys=e4_metric_keys)
+    _save_raw_csv("E4_scalability", results, metric_keys=e4_metric_keys)
+    save_comparison_csv(
+        "E4_scalability_stats", compare_all(results, e4_metric_keys)
+    )
     return results
 
 
@@ -1851,14 +1897,18 @@ def run_E3(seed=0, n_seeds=8) -> Dict[str, List[EpochMetrics]]:
                 ]
             ]
 
-    _save_csv("E3_correlated", results,
-              metric_keys=[
-                  "deadline_miss_ratio", "hard_fault_miss_ratio",
-                  "source_fault_miss_ratio", "contact_miss_ratio",
-                  "compute_queue_miss_ratio", "policy_miss_ratio",
-                  "isl_traffic_bits_per_delivered_tile",
-                  "energy_j_per_delivered_tile", "n_replicas_avg",
-              ])
+    e3_metric_keys = [
+        "deadline_miss_ratio", "hard_fault_miss_ratio",
+        "source_fault_miss_ratio", "contact_miss_ratio",
+        "compute_queue_miss_ratio", "policy_miss_ratio",
+        "isl_traffic_bits_per_delivered_tile",
+        "energy_j_per_delivered_tile", "n_replicas_avg",
+    ]
+    _save_csv("E3_correlated", results, metric_keys=e3_metric_keys)
+    _save_raw_csv("E3_correlated", results, metric_keys=e3_metric_keys)
+    save_comparison_csv(
+        "E3_correlated_stats", compare_all(results, e3_metric_keys)
+    )
     return results
 
 

@@ -7,7 +7,7 @@ Reads CSVs from results/ and writes PNG figures to figure/.
 from __future__ import annotations
 import csv
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -77,6 +77,15 @@ def _read_csv(exp_id: str) -> List[Dict]:
         return list(csv.DictReader(f))
 
 
+def _read_raw_csv(exp_id: str) -> List[Dict]:
+    """Read the per-run (per-seed) records written by experiments._save_raw_csv."""
+    path = os.path.join(RESULTS_DIR, f"{exp_id}_raw.csv")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return list(csv.DictReader(f))
+
+
 def _ensure_figures():
     os.makedirs(FIGURES_DIR, exist_ok=True)
 
@@ -97,6 +106,72 @@ def _ci95(row, key):
     """Normal-approximation 95% CI from across-run sample dispersion."""
     n = max(_float(row, "sample_count"), 1.0)
     return 1.96 * _std(row, key) / np.sqrt(n)
+
+
+# ── Per-run scatter and ECDF (reveals seed-level spread and tail behavior) ──
+
+def plot_seed_distribution(exp_id: str, metric: str, title: str,
+                           scale: float = 1.0,
+                           conditions: Optional[tuple] = None):
+    """Per-run scatter plus empirical CDF for one metric, across seeds.
+
+    Aggregate bar/line charts only show mean +/- std; this shows every
+    individual run so outliers and tail behavior (e.g. one bad seed driving
+    the miss-ratio mean up) are visible instead of averaged away.
+    """
+    rows = _read_raw_csv(exp_id)
+    if conditions is not None:
+        rows = [r for r in rows if r.get("condition") in conditions]
+    if not rows:
+        print(f"No raw per-seed data for {exp_id} ({metric})"); return
+
+    by_alg: Dict[str, List[float]] = {}
+    for r in rows:
+        try:
+            value = float(r[metric]) / scale
+        except (KeyError, ValueError):
+            continue
+        by_alg.setdefault(r["algorithm"], []).append(value)
+    if not by_alg:
+        print(f"No values for {metric} in {exp_id}"); return
+
+    algs = sorted(by_alg, key=lambda a: (a != "ORDI", a))
+    colors = [ALG_COLORS.get(a, "#888") for a in algs]
+    labels = [ALG_LABELS.get(a, a) for a in algs]
+
+    fig, (ax_scatter, ax_cdf) = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    rng = np.random.default_rng(0)
+    for i, (alg, color) in enumerate(zip(algs, colors)):
+        values = by_alg[alg]
+        jitter = rng.uniform(-0.12, 0.12, size=len(values))
+        ax_scatter.scatter(np.full(len(values), i) + jitter, values,
+                          color=color, alpha=0.7, s=18,
+                          edgecolor="black", linewidth=0.3)
+        ax_scatter.scatter([i], [np.mean(values)], color=color, marker="_",
+                          s=400, linewidth=2.5, zorder=5)
+    ax_scatter.set_xticks(range(len(algs)))
+    ax_scatter.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax_scatter.set_title(f"Per-run {title}", fontsize=10)
+    ax_scatter.grid(axis="y", alpha=0.25, linewidth=0.6)
+
+    for alg, color, label in zip(algs, colors, labels):
+        values = np.sort(by_alg[alg])
+        y = np.arange(1, len(values) + 1) / len(values)
+        ax_cdf.step(values, y, where="post", color=color, label=label,
+                   linewidth=1.6)
+    ax_cdf.set_title(f"Empirical CDF: {title}", fontsize=10)
+    ax_cdf.set_ylabel("Cumulative fraction of runs")
+    ax_cdf.grid(alpha=0.25, linewidth=0.6)
+    ax_cdf.legend(fontsize=7)
+
+    fig.tight_layout()
+    _ensure_figures()
+    suffix = f"_{conditions[0]}" if conditions else ""
+    path = os.path.join(FIGURES_DIR, f"{exp_id}_{metric}{suffix}_seeds.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved {path}")
 
 
 # ── E1: Core performance bar chart ───────────────────────────────────────────
@@ -156,6 +231,9 @@ def plot_E1():
     plt.close()
     print(f"  Saved {path}")
     plot_E1_miss_decomposition(rows)
+    plot_seed_distribution(
+        "E1_core", "deadline_miss_ratio", "Deadline Miss Ratio (E1)"
+    )
 
 
 def plot_E1_miss_decomposition(rows=None):
@@ -276,6 +354,12 @@ def plot_E2():
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
+    # 0.02 matches E1's default fault rate (experiments._E1_FAULT_RATE).
+    plot_seed_distribution(
+        "E2_fault_intensity", "deadline_miss_ratio",
+        "Deadline Miss Ratio (E2, fault=0.02)",
+        conditions=("fault=0.02",),
+    )
 
 
 # ── E3: Correlated failures ──────────────────────────────────────────────────
@@ -346,6 +430,11 @@ def plot_E3():
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
+    plot_seed_distribution(
+        "E3_correlated", "deadline_miss_ratio",
+        "Deadline Miss Ratio (E3, 1-plane outage)",
+        conditions=("1plane",),
+    )
 
 
 # ── E4: Scalability ───────────────────────────────────────────────────────────
@@ -424,6 +513,11 @@ def plot_E4():
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
+    plot_seed_distribution(
+        "E4_scalability", "deadline_miss_ratio",
+        "Deadline Miss Ratio (E4, requests=40)",
+        conditions=("requests=40",),
+    )
 
 
 def plot_all():
