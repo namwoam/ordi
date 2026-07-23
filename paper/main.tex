@@ -35,7 +35,6 @@
 \maketitle
 
 \begin{abstract}
-Low-Earth-orbit Earth-observation constellations collect more imagery than intermittent ground contacts can promptly downlink, motivating distributed onboard inference for time-critical alerts. Yet changing contact geometry, thermal and battery throttling, and correlated orbital-plane failures make static task placement unreliable. We present \ordi{}, an orbit-aware rolling-horizon scheduler that jointly considers predicted contacts and each satellite's compute, energy, temperature, queue, and availability state. \ordi{} ranks image tiles by urgency-weighted utility, selects feasible primary helper--aggregator pairs, and adds fault-disjoint backups only when their marginal reliability gain exceeds energy, communication, and replication costs. Detected failures, missed contacts, and stragglers trigger local replanning. We compare \ordi{} with eight baselines across fault type and intensity, deadline, constellation scale, correlated outage, and backup-cap studies, using a uniform conservative $25^\circ$ ground-link elevation mask. Under nominal stochastic loss, \ordi{} achieves the highest utility while using 40\% fewer replicas and 40\% less energy than full replication. Under one-plane outages it remains within 3.5 percentage points of full replication's realized miss ratio with 44\% less energy. Its greedy solution attains slightly higher utility than an ILP reference with $5.8\times$ less inter-satellite traffic. Tests on real-world NASA FIRMS wildfire requests further preserve the synthetic study's utility ordering, supporting selective redundancy under operational demand conditions.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -46,15 +45,252 @@ LEO constellations, Earth observation, distributed inference, fault-tolerant sch
 \section{Background and Related Work}
 \label{sec:motivation}
 
-\subsection{Onboard Inference and Orbital Edge Computing}
-\label{sec:related}
-EO satellites are bandwidth-starved: ground contact windows last only 5--10 minutes per pass, and many operators schedule only high-latitude stations, so a satellite over the southern hemisphere may wait most of an orbit to downlink. Onboard inference attacks this at the source, reducing a megabyte-scale tile to a kilobyte-scale result and shifting the bottleneck from downlink to onboard compute, which is in turn bounded by a small spacecraft's power and thermal envelope. That this is practical is now established by flight programs across agencies and industry: ESA's $\Phi$-Sat-1 flew the first on-board deep-neural-network demonstrator~\cite{giuffrida2022phisat}, re-trainable payloads have been uplinked and run in orbit on a 1\,W VPU~\cite{ruzicka2023worldfloods}, the NASA/HPE Spaceborne Computer-2 ran AI workloads on the ISS with software radiation hardening~\cite{hpe_sbc2}, and the Tiansuan constellation reported systematic in-orbit COTS measurements~\cite{wang2024cots} showing accelerators throttled well below nameplate throughput by thermal and battery limits. Earlier work established the paradigm (orbital edge computing~\cite{denby2020oec}, onboard model specialization~\cite{denby2022kodan}), and recent surveys catalogue it~\cite{yin2025oecsurvey}. This body of work is almost entirely \emph{single-satellite} inference; \ordi{} addresses the next question of distributing one task across satellites when a single satellite's compute or downlink cannot meet the deadline.
+Orbital edge computing treats a satellite constellation as a distributed
+computing platform rather than a collection of sensors that merely forward raw
+data. Denby and Lucia establish this design space and expose the coupled
+constraints of orbital motion, onboard compute, energy, sensing, and
+downlink~\cite{denby2020oec}. Subsequent systems provide complementary
+mechanisms: Krios places and migrates persistent services across moving LEO
+resources~\cite{krios2024}, LEOEdge coordinates heterogeneous satellite and
+ground resources for AI inference~\cite{leoedge2025}, and SECO jointly schedules
+wide-area observation, routing, and compute placement~\cite{seco}. These systems
+primarily target service availability, latency, coverage, or resource
+efficiency under nominal mobility.
 
-\subsection{Multi-Satellite Offloading and Placement}
-As LEO mega-constellations mature, several systems schedule computation across satellites. Serval bifurcates near-real-time EO queries on one satellite's resources~\cite{tao2024serval}; SECO optimizes latency or energy for multi-satellite placement~\cite{seco}; and LEOEdge co-designs satellite-ground AI-inference placement with per-satellite adaptive models~\cite{leoedge2025}. These approaches optimize placement under nominal availability but assume scheduled resources survive; we quantify the resulting reliability loss and show that structured redundancy recovers utility efficiently.
+Deadline-aware mobile-edge schedulers provide useful methods for dynamic
+arrivals and constrained communication. Liu et al.\ minimize the deadline
+violation ratio for dependent tasks through scheduling, migration, and
+merging~\cite{liu2023deadline}, while TODG makes distributed online offloading
+decisions under hard delay constraints and stochastic communication
+resources~\cite{yue2022todg}. These formulations motivate deadline misses,
+rather than average latency alone, as a reliability metric.
 
-\subsection{Priced Redundancy under Correlated Failures}
-Tiling makes inference embarrassingly parallel: a $4{\times}4$ grid yields 16 independent units that ISLs can spread across a neighborhood. But every replica's success requires the source to emit the tile, each ISL hop to hold, the helper to survive compute, and the aggregator's downlink to materialize---and these events are correlated, since satellites in one plane share geometry, eclipse cycles, and deployment batch, so a plane-wide outage disables many helpers at once. Tail-tolerant duplication~\cite{dean2013tail} and coded computation~\cite{lee2018codes,cocoi} address this in datacenters, but assume cheap bandwidth and independent failures. In orbit, full replication costs roughly double the energy and ISL traffic that a 20--30\,Wh-class spacecraft cannot afford, and correlation breaks the coding assumption. The design space between zero redundancy and full replication, priced by orbital state and placed against the actual failure correlation, is the territory \ordi{} explores.
+Selective replication is a separate approach to reducing delay and execution
+risk. Learning-based vehicular-edge schemes estimate worker quality and
+replicate tasks across a chosen set of workers~\cite{sun2018replication}; their
+analysis further shows that excessive replication can increase queue contention
+and perform worse than a smaller replica count~\cite{sun2021replication}.
+
+\ordi{} combines these three lines of work in an online scheduler for LEO
+Earth-observation inference. It splits requests into spatial tasks, places them
+on queue-aware helpers, and selects contact-aware routes that can complete
+computation and ground delivery before an absolute deadline. It also learns
+failure-domain risk from execution outcomes and selectively adds fault-disjoint
+backups when their expected reliability gain justifies the additional compute
+and communication cost. This integration makes deadline feasibility, orbital
+resource variation, and correlated failures part of one scheduling decision.
+
+\section{Modeling}
+\label{sec:modeling}
+
+\subsection{System and Task Model}
+\label{sec:model}
+
+Orbital contacts, compute queues, and energy--thermal states evolve over time,
+whereas continuously recomputing the schedule after every state change would
+incur prohibitive control and optimization overhead. We therefore adopt a
+rolling-horizon discretization in which scheduling decisions are revised at
+fixed epochs indexed by $\ell\in\mathbb{Z}_{\ge 0}$. Each epoch has duration
+$\Delta$ and interval
+\begin{equation}
+ \mathcal{I}_{\ell}=[t_{\ell},t_{\ell+1}),
+ \qquad t_{\ell}=\ell\Delta .
+ \label{eq:epoch}
+\end{equation}
+At $t_{\ell}$, the scheduler refreshes the satellite states and pending task
+set, and constructs a rolling-horizon plan using contacts predicted through
+the relevant task deadlines. The epoch length determines the replanning
+cadence; it does not restrict an operation to the current interval, and
+resource reservations may extend beyond $\mathcal{I}_{\ell}$. Hereafter, $t$
+denotes the current decision time $t_{\ell}$.
+
+The constellation is represented by a time-varying directed contact graph
+$\mathcal{G}(t)=(\mathcal{N},\mathcal{E}(t))$, where
+$\mathcal{N}=\mathcal{S}\cup\mathcal{D}$ contains satellites
+$\mathcal{S}$ and ground stations $\mathcal{D}$. A contact
+$e=(i,j,o_e,c_e,R_e,\rho_e,\kappa_e)$ denotes a directed communication
+opportunity from $i$ to $j$, where $o_e$ and $c_e$ are its opening and closing
+times, respectively. During the interval $[o_e,c_e]$, the contact has rate
+$R_e$, success probability $\rho_e$, and type
+$\kappa_e\in\{\mathrm{ISL},\mathrm{downlink}\}$. Its raw capacity is
+$K_e=R_e(c_e-o_e)$ bits. A feasible store-and-forward route is a
+time-ordered sequence of contacts and may include waiting at intermediate
+satellites.
+
+At decision time $t$, satellite $i$ is characterized by
+\begin{equation}
+  \boldsymbol{\sigma}_i(t)
+  =\bigl(C_i(t),B_i(t),\Theta_i(t),Q_i(t),A_i(t),\rho_i(t)\bigr),
+  \label{eq:satellite-state}
+\end{equation}
+where $C_i$ is its effective compute rate in FLOP/s, $B_i$ is battery energy,
+$\Theta_i$ is payload temperature, $Q_i$ is already-queued work in FLOPs,
+$A_i\in\{0,1\}$ is availability, and $\rho_i$ is node reliability. The
+effective rate $C_i$ incorporates thermal throttling. Let $H_i(t)$ indicate
+whether the platform is operational. Availability is defined as
+\begin{equation}
+ A_i(t)=
+ \mathbb{1}\!\left[
+   H_i(t)=1,\ B_i(t)\ge B_i^{\min},\
+   \Theta_i(t)<\Theta_i^{\max}
+ \right].
+ \label{eq:availability}
+\end{equation}
+The battery and thermal dynamics update $C_i$ and $A_i$ between consecutive
+decision epochs.
+
+Each EO request $k$ is represented as
+$\mathcal{T}_k=(s_k,r_k,D_k,\mathcal{V}_k)$, where $s_k$ is the imaging
+satellite, $r_k$ is the release time, $D_k$ is the absolute delivery deadline,
+and $\mathcal{V}_k$ is a grid of image tiles. Each tile $v\in\mathcal{V}_k$ is
+described by
+\begin{equation}
+  \tau_{kv}=(d^{\mathrm{in}}_{kv},d^{\mathrm{out}}_{kv},
+  w_{kv},u_{kv}),
+  \label{eq:tile}
+\end{equation}
+where $d^{\mathrm{in}}_{kv}$ and $d^{\mathrm{out}}_{kv}$ are input and result
+sizes in bits, $w_{kv}$ is inference work in FLOPs, and $u_{kv}$ is utility.
+The two data volumes are distinguished because onboard inference transforms a
+high-dimensional image tile into a task-dependent product, such as a class
+label, bounding boxes, or a segmentation mask.
+
+Orbital motion is predictable; therefore each satellite is assumed to know
+the contact graph over the scheduling horizon. This knowledge specifies when
+links will exist, but not the contemporaneous resource state of another
+satellite. At time $t$, satellite $i$ directly observes only
+$\boldsymbol{\sigma}_i(t)$. For $j\ne i$, its most recent estimate is
+\begin{equation}
+ \widehat{\boldsymbol{\sigma}}^{\,i}_j(t)
+ =\boldsymbol{\sigma}_j(t^i_j),
+ \qquad
+ a^i_j(t)=t-t^i_j,
+ \label{eq:state-estimate}
+\end{equation}
+where $t^i_j$ is the generation time of the latest state advertisement
+received by $i$, and $a^i_j$ is its age. The state of $j$ is unknown to $i$
+until such an advertisement is received.
+
+Neighboring satellites exchange state advertisements and task data over
+inter-satellite links. Task data may traverse multiple ISLs, and a downlink
+delivers the resulting data to a ground station. Control and task traffic
+share the finite capacities of the corresponding contact windows. Thus,
+knowledge of future connectivity is global and deterministic, whereas
+knowledge of remote satellite state is local, delayed, and acquired through
+communication.
+
+\subsection{Constraints and Problem Formulation}
+\label{sec:formulation}
+
+For each tile, a decision selects a split width
+$q\in\mathcal{Q}=\{1,2,4\}$. Each complete reconstruction group contains $q$
+equal shards; shard $m$ carries $d^{\mathrm{in}}_{kv}/q$ input bits, requires
+$w_{kv}/q$ FLOPs, and produces $d^{\mathrm{out}}_{kv}/q$ result bits. Its
+placement
+\begin{equation}
+ x_{kvgm}=(h_{kvgm},P^{\mathrm{in}}_{kvgm},
+ P^{\mathrm{gnd}}_{kvgm})
+ \label{eq:placement}
+\end{equation}
+selects a compute satellite $h_{kvgm}$, a time-respecting input path from
+$s_k$ to $h_{kvgm}$, and a time-respecting result path from $h_{kvgm}$ to any
+ground station. Either path may contain multiple ISLs, while
+$P^{\mathrm{gnd}}_{kvgm}$ ends with a downlink.
+
+Let $F^{\mathrm{in}}_{kvgm}$ be the time at which the input shard reaches its
+compute satellite. Computation begins at
+\begin{equation}
+ \begin{aligned}
+ S^{\mathrm{cmp}}_{kvgm}
+ &\ge \max\!\left\{
+ F^{\mathrm{in}}_{kvgm},\
+ t+\frac{Q_{h_{kvgm}}(t)}{C_{h_{kvgm}}(t)}
+ \right\},\\
+ F^{\mathrm{cmp}}_{kvgm}
+ &=S^{\mathrm{cmp}}_{kvgm}
+ +\frac{w_{kv}}{qC_{h_{kvgm}}(t)}.
+ \end{aligned}
+ \label{eq:compute-time}
+\end{equation}
+The result path starts after computation. Let $F_{kvgm}$ denote the time at
+which the result reaches the ground. A group completes after all $q$ of its
+results arrive, while a tile completes when any selected reconstruction group
+completes:
+\begin{equation}
+ T_{kvg}=\max_{1\le m\le q}F_{kvgm},
+ \qquad
+ T_{kv}=\min_{g\in\mathcal{R}_{kv}}T_{kvg}.
+ \label{eq:completion-time}
+\end{equation}
+Every admitted placement obeys
+\begin{equation}
+ \begin{aligned}
+ r_k&\le t,\qquad F_{kvgm}\le D_k,\\
+ A_i(t)&=1,\quad
+ \forall i\in
+ \mathcal{S}(P^{\mathrm{in}}_{kvgm}\cup
+ P^{\mathrm{gnd}}_{kvgm}).
+ \end{aligned}
+ \label{eq:deadline-availability}
+\end{equation}
+Here, $\mathcal{S}(P)$ denotes the satellite nodes traversed by path $P$.
+At decision time, a satellite evaluates remote availability using its latest
+estimate from Equation~\eqref{eq:state-estimate}; stale information can
+therefore cause a planned placement to fail during execution.
+
+Shared resources are explicitly serialized. For every contact window $e$,
+\begin{equation}
+ \sum_{x_{kvgm}\,\ni\,e} b_{kvgm,e}\le K_e,
+ \label{eq:contact-capacity}
+\end{equation}
+and each transmission interval must lie inside $[o_e,c_e]$. Intervals using
+the same satellite terminal cannot overlap, and compute intervals on one
+compute satellite cannot overlap. State advertisements and task transfers
+consume capacity from the same contact-window budget.
+
+Within a group, compute satellites are distinct. A backup group must
+additionally avoid the primary compute satellites, their orbital planes, and
+satellite nodes already used by the primary routes. If $\delta(i)$ denotes the
+fault domain of satellite $i$, then for primary group $0$ and backup group
+$g>0$,
+\begin{equation}
+\delta(h_{kv0m})\ne\delta(h_{kvgm'})
+\quad \forall\,m,m',
+\label{eq:fault-disjoint}
+\end{equation}
+with the analogous node-disjoint condition on their routes.
+
+Let $\mathcal{C}_{kvg}$ be the physical node and link components required by
+group $g$. Its success probability is
+$p_{kvg}=\prod_{c\in\mathcal{C}_{kvg}}\rho_c$. Because groups can share a
+source or contact component, tile reliability uses inclusion--exclusion rather
+than assuming independent replicas:
+\begin{equation}
+ P_{kv}=
+ \sum_{\emptyset\ne H\subseteq\mathcal{R}_{kv}}
+ (-1)^{|H|+1}
+ \prod_{c\in\bigcup_{g\in H}\mathcal{C}_{kvg}}\rho_c ,
+ \label{eq:tile-reliability}
+\end{equation}
+where $\mathcal{R}_{kv}$ is the selected set of complete groups. Let
+$L_{kv}=T_{kv}-t$ be the service latency, let $Z_{kv}$ be the total routed
+bits counted per hop, and let $n_{kv}=|\mathcal{R}_{kv}|$. The online
+scheduling problem is
+\begin{equation}
+ \max_{\{q,x,\mathcal{R}\}}
+ \sum_{k}\sum_{v\in\mathcal{V}_k}
+ \left[
+ u_{kv}P_{kv}e^{-\alpha L_{kv}}
+ -\lambda_C Z_{kv}
+ -\lambda_R(n_{kv}-1)
+ \right]
+ \label{eq:objective}
+\end{equation}
+subject to Equations~\eqref{eq:compute-time}--\eqref{eq:fault-disjoint} and
+$q\in\mathcal{Q}$. The physical model separately integrates compute and radio
+energy and updates $B_i$ and $\Theta_i$; therefore energy affects subsequent
+feasibility through Equation~\eqref{eq:availability} rather than through an
+optimistic per-placement estimate.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

@@ -6,6 +6,12 @@ tasks:
     cmds:
       - uv sync
 
+  compile:
+    desc: Compile the paper PDF
+    dir: paper
+    cmds:
+      - tectonic main.tex
+
   # ── individual experiments ─────────────────────────────────────────────────
   e1:
     desc: "E1 - Core performance under matched moderate random faults"
