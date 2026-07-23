@@ -5,7 +5,10 @@ import pytest
 from ordi.algorithms import (
     Assignment, ContactWindow, EpochInput, SatelliteView, SECOAdapted,
 )
-from ordi.algorithms.seco_adapted import _speculative_terminal_slot
+import ordi.algorithms.seco_adapted as seco_module
+from ordi.algorithms.seco_adapted import (
+    ResourceLedger, _route, _speculative_terminal_slot,
+)
 from ordi.eval.experiments import _advance_synthetic_states
 from ordi.eval.validation import _terminal_slot
 
@@ -241,3 +244,80 @@ def test_seco_terminal_slot_does_not_scan_historical_calendar():
 
     assert result == 2_000.0
     assert historical.accesses < 20
+
+
+def _route_request(contacts):
+    states = {
+        "src": _state("src"),
+        "target": _state("target"),
+    }
+    return EpochInput(
+        0, 0.0, [], states, {}, frozenset(), tuple(contacts)
+    )
+
+
+def test_seco_route_skips_terminal_search_for_dominated_contact(monkeypatch):
+    request = _route_request((
+        ContactWindow("src", "target", 0.0, 10.0, 100.0, "isl"),
+        ContactWindow("src", "target", 2.0, 10.0, 100.0, "isl"),
+    ))
+    ledger = ResourceLedger.from_request(request)
+    terminal_searches = 0
+    original = seco_module._speculative_terminal_slot
+
+    def counted(*args, **kwargs):
+        nonlocal terminal_searches
+        terminal_searches += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        seco_module, "_speculative_terminal_slot", counted
+    )
+
+    route = _route(request, ledger, "src", {"target"}, 100.0, 0.0)
+
+    assert route is not None
+    assert route.arrival == pytest.approx(1.0)
+    assert terminal_searches == 1
+
+
+def test_seco_route_keeps_later_contact_that_improves_arrival():
+    request = _route_request((
+        ContactWindow("src", "target", 0.0, 20.0, 10.0, "isl"),
+        ContactWindow("src", "target", 1.0, 20.0, 100.0, "isl"),
+    ))
+
+    route = _route(
+        request, ResourceLedger.from_request(request),
+        "src", {"target"}, 100.0, 0.0,
+    )
+
+    assert route is not None
+    assert route.arrival == pytest.approx(2.0)
+    assert route.contact_indices == (1,)
+
+
+def test_seco_route_keeps_later_contact_after_too_short_window(monkeypatch):
+    request = _route_request((
+        ContactWindow("src", "target", 0.0, 0.5, 100.0, "isl"),
+        ContactWindow("src", "target", 2.0, 5.0, 100.0, "isl"),
+    ))
+    ledger = ResourceLedger.from_request(request)
+    terminal_searches = 0
+    original = seco_module._speculative_terminal_slot
+
+    def counted(*args, **kwargs):
+        nonlocal terminal_searches
+        terminal_searches += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        seco_module, "_speculative_terminal_slot", counted
+    )
+
+    route = _route(request, ledger, "src", {"target"}, 100.0, 0.0)
+
+    assert route is not None
+    assert route.arrival == pytest.approx(3.0)
+    assert route.contact_indices == (1,)
+    assert terminal_searches == 1

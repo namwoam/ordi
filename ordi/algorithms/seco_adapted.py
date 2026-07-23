@@ -180,13 +180,26 @@ def _route(request, ledger, source, targets, bits, start):
             if ledger.contact_residual_bits[index] + 1e-9 < bits:
                 continue
             duration = bits / max(contact.rate_bps, 1.0)
+            earliest = max(
+                now, contact.opens, ledger.contact_ready_at[index]
+            )
+            optimistic_finish = earliest + duration
+            # Terminal contention can only delay this contact. Avoid the
+            # calendar search when even its contention-free finish cannot fit
+            # in the window or improve the target's current arrival label.
+            if (
+                optimistic_finish > contact.closes + 1e-9
+                or optimistic_finish
+                >= best.get(contact.target, math.inf)
+            ):
+                continue
             terminals = tuple(
                 endpoint for endpoint in (contact.source, contact.target)
                 if endpoint in request.satellites
             )
             depart = _speculative_terminal_slot(
                 ledger.terminal_intervals, terminals,
-                max(now, contact.opens, ledger.contact_ready_at[index]),
+                earliest,
                 duration, contact.closes,
             )
             if depart is None:
