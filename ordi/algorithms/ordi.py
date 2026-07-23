@@ -24,6 +24,7 @@ from ordi.sim.messaging import MessageSimulator
 class _LocalPlan:
     shard_count: int
     placements: tuple
+    candidates: tuple
     work_fraction: float
     input_fraction: float
     output_fraction: float
@@ -287,7 +288,7 @@ class ORDI:
             - request.weights.communication * communication
         )
         return _LocalPlan(
-            shard_count, placements,
+            shard_count, placements, tuple(choices),
             work_fraction, input_fraction,
             output_fraction, latency, reliability, communication,
             value,
@@ -332,13 +333,10 @@ class ORDI:
                 >= self._cold_start_backup_budget):
             return None
         q = primary.shard_count
-        choices = enumerate_placements(
-            request, task, tile,
-            work_fraction=primary.work_fraction,
-            input_fraction=primary.input_fraction,
-            output_fraction=primary.output_fraction,
-            protocol_header_bits=self.messages.header_bits,
-        )
+        # The primary planner already enumerated this exact request, tile, and
+        # split fraction. Reuse those immutable placements instead of running
+        # the full helper-aggregator route search a second time.
+        choices = primary.candidates
         used_helpers = {p.helper for p in primary.placements}
         used_planes = {plane(p.helper) for p in primary.placements}
         used_nodes = {

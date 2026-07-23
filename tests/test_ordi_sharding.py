@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ordi.algorithms.ordi as ordi_module
 from ordi.algorithms import (
     ContactWindow, Decision, EpochInput, ORDI, PolicyWeights, SatelliteView,
 )
@@ -266,6 +267,62 @@ def test_sampled_fault_risk_selects_a_cost_effective_disjoint_backup():
     assert assignment.metadata["shard_groups"] == (0, 1)
     assert plane(assignment.helpers[0]) != plane(assignment.helpers[1])
     assert assignment.metadata["fault_domain_samples"] == 0
+
+
+def test_backup_reuses_primary_placement_enumeration(monkeypatch):
+    states = {
+        name: _view(name)
+        for name in ("SAT_00_00", "SAT_01_00")
+    }
+    contacts = (
+        ContactWindow(
+            "SAT_00_00", "SAT_01_00", 0.0, 20.0, 1e9, "isl", 0.99
+        ),
+        ContactWindow(
+            "SAT_01_00", "SAT_00_00", 0.0, 20.0, 1e9, "isl", 0.99
+        ),
+        ContactWindow(
+            "SAT_00_00", "ground", 0.0, 20.0, 1e9,
+            "downlink", 0.99,
+        ),
+        ContactWindow(
+            "SAT_01_00", "ground", 0.0, 20.0, 1e9,
+            "downlink", 0.99,
+        ),
+    )
+    tile = SimpleNamespace(
+        tile_id=0, n_replicas_max=2, d_in_bits=100.0,
+        d_out_bits=10.0, compute_ops=1_000.0, utility=1.0,
+    )
+    task = SimpleNamespace(
+        task_id=1, source_sat="SAT_00_00",
+        deadline=20.0, tiles=[tile],
+    )
+    request = EpochInput(
+        0, 0.0, [task], states, {}, frozenset({"ground"}), contacts,
+        weights=PolicyWeights(
+            freshness=0.0, energy=0.0, communication=0.0,
+            replication=0.05,
+        ),
+    )
+    calls = 0
+    original = ordi_module.enumerate_placements
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ordi_module, "enumerate_placements", counted)
+    scheduler = ORDI(split_options=(1,))
+    scheduler.messages.seed_knowledge(
+        "SAT_00_00", states, generated_at=-60.0, delivered_at=0.0
+    )
+
+    assignment = scheduler.schedule(request).assignments[0]
+
+    assert len(assignment.helpers) == 2
+    assert calls == 1
 
 
 def test_fault_domain_estimate_learns_from_samples():
