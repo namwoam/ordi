@@ -200,6 +200,16 @@ def test_partition_fractions_drive_physical_workload():
          ("a", "b"), 0.0, 2.0, 10.0),
         ({"a": [(0.0, 5.0)], "b": [(5.0, 10.0)]},
          ("a", "b"), 0.0, 1.0, 10.0),
+        # The predecessor returned by bisect still overlaps ``earliest``.
+        ({"a": [(0.0, 10.0), (20.0, 30.0)]},
+         ("a",), 5.0, 5.0, 30.0),
+        # A reservation ending exactly at ``earliest`` is non-conflicting.
+        ({"a": [(0.0, 5.0), (10.0, 12.0)]},
+         ("a",), 5.0, 3.0, 20.0),
+        # Historical intervals on both terminals are skipped independently.
+        ({"a": [(0.0, 1.0), (2.0, 3.0), (10.0, 12.0)],
+          "b": [(1.0, 2.0), (4.0, 5.0), (12.0, 14.0)]},
+         ("a", "b"), 9.0, 2.0, 20.0),
     ],
 )
 def test_seco_speculative_terminal_slot_matches_validator_semantics(
@@ -210,3 +220,24 @@ def test_seco_speculative_terminal_slot_matches_validator_semantics(
     assert _speculative_terminal_slot(
         calendars, terminals, earliest, duration, latest
     ) == expected
+
+
+def test_seco_terminal_slot_does_not_scan_historical_calendar():
+    class CountingIntervals(list):
+        accesses = 0
+
+        def __getitem__(self, index):
+            self.accesses += 1
+            return super().__getitem__(index)
+
+    historical = CountingIntervals(
+        (float(index), float(index) + 0.5)
+        for index in range(1_024)
+    )
+
+    result = _speculative_terminal_slot(
+        {"sat": historical}, ("sat",), 2_000.0, 1.0, 2_010.0
+    )
+
+    assert result == 2_000.0
+    assert historical.accesses < 20

@@ -12,7 +12,7 @@ link/compute capacity. Basilisk alone evolves physical energy state.
 """
 from __future__ import annotations
 
-from bisect import insort
+from bisect import bisect_left, insort
 from dataclasses import dataclass, replace
 import heapq
 import math
@@ -123,10 +123,23 @@ def _speculative_terminal_slot(calendars, terminals, earliest, duration, latest)
     """Earliest common terminal gap over SECO's sorted local calendars."""
     first = calendars.get(terminals[0], ()) if terminals else ()
     second = calendars.get(terminals[1], ()) if len(terminals) > 1 else ()
-    i = j = 0
+    # Calendars are sorted, non-overlapping reservation lists. Start at the
+    # first interval whose opening is not earlier than ``earliest``, retaining
+    # its predecessor only when that interval still overlaps the search time.
+    # This avoids rescanning every historical reservation on every edge
+    # relaxation as the scheduling ledger grows.
+    i = bisect_left(first, (earliest,))
+    if i and first[i - 1][1] > earliest + 1e-9:
+        i -= 1
+    j = bisect_left(second, (earliest,))
+    if j and second[j - 1][1] > earliest + 1e-9:
+        j -= 1
+    first_count = len(first)
+    second_count = len(second)
     start = earliest
-    while i < len(first) or j < len(second):
-        if j >= len(second) or (i < len(first) and first[i] <= second[j]):
+    while i < first_count or j < second_count:
+        if (j >= second_count
+                or (i < first_count and first[i] <= second[j])):
             reserved_start, reserved_finish = first[i]
             i += 1
         else:
