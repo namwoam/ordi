@@ -321,3 +321,96 @@ def test_seco_route_keeps_later_contact_after_too_short_window(monkeypatch):
     assert route.arrival == pytest.approx(3.0)
     assert route.contact_indices == (1,)
     assert terminal_searches == 1
+
+
+def test_seco_branch_bound_prunes_split_with_worse_qth_helper_bound(
+        monkeypatch):
+    scheduler = SECOAdapted(split_options=(1, 2, 4))
+    bounds = {
+        1: ((1.0, "h1"),),
+        2: ((2.0, "h1"), (10.0, "h2")),
+        4: (
+            (2.0, "h1"), (3.0, "h2"),
+            (4.0, "h3"), (20.0, "h4"),
+        ),
+    }
+    evaluated = []
+
+    def ranked(
+        request, task, tile, ledger, work_fraction,
+        input_fraction, output_fraction,
+    ):
+        return bounds[round(1.0 / output_fraction)]
+
+    def split_plan(
+        request, task, tile, ledger, split_count, ranked_helpers=None,
+    ):
+        evaluated.append(split_count)
+        return SimpleNamespace(completion=5.0, split_count=split_count)
+
+    monkeypatch.setattr(scheduler, "_rank_helpers", ranked)
+    monkeypatch.setattr(scheduler, "_split_plan", split_plan)
+
+    plan = scheduler._best_plan(object(), object(), object(), object())
+
+    assert plan.split_count == 1
+    assert evaluated == [1]
+
+
+def test_seco_branch_bound_evaluates_most_promising_split_first(monkeypatch):
+    scheduler = SECOAdapted(split_options=(1, 2))
+    bounds = {
+        1: ((5.0, "h1"),),
+        2: ((1.0, "h1"), (2.0, "h2")),
+    }
+    completions = {1: 10.0, 2: 4.0}
+    evaluated = []
+
+    def ranked(
+        request, task, tile, ledger, work_fraction,
+        input_fraction, output_fraction,
+    ):
+        return bounds[round(1.0 / output_fraction)]
+
+    def split_plan(
+        request, task, tile, ledger, split_count, ranked_helpers=None,
+    ):
+        evaluated.append(split_count)
+        return SimpleNamespace(
+            completion=completions[split_count],
+            split_count=split_count,
+        )
+
+    monkeypatch.setattr(scheduler, "_rank_helpers", ranked)
+    monkeypatch.setattr(scheduler, "_split_plan", split_plan)
+
+    plan = scheduler._best_plan(object(), object(), object(), object())
+
+    assert plan.split_count == 2
+    assert evaluated == [2]
+
+
+def test_seco_branch_bound_preserves_split_option_tie_order(monkeypatch):
+    scheduler = SECOAdapted(split_options=(1, 2))
+    bounds = {
+        1: ((1.0, "h1"),),
+        2: ((0.25, "h1"), (0.5, "h2")),
+    }
+
+    def ranked(
+        request, task, tile, ledger, work_fraction,
+        input_fraction, output_fraction,
+    ):
+        return bounds[round(1.0 / output_fraction)]
+
+    def split_plan(
+        request, task, tile, ledger, split_count, ranked_helpers=None,
+    ):
+        return SimpleNamespace(completion=5.0, split_count=split_count)
+
+    monkeypatch.setattr(scheduler, "_rank_helpers", ranked)
+    monkeypatch.setattr(scheduler, "_split_plan", split_plan)
+
+    plan = scheduler._best_plan(object(), object(), object(), object())
+
+    assert plan.split_count == 1

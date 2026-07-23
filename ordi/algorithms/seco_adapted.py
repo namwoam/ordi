@@ -360,7 +360,7 @@ class SECOAdapted:
         # If that bound already misses the deadline, exact route reservation
         # cannot recover the helper and would only waste planning time.
         return tuple(
-            helper for completion, helper in ranked
+            (completion, helper) for completion, helper in ranked
             if completion <= task.deadline + 1e-9
         )
 
@@ -447,7 +447,8 @@ class SECOAdapted:
                 best = (part, trial)
         return best
 
-    def _split_plan(self, request, task, tile, ledger, split_count):
+    def _split_plan(self, request, task, tile, ledger, split_count,
+                    ranked_helpers=None):
         output_fraction = 1.0 / split_count
         # Each internal spatial boundary adds a halo.  Total transferred input
         # and compute become 1 + halo*(q-1), avoiding unrealistically free splits.
@@ -460,12 +461,16 @@ class SECOAdapted:
         # One fixed, handshake-aware compute-layer shortlist per split plan.
         # Exact feasibility is deliberately bounded: a sparse contact graph
         # must not turn a failed first batch back into an all-helper scan.
-        ranked = self._rank_helpers(
-            request, task, tile, trial, work_fraction,
-            input_fraction, output_fraction,
-        )
+        ranked = ranked_helpers
+        if ranked is None:
+            ranked = self._rank_helpers(
+                request, task, tile, trial, work_fraction,
+                input_fraction, output_fraction,
+            )
         shortlist_size = max(self.candidate_limit, 2 * split_count)
-        shortlist = ranked[:shortlist_size]
+        shortlist = tuple(
+            helper for _completion, helper in ranked[:shortlist_size]
+        )
         if len(shortlist) < split_count:
             return None
         for _ in range(split_count):
@@ -487,13 +492,49 @@ class SECOAdapted:
         )
 
     def _best_plan(self, request, task, tile, ledger):
-        plans = [
-            self._split_plan(request, task, tile, ledger, count)
-            for count in self.split_options
-            if count > 0
-        ]
-        feasible = [plan for plan in plans if plan is not None]
-        return min(feasible, key=lambda plan: plan.completion) if feasible else None
+        candidates = []
+        for option_index, count in enumerate(self.split_options):
+            if count <= 0:
+                continue
+            output_fraction = 1.0 / count
+            input_fraction = (
+                1.0 + self.halo_fraction * (count - 1)
+            ) / count
+            ranked = self._rank_helpers(
+                request, task, tile, ledger, input_fraction,
+                input_fraction, output_fraction,
+            )
+            if len(ranked) < count:
+                continue
+            # Any exact q-way plan uses q distinct helpers. Since each ranked
+            # completion ignores contention and future reservations, the q-th
+            # smallest value lower-bounds that plan's maximum completion.
+            candidates.append(
+                (ranked[count - 1][0], option_index, count, ranked)
+            )
+
+        best = None
+        best_index = math.inf
+        for lower_bound, option_index, count, ranked in sorted(candidates):
+            if (
+                best is not None
+                and lower_bound > best.completion + 1e-9
+            ):
+                continue
+            plan = self._split_plan(
+                request, task, tile, ledger, count,
+                ranked_helpers=ranked,
+            )
+            if plan is None:
+                continue
+            if (
+                best is None
+                or (plan.completion, option_index)
+                < (best.completion, best_index)
+            ):
+                best = plan
+                best_index = option_index
+        return best
 
     def schedule(self, request):
         advertisements = self.messages.prepare_epoch(request)
