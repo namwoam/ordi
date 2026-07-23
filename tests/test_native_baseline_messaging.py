@@ -87,12 +87,12 @@ def test_random_replication_route_ties_use_communication_then_reliability():
 
 
 @pytest.mark.parametrize("policy_type", [FullReplication, RandomReplication])
-def test_replication_policies_use_shared_current_state(policy_type):
+def test_replication_policies_natively_discover_and_message_helpers(policy_type):
     scheduler = policy_type()
 
     first = scheduler.schedule(_request()).assignments[0]
-    assert set(first.helpers) == {"src", "helper"}
-    assert first.metadata["known_state_nodes"] == 2
+    assert first.helpers == ("src",)
+    assert first.metadata["known_state_nodes"] == 1
 
     informed = scheduler.schedule(
         _request(epoch=1, sim_time=1.0)
@@ -106,7 +106,7 @@ def test_replication_policies_use_shared_current_state(policy_type):
     } <= kinds
 
 
-def test_replication_avoids_currently_unavailable_helper():
+def test_replication_helper_rejects_stale_assignment_before_image_transfer():
     scheduler = FullReplication()
     scheduler.schedule(_request())
 
@@ -115,10 +115,11 @@ def test_replication_avoids_currently_unavailable_helper():
     )).assignments[0]
 
     assert stale.helpers == ("src",)
-    assert not any(
-        event.kind == "replica_request" and event.peer == "helper"
-        for event in stale.message_events
-    )
+    rejected = [
+        event for event in stale.message_events
+        if event.kind == "replica_reject" and event.event == "delivered"
+    ]
+    assert rejected
     assert not any(
         event.kind == "image_shard" and event.node == "src"
         and event.peer == "helper" and event.event == "sent"

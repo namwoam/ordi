@@ -50,6 +50,7 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
         0, tuple(assignments),
         metadata={
             "protocol_message_count": 2,
+            "advertisement_control_bits": 20.0,
         },
     )
 
@@ -61,11 +62,11 @@ def test_e1_operational_metrics_are_normalized_and_distribution_aware():
 
     assert metrics.delivery_latency_p50_s == pytest.approx(20.0)
     assert metrics.delivery_latency_p95_s == pytest.approx(29.0)
-    assert metrics.isl_traffic_bits_per_delivered_tile == pytest.approx(130.0)
-    assert metrics.control_traffic_bits_per_delivered_tile == pytest.approx(40.0)
+    assert metrics.isl_traffic_bits_per_delivered_tile == pytest.approx(140.0)
+    assert metrics.control_traffic_bits_per_delivered_tile == pytest.approx(50.0)
     assert metrics.protocol_messages_per_delivered_tile == pytest.approx(5.0)
     assert metrics.energy_j_per_delivered_tile == pytest.approx(10.0)
-    assert metrics.control_traffic_ratio == pytest.approx(80.0 / 320.0)
+    assert metrics.control_traffic_ratio == pytest.approx(100.0 / 340.0)
     assert metrics.active_helper_fraction == pytest.approx(2.0 / 3.0)
     assert metrics.compute_load_balance == pytest.approx(2.0 / 3.0)
     assert metrics.helper_request_count == 2

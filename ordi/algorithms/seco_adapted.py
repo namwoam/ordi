@@ -19,7 +19,7 @@ import math
 
 from .schema import Assignment, Decision
 from ._common import (
-    Placement, group_success, protocol_trace,
+    Placement, advertisement_metadata, group_success, protocol_trace,
 )
 from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
@@ -470,6 +470,7 @@ class SECOAdapted:
         return min(feasible, key=lambda plan: plan.completion) if feasible else None
 
     def schedule(self, request):
+        advertisements = self.messages.prepare_epoch(request)
         assignments = []
         by_source = {}
         for task in request.tasks:
@@ -478,7 +479,7 @@ class SECOAdapted:
             local = self.messages.local_view(request, source)
             ledger = ResourceLedger.from_request(local)
             # The local planner knows the residual capacity consumed by state
-            # work committed before this decision.
+            # advertisements sent before this decision.
             for index, contact in enumerate(local.contacts):
                 key = (
                     contact.source, contact.target, contact.opens,
@@ -581,4 +582,8 @@ class SECOAdapted:
                     assignment, metadata=metadata,
                     message_events=execution.events,
                 ))
-        return Decision(request.epoch, tuple(assignments))
+        return Decision(
+            request.epoch, tuple(assignments),
+            advertisement_metadata(advertisements),
+            advertisements.events,
+        )

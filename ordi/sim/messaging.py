@@ -43,6 +43,13 @@ class ProtocolExecution:
     executed_shards: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class AdvertisementBatch:
+    events: tuple[MessageEvent, ...] = ()
+    message_count: int = 0
+    control_bits: float = 0.0
+
+
 @dataclass
 class MessageSimulator:
     """Execute node messages on contact and compute resources.
@@ -55,6 +62,7 @@ class MessageSimulator:
     header_bits: float = 2048.0
     max_hops: int = 12
     max_split_depth: int = 3
+    advertisement_bits: float = 1024.0
     contact_ready_at: dict[tuple, float] = field(default_factory=dict)
     contact_residual_bits: dict[tuple, float] = field(default_factory=dict)
     compute_ready_at: dict[str, float] = field(default_factory=dict)
@@ -62,6 +70,13 @@ class MessageSimulator:
         default_factory=dict
     )
     delivered_keys: set[tuple[str, str]] = field(default_factory=set)
+    knowledge: dict[str, dict[str, tuple[object, float, float]]] = field(
+        default_factory=dict
+    )
+    pending_advertisements: list[tuple[float, str, str, object, float]] = field(
+        default_factory=list
+    )
+    advertised_epochs: set[int] = field(default_factory=set)
     _next_id: int = 0
 
     def _message_id(self, trial_counter):
@@ -70,15 +85,122 @@ class MessageSimulator:
 
     def seed_knowledge(self, observer, satellites, generated_at=0.0,
                        delivered_at=0.0):
-        """Compatibility no-op: constellation state is globally available."""
+        """Explicit bootstrap hook for controlled tests or real telemetry."""
+        directory = self.knowledge.setdefault(observer, {})
+        for sat_id, state in satellites.items():
+            directory[sat_id] = (state, generated_at, delivered_at)
+
+    def prepare_epoch(self, request):
+        """Deliver old advertisements and broadcast current neighbor state.
+
+        Decisions made in this epoch can only use entries delivered before
+        ``request.sim_time``. Newly transmitted advertisements become visible
+        in a later epoch after their contact-constrained arrival time.
+        """
+        events = []
+        remaining = []
+        for delivered_at, observer, sender, view, generated_at in (
+                self.pending_advertisements):
+            if delivered_at <= request.sim_time + 1e-9:
+                self.knowledge.setdefault(observer, {})[sender] = (
+                    view, generated_at, delivered_at
+                )
+            else:
+                remaining.append(
+                    (delivered_at, observer, sender, view, generated_at)
+                )
+        self.pending_advertisements = remaining
+
+        if request.epoch in self.advertised_epochs:
+            return AdvertisementBatch()
+        self.advertised_epochs.add(request.epoch)
+        ready = self.contact_ready_at.copy()
+        residual = self.contact_residual_bits.copy()
+        terminal_intervals = {
+            terminal: list(intervals)
+            for terminal, intervals in self.terminal_intervals.items()
+        }
+        counter = self._next_id
+        scheduled_pairs = set()
+        message_count = 0
+        control_bits = 0.0
+        horizon = request.sim_time + request.epoch_length
+        for contact in sorted(request.contacts, key=lambda item: item.opens):
+            pair = (contact.source, contact.target)
+            if (pair in scheduled_pairs or contact.kind != "isl"
+                    or contact.source not in request.satellites
+                    or contact.target not in request.satellites
+                    or contact.opens > horizon
+                    or contact.closes < request.sim_time):
+                continue
+            state = request.satellites[contact.source]
+            if not state.available:
+                continue
+            try:
+                depart, finish = self._reserve_hop(
+                    request, ready, residual, terminal_intervals,
+                    contact.source, contact.target,
+                    self.advertisement_bits, request.sim_time,
+                )
+            except InvalidDecisionError:
+                continue
+            message_id, counter = self._message_id(counter)
+            item = WorkItem(
+                -1, -1, contact.target, contact.source, depth=0
+            )
+            message = ProtocolMessage(
+                message_id, "state_advertisement", contact.source,
+                contact.target, item, self.advertisement_bits, 0, 0,
+                0, self.max_hops,
+                f"state:{request.epoch}:{contact.source}:{contact.target}",
+            )
+            self._record(
+                events, depart, "hop_sent", message,
+                contact.source, contact.target,
+            )
+            self._record(
+                events, finish, "hop_received", message,
+                contact.target, contact.source,
+            )
+            self._record(
+                events, finish, "delivered", message,
+                contact.target, contact.source,
+            )
+            self.pending_advertisements.append((
+                finish, contact.target, contact.source, state,
+                request.sim_time,
+            ))
+            scheduled_pairs.add(pair)
+            message_count += 1
+            control_bits += self.advertisement_bits
+
+        self.contact_ready_at = ready
+        self.contact_residual_bits = residual
+        self.terminal_intervals = terminal_intervals
+        self._next_id = counter
+        return AdvertisementBatch(
+            tuple(sorted(events, key=lambda event: event.time)),
+            message_count, control_bits,
+        )
 
     def local_view(self, request, observer):
-        """Return the shared current constellation state and contact plan."""
-        ages = {sat_id: 0.0 for sat_id in request.satellites}
+        """Return local live state plus the deterministic orbital contact plan.
+
+        Satellite resource state remains limited to advertisements received by
+        ``observer``. Contact windows are predictable from ephemerides and are
+        therefore shared independently of live state, allowing an unknown
+        satellite to act as a store-and-forward relay without also exposing
+        its battery, queue, temperature, or availability.
+        """
+        known = {observer: request.satellites[observer]}
+        ages = {observer: 0.0}
+        for sat_id, (view, generated_at, delivered_at) in (
+                self.knowledge.get(observer, {}).items()):
+            if delivered_at <= request.sim_time + 1e-9:
+                known[sat_id] = view
+                ages[sat_id] = max(0.0, request.sim_time - generated_at)
         return replace(
-            request,
-            satellites=dict(request.satellites),
-            contacts=tuple(request.contacts),
+            request, satellites=known, contacts=tuple(request.contacts),
             opportunities=request.opportunities,
             state_age_s=ages, observer=observer,
         )
@@ -429,5 +551,6 @@ class MessageSimulator:
 
 
 __all__ = [
-    "MessageSimulator", "ProtocolExecution", "ProtocolMessage",
+    "AdvertisementBatch", "MessageSimulator", "ProtocolExecution",
+    "ProtocolMessage",
 ]

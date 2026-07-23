@@ -158,11 +158,9 @@ def test_policies_retime_multiple_tiles_before_model_validation(algorithm_type):
         for sid in ("src", "h1", "h2")
     }
     contacts = tuple(
-        [ContactWindow("src", helper, 0.0, 10.0, 100_000.0, "isl")
+        [ContactWindow("src", helper, 0.0, 10.0, 1_000.0, "isl")
          for helper in ("h1", "h2")]
-        + [ContactWindow(helper, "src", 0.0, 10.0, 100_000.0, "isl")
-           for helper in ("h1", "h2")]
-        + [ContactWindow(sid, "ground", 0.0, 10.0, 100_000.0, "downlink")
+        + [ContactWindow(sid, "ground", 0.0, 10.0, 1_000.0, "downlink")
            for sid in states]
     )
     tiles = [

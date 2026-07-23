@@ -195,9 +195,14 @@ def compute_metrics(
                     m.isl_traffic_bits += tile.d_in_bits * input_fraction
                 if helper != aggregator:
                     m.isl_traffic_bits += tile.d_out_bits * output_fraction
+        advertisement_bits = float(
+            assignment.metadata.get("advertisement_control_bits", 0.0)
+        )
         handshake_bits = float(
             assignment.metadata.get("handshake_control_bits", 0.0)
         )
+        m.control_traffic_bits += advertisement_bits
+        m.isl_traffic_bits += advertisement_bits
         m.control_traffic_bits += handshake_bits
         m.isl_traffic_bits += handshake_bits
         m.protocol_messages += float(
@@ -290,9 +295,14 @@ def compute_metrics(
         if constellation_size and squared_load > 0.0 else 0.0
     )
 
+    decision_advertisement_bits = float(
+        decision_metadata.get("advertisement_control_bits", 0.0)
+    )
     m.protocol_messages += float(
         decision_metadata.get("protocol_message_count", 0.0)
     )
+    m.control_traffic_bits += decision_advertisement_bits
+    m.isl_traffic_bits += decision_advertisement_bits
     m.isl_traffic_bits += max(
         0.0, float(abandoned_costs.get("isl_traffic_bits", 0.0))
     )

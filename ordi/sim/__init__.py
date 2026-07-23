@@ -5,7 +5,8 @@ not initialize the algorithm package and create an ORDI↔messaging cycle.
 """
 
 __all__ = [
-    "MessageSimulator", "ProtocolExecution", "ProtocolMessage",
+    "AdvertisementBatch", "MessageSimulator", "ProtocolExecution",
+    "ProtocolMessage",
 ]
 
 

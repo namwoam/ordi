@@ -78,7 +78,7 @@ def test_ordi_executes_node_decisions_through_message_events():
         "sent", "delivered", "compute_started", "compute_finished",
     }
     assert assignment.metadata["protocol_message_count"] == 4
-    assert result.metadata.get("protocol_message_count", 0) == 0
+    assert result.metadata["protocol_message_count"] == 1
     assert assignment.metadata["protocol_control_bits"] > 0
     image_payloads = {
         event.shard_id: event.bits
@@ -94,7 +94,7 @@ def test_ordi_executes_node_decisions_through_message_events():
         result,
         [task], 0.0, {name: 60_000.0 for name in request.satellites},
     )
-    assert metrics.protocol_messages == 4
+    assert metrics.protocol_messages == 5
     assert metrics.control_traffic_bits > 0
     assert metrics.downlink_volume_bits == pytest.approx(
         assignment.metadata["protocol_ground_bits"]
@@ -152,7 +152,7 @@ def test_protocol_enforces_hop_and_split_depth_limits():
         )
 
 
-def test_current_constellation_state_is_shared_without_broadcasting():
+def test_state_advertisements_are_delayed_and_then_used_locally():
     request, task, _tile = _request(link_rate=10_000.0)
     reverse = ContactWindow(
         "helper", "src", 0.0, 10.0, 10_000.0, "isl"
@@ -162,18 +162,30 @@ def test_current_constellation_state_is_shared_without_broadcasting():
         contacts=request.contacts + (reverse,),
     )
 
-    scheduler = ORDI(max_replicas=1, split_options=(2,))
-    result = scheduler.schedule(replace(
+    before_arrival = ORDI(
+        max_replicas=1, split_options=(1, 2)
+    )
+    before_arrival.schedule(warmup)
+    early = before_arrival.schedule(replace(
         request, epoch=1, sim_time=0.05,
         contacts=warmup.contacts,
+    )).assignments[0]
+    assert early.metadata["split_count"] == 1
+    assert early.metadata["known_state_nodes"] == 1
+
+    after_arrival = ORDI(max_replicas=1, split_options=(2,))
+    after_arrival.schedule(warmup)
+    informed_result = after_arrival.schedule(replace(
+        request, epoch=1, sim_time=0.3,
+        contacts=warmup.contacts,
     ))
-    informed = result.assignments[0]
+    informed = informed_result.assignments[0]
     assert informed.metadata["split_count"] == 2
     assert informed.metadata["known_state_nodes"] == 2
-    assert informed.metadata["max_state_age_s"] == pytest.approx(0.0)
-    assert not any(
+    assert informed.metadata["max_state_age_s"] == pytest.approx(0.3)
+    assert any(
         event.kind == "state_advertisement"
-        for event in result.message_events
+        for event in informed_result.message_events
     )
 
 
@@ -296,7 +308,7 @@ def test_ordi_planning_uses_residual_contact_capacity():
     assert scheduler.waiting[(1, 1)].reason == "no_primary_plan"
 
 
-def test_shared_current_state_exposes_physical_failure():
+def test_stale_advertisement_does_not_hide_physical_failure():
     request, _task, _tile = _request()
     reverse = ContactWindow(
         "helper", "src", 0.0, 10.0, 1_000.0, "isl"

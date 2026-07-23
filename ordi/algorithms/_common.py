@@ -326,6 +326,14 @@ def protocol_trace(request, task, tile, groups, work_fraction=1.0,
     return tuple(decisions)
 
 
+def advertisement_metadata(batch):
+    return {
+        "protocol_message_count": batch.message_count,
+        "protocol_control_bits": batch.control_bits,
+        "advertisement_control_bits": batch.control_bits,
+    }
+
+
 def source_only_view(request, source):
     """Local state for policies that never discover or delegate to helpers."""
     known = ({source: request.satellites[source]}

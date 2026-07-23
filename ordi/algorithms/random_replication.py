@@ -5,7 +5,8 @@ import random
 
 from .schema import Assignment, Decision
 from ._common import (
-    deadline_expired, enumerate_placements, protocol_trace, tile_success,
+    advertisement_metadata, deadline_expired, enumerate_placements, protocol_trace,
+    tile_success,
 )
 from ordi.eval.validation import InvalidDecisionError
 from ordi.sim.messaging import MessageSimulator
@@ -43,6 +44,7 @@ class RandomReplication:
         self.messages = MessageSimulator()
 
     def schedule(self, request):
+        advertisements = self.messages.prepare_epoch(request)
         rng = random.Random(self.seed + request.epoch)
         assignments = []
         for task in request.tasks:
@@ -129,4 +131,8 @@ class RandomReplication:
                     assignment, metadata=metadata,
                     message_events=execution.events,
                 ))
-        return Decision(request.epoch, tuple(assignments))
+        return Decision(
+            request.epoch, tuple(assignments),
+            advertisement_metadata(advertisements),
+            advertisements.events,
+        )
