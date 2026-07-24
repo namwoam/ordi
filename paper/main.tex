@@ -145,12 +145,11 @@ satellite, $r_k$ is the release time, $D_k$ is the absolute delivery deadline,
 and $\mathcal{V}_k$ is a grid of image tiles. Each tile $v\in\mathcal{V}_k$ is
 described by
 \begin{equation}
-  \tau_{kv}=(d^{\mathrm{in}}_{kv},d^{\mathrm{out}}_{kv},
-  w_{kv},u_{kv}),
+  \tau_{kv}=(d^{\mathrm{in}}_{kv},d^{\mathrm{out}}_{kv},w_{kv}),
   \label{eq:tile}
 \end{equation}
 where $d^{\mathrm{in}}_{kv}$ and $d^{\mathrm{out}}_{kv}$ are input and result
-sizes in bits, $w_{kv}$ is inference work in FLOPs, and $u_{kv}$ is utility.
+sizes in bits, and $w_{kv}$ is inference work in FLOPs.
 The two data volumes are distinguished because onboard inference transforms a
 high-dimensional image tile into a task-dependent product, such as a class
 label, bounding boxes, or a segmentation mask.
@@ -172,54 +171,89 @@ received by $i$, and $a^i_j$ is its age. The state of $j$ is unknown to $i$
 until such an advertisement is received.
 
 Neighboring satellites exchange state advertisements and task data over
-inter-satellite links. Task data may traverse multiple ISLs, and a downlink
-delivers the resulting data to a ground station. Control and task traffic
-share the finite capacities of the corresponding contact windows. Thus,
-knowledge of future connectivity is global and deterministic, whereas
+inter-satellite links. To limit flooding overhead and preserve contact
+capacity for task traffic, each epoch's state advertisement is forwarded over
+at most three ISL hops. Let $\mathcal{A}^{(h)}_i(e)$ be the advertisements
+available to satellite $i$ after at most $h$ forwarding hops in epoch $e$, and
+let $\mathcal{N}_i(e)$ be its incoming ISL neighbors during that epoch. The
+exchange can be summarized as
+\begin{align}
+ \mathcal{A}^{(0)}_i(e)
+   &=\{(i,\boldsymbol{\sigma}_i(t_e),t_e)\}, \nonumber\\
+ \mathcal{A}^{(h)}_i(e)
+   &=\operatorname{fresh}\!\left(
+       \mathcal{A}^{(h-1)}_i(e)
+       \cup
+       \bigcup_{j\in\mathcal{N}_i(e)}
+       \mathcal{A}^{(h-1)}_j(e)
+     \right), \nonumber\\[-2pt]
+ &\hspace{24mm} h=1,2,3.
+ \label{eq:advertisement-exchange}
+\end{align}
+where $\operatorname{fresh}(\cdot)$ retains only the newest advertisement per
+origin. A received entry becomes usable only after its contact-constrained
+arrival time. This bounded dissemination extends state awareness beyond
+immediate neighbors without requiring network-wide flooding. Task data may
+traverse multiple ISLs, and a downlink delivers the resulting data to a ground
+station.
+Control and task traffic share the finite capacities of the corresponding
+contact windows. Thus, knowledge of future connectivity is global and
+deterministic, whereas
 knowledge of remote satellite state is local, delayed, and acquired through
 communication.
 
 \subsection{Constraints and Problem Formulation}
 \label{sec:formulation}
 
-For each tile, a decision selects a split width
-$q\in\mathcal{Q}=\{1,2,4\}$. Each complete reconstruction group contains $q$
-equal shards; shard $m$ carries $d^{\mathrm{in}}_{kv}/q$ input bits, requires
-$w_{kv}/q$ FLOPs, and produces $d^{\mathrm{out}}_{kv}/q$ result bits. Its
-placement
+For each tile $v\in\mathcal{V}_k$, the decisions include a split width
+$q_{kv}\in\{1,2,4\}$ and a reconstruction-group count
+$n_{kv}\in\{1,2\}$. Following similar distributed-inference work
+\cite{zhao2018deepthings,tang2022partitioning}, we allow at most four shards
+because over-sharding increases communication, synchronization, and scheduling
+overhead.
+
+A reconstruction group is an end-to-end plan that independently completes tile
+$v$, indexed by $g\in\{1,\ldots,n_{kv}\}$. We choose $n_{kv}\le2$ because
+each additional group schedules another $q_{kv}$ shard placements, consuming
+compute and link capacity while enlarging the combinatorial placement search.
+
+For group $g$, shard $m\in\{1,\ldots,q_{kv}\}$ carries
+$d^{\mathrm{in}}_{kv}/q_{kv}$ input bits, requires $w_{kv}/q_{kv}$ FLOPs, and
+produces $d^{\mathrm{out}}_{kv}/q_{kv}$ result bits. Its placement
 \begin{equation}
  x_{kvgm}=(h_{kvgm},P^{\mathrm{in}}_{kvgm},
  P^{\mathrm{gnd}}_{kvgm})
- \label{eq:placement}
+\label{eq:placement}
 \end{equation}
-selects a compute satellite $h_{kvgm}$, a time-respecting input path from
-$s_k$ to $h_{kvgm}$, and a time-respecting result path from $h_{kvgm}$ to any
-ground station. Either path may contain multiple ISLs, while
-$P^{\mathrm{gnd}}_{kvgm}$ ends with a downlink.
+where $h_{kvgm}$ is the compute satellite,
+$P^{\mathrm{in}}_{kvgm}$ and $P^{\mathrm{gnd}}_{kvgm}$ are the
+time-respecting input and output paths, respectively. Each path contains at
+most $H_{\max}^{\mathrm{ISL}}=12$ ISL hops.
 
-Let $F^{\mathrm{in}}_{kvgm}$ be the time at which the input shard reaches its
-compute satellite. Computation begins at
+\noindent Let $F^{\mathrm{in}}_{kvgm}$ be the time at which the input shard reaches its
+compute satellite, and let $S^{\mathrm{cmp}}_{kvgm}$ be its computation start times.
+The shard computation is constrained by
 \begin{equation}
  \begin{aligned}
  S^{\mathrm{cmp}}_{kvgm}
- &\ge \max\!\left\{
- F^{\mathrm{in}}_{kvgm},\
- t+\frac{Q_{h_{kvgm}}(t)}{C_{h_{kvgm}}(t)}
- \right\},\\
- F^{\mathrm{cmp}}_{kvgm}
- &=S^{\mathrm{cmp}}_{kvgm}
- +\frac{w_{kv}}{qC_{h_{kvgm}}(t)}.
+ &\ge F^{\mathrm{in}}_{kvgm},\\
+ \int_t^{S^{\mathrm{cmp}}_{kvgm}}
+ C_{h_{kvgm}}(\tau)\,d\tau
+ &\ge Q_{h_{kvgm}}(t),\\
+ \int_{S^{\mathrm{cmp}}_{kvgm}}^{F^{\mathrm{cmp}}_{kvgm}}
+ C_{h_{kvgm}}(\tau)\,d\tau
+ &=\frac{w_{kv}}{q_{kv}}.
  \end{aligned}
  \label{eq:compute-time}
 \end{equation}
 The result path starts after computation. Let $F_{kvgm}$ denote the time at
-which the result reaches the ground. A group completes after all $q$ of its
+which the result reaches the ground. A group completes after all $q_{kv}$ of its
 results arrive, while a tile completes when any selected reconstruction group
 completes:
 \begin{equation}
- T_{kvg}=\max_{1\le m\le q}F_{kvgm},
+ T_{kvg}=\max_{1\le m\le q_{kv}}F_{kvgm},
  \qquad
- T_{kv}=\min_{g\in\mathcal{R}_{kv}}T_{kvg}.
+ T_{kv}=\min_{1\le g\le n_{kv}}T_{kvg}.
  \label{eq:completion-time}
 \end{equation}
 Every admitted placement obeys
@@ -251,11 +285,11 @@ consume capacity from the same contact-window budget.
 Within a group, compute satellites are distinct. A backup group must
 additionally avoid the primary compute satellites, their orbital planes, and
 satellite nodes already used by the primary routes. If $\delta(i)$ denotes the
-fault domain of satellite $i$, then for primary group $0$ and backup group
-$g>0$,
+fault domain of satellite $i$, then for primary group $1$ and each selected
+backup group $2\le g\le n_{kv}$,
 \begin{equation}
-\delta(h_{kv0m})\ne\delta(h_{kvgm'})
-\quad \forall\,m,m',
+\delta(h_{kv1m})\ne\delta(h_{kvgm'})
+\quad \forall\,m,m'\in\{1,\ldots,q_{kv}\},
 \label{eq:fault-disjoint}
 \end{equation}
 with the analogous node-disjoint condition on their routes.
@@ -267,30 +301,28 @@ source or contact component, tile reliability uses inclusion--exclusion rather
 than assuming independent replicas:
 \begin{equation}
  P_{kv}=
- \sum_{\emptyset\ne H\subseteq\mathcal{R}_{kv}}
+ \sum_{\emptyset\ne H\subseteq\{1,\ldots,n_{kv}\}}
  (-1)^{|H|+1}
  \prod_{c\in\bigcup_{g\in H}\mathcal{C}_{kvg}}\rho_c ,
  \label{eq:tile-reliability}
 \end{equation}
-where $\mathcal{R}_{kv}$ is the selected set of complete groups. Let
-$L_{kv}=T_{kv}-t$ be the service latency, let $Z_{kv}$ be the total routed
-bits counted per hop, and let $n_{kv}=|\mathcal{R}_{kv}|$. The online
-scheduling problem is
+Let $L_{kv}=T_{kv}-t$ be the service latency, and let $Z_{kv}$ be the total
+routed bits counted per hop. The online scheduling problem is
 \begin{equation}
- \max_{\{q,x,\mathcal{R}\}}
+ \max_{\{q_{kv},n_{kv},x\}}
  \sum_{k}\sum_{v\in\mathcal{V}_k}
  \left[
- u_{kv}P_{kv}e^{-\alpha L_{kv}}
+ P_{kv}e^{-\alpha L_{kv}}
  -\lambda_C Z_{kv}
  -\lambda_R(n_{kv}-1)
  \right]
- \label{eq:objective}
+\label{eq:objective}
 \end{equation}
-subject to Equations~\eqref{eq:compute-time}--\eqref{eq:fault-disjoint} and
-$q\in\mathcal{Q}$. The physical model separately integrates compute and radio
-energy and updates $B_i$ and $\Theta_i$; therefore energy affects subsequent
-feasibility through Equation~\eqref{eq:availability} rather than through an
-optimistic per-placement estimate.
+subject to Equations~\eqref{eq:compute-time}--\eqref{eq:fault-disjoint}, with
+$q_{kv}\in\{1,2,4\}$ and $n_{kv}\in\{1,2\}$. The physical model separately
+integrates compute and radio energy and updates $B_i$ and $\Theta_i$; therefore
+energy affects subsequent feasibility through Equation~\eqref{eq:availability}
+rather than through an optimistic per-placement estimate.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
