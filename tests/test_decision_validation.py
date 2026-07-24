@@ -100,6 +100,54 @@ def test_retiming_records_exact_communication_intervals():
     )
 
 
+def test_prune_stale_drops_only_finished_history():
+    model = DecisionFeasibilityModel()
+    model.reservations = [
+        {"owner": "old", "kind": "compute", "resource": "h1",
+         "start": 0.0, "finish": 5.0, "amount": 1.0},
+        {"owner": "recent", "kind": "compute", "resource": "h1",
+         "start": 90.0, "finish": 95.0, "amount": 1.0},
+    ]
+    model.terminal_intervals = {"h1": [(0.0, 5.0), (90.0, 95.0)]}
+    old_key = ("a", "b", 0.0, 5.0, 100.0, "isl")
+    recent_key = ("a", "b", 90.0, 95.0, 100.0, "isl")
+    model.contact_ready_at = {old_key: 5.0, recent_key: 95.0}
+    model.contact_residual_bits = {old_key: 10.0, recent_key: 10.0}
+
+    model._prune_stale(sim_time=100.0, margin=10.0)
+
+    assert [r["owner"] for r in model.reservations] == ["recent"]
+    assert model.terminal_intervals == {"h1": [(90.0, 95.0)]}
+    assert model.contact_ready_at == {recent_key: 95.0}
+    assert model.contact_residual_bits == {recent_key: 10.0}
+
+
+def test_pruning_does_not_change_validate_and_reserve_outcome():
+    decision = _replicated_decision()
+    request = _request(contact_bits=200.0)
+
+    fresh = DecisionFeasibilityModel().validate_and_reserve(
+        request, decision, retime=True
+    )
+
+    ancient_key = ("src", "relay", -1000.0, -990.0, 100.0, "isl")
+    seeded = DecisionFeasibilityModel(
+        contact_ready_at={ancient_key: -990.0},
+        contact_residual_bits={ancient_key: 50.0},
+        terminal_intervals={"src": [(-1000.0, -990.0)]},
+        reservations=[{
+            "owner": "ancient", "kind": "contact", "resource": ancient_key,
+            "start": -1000.0, "finish": -990.0, "amount": 50.0,
+            "capacity": 100.0, "terminal_resources": ("src", "relay"),
+        }],
+    )
+    seeded_result = seeded.validate_and_reserve(request, decision, retime=True)
+
+    assert seeded_result == fresh
+    assert not any(r["owner"] == "ancient" for r in seeded.reservations)
+    assert ancient_key not in seeded.contact_ready_at
+
+
 def test_future_terminal_reservation_does_not_block_an_earlier_gap():
     calendars = {"src": [(100.0, 110.0)]}
 

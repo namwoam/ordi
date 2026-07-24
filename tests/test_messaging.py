@@ -101,6 +101,21 @@ def test_ordi_executes_node_decisions_through_message_events():
     )
 
 
+def test_prune_stale_drops_only_finished_intervals():
+    sim = MessageSimulator()
+    sim.terminal_intervals = {"src": [(0.0, 5.0), (90.0, 95.0)]}
+    old_key = ("a", "b", 0.0, 5.0, 100.0, "isl")
+    recent_key = ("a", "b", 90.0, 95.0, 100.0, "isl")
+    sim.contact_ready_at = {old_key: 5.0, recent_key: 95.0}
+    sim.contact_residual_bits = {old_key: 10.0, recent_key: 10.0}
+
+    sim._prune_stale(sim_time=100.0, margin=10.0)
+
+    assert sim.terminal_intervals == {"src": [(90.0, 95.0)]}
+    assert sim.contact_ready_at == {recent_key: 95.0}
+    assert sim.contact_residual_bits == {recent_key: 10.0}
+
+
 def test_message_headers_can_make_nominal_data_route_invalid():
     # The 1,000-bit contact can carry the ten-bit model result, but not the
     # result plus ORDI's 2,048-bit protocol header.

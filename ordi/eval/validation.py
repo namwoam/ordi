@@ -53,6 +53,39 @@ class DecisionFeasibilityModel:
     )
     reservations: list[dict] = field(default_factory=list)
 
+    def _prune_stale(self, sim_time: float, margin: float = 0.0) -> None:
+        """Drop reservations/intervals that can never affect a future decision.
+
+        Every reservation lookup only ever queries with a start time >= the
+        current epoch's sim_time (route search and message timelines only
+        advance forward), and ``_terminal_slot`` already skips any interval
+        whose finish is at or before that start. Once ``finish`` (or a
+        contact window's ``closes``) falls behind ``sim_time - margin``, the
+        record is permanently dead weight: keeping it only makes every future
+        ``_copy()``/``_terminal_slot`` scan pay for the whole simulation's
+        history instead of the part a decision could still touch.
+        """
+        horizon = sim_time - margin
+        self.reservations = [
+            record for record in self.reservations
+            if record["finish"] > horizon
+        ]
+        self.terminal_intervals = {
+            terminal: pruned
+            for terminal, intervals in self.terminal_intervals.items()
+            if (pruned := [
+                interval for interval in intervals if interval[1] > horizon
+            ])
+        }
+        self.contact_ready_at = {
+            key: value for key, value in self.contact_ready_at.items()
+            if key[3] > horizon
+        }
+        self.contact_residual_bits = {
+            key: value for key, value in self.contact_residual_bits.items()
+            if key[3] > horizon
+        }
+
     def _copy(self):
         return DecisionFeasibilityModel(
             contact_ready_at=self.contact_ready_at.copy(),
@@ -220,6 +253,7 @@ class DecisionFeasibilityModel:
     def validate_and_reserve(self, request: EpochInput, decision: Decision,
                              *, retime: bool = False):
         """Validate one decision and atomically reserve all accepted work."""
+        self._prune_stale(request.sim_time, margin=2.0 * request.epoch_length)
         trial = self._copy()
         accepted = []
         task_by_id = {task.task_id: task for task in request.tasks}

@@ -84,6 +84,33 @@ class MessageSimulator:
         value = f"msg-{trial_counter:08d}"
         return value, trial_counter + 1
 
+    def _prune_stale(self, sim_time: float, margin: float = 0.0) -> None:
+        """Drop dead contact/interval history, mirroring validation.py.
+
+        Nothing here ever looks up a time before the current epoch's
+        sim_time (routes and message timelines only advance forward), so
+        once an interval or contact window is safely behind ``sim_time``, it
+        can never be reserved against again; keeping it only inflates every
+        future ``.copy()``/``_terminal_slot`` scan in ``prepare_epoch`` and
+        ``execute``.
+        """
+        horizon = sim_time - margin
+        self.terminal_intervals = {
+            terminal: pruned
+            for terminal, intervals in self.terminal_intervals.items()
+            if (pruned := [
+                interval for interval in intervals if interval[1] > horizon
+            ])
+        }
+        self.contact_ready_at = {
+            key: value for key, value in self.contact_ready_at.items()
+            if key[3] > horizon
+        }
+        self.contact_residual_bits = {
+            key: value for key, value in self.contact_residual_bits.items()
+            if key[3] > horizon
+        }
+
     def seed_knowledge(self, observer, satellites, generated_at=0.0,
                        delivered_at=0.0):
         """Explicit bootstrap hook for controlled tests or real telemetry."""
@@ -108,6 +135,7 @@ class MessageSimulator:
         epoch update is forwarded at most ``advertisement_max_hops`` times and
         accepted once per origin/receiver pair.
         """
+        self._prune_stale(request.sim_time, margin=2.0 * request.epoch_length)
         events = []
         remaining = []
         for delivered_at, observer, sender, view, generated_at in (
